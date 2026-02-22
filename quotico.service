@@ -1,0 +1,19 @@
+[Unit]
+Description=Quotico.de Backend (uvicorn)
+After=network.target mongod.service
+Wants=mongod.service
+
+[Service]
+Type=exec
+User=www-data
+Group=www-data
+WorkingDirectory=/var/www/quotico.de/backend
+EnvironmentFile=/var/www/quotico.de/.env
+ExecStart=/var/www/quotico.de/backend/.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 4201
+Restart=always
+RestartSec=5
+StandardOutput=append:/var/www/quotico.de/logs/backend.log
+StandardError=append:/var/www/quotico.de/logs/backend.log
+
+[Install]
+WantedBy=multi-user.target
