@@ -1,11 +1,12 @@
 import logging
-from datetime import datetime, timezone
 
 from bson import ObjectId
 from fastapi import HTTPException, status
+from pymongo.errors import DuplicateKeyError
 
 from app.config import settings
 import app.database as _db
+from app.utils import ensure_utc, utcnow
 
 logger = logging.getLogger("quotico.tip_service")
 
@@ -30,8 +31,9 @@ async def create_tip(
         )
 
     # Check match hasn't started
-    now = datetime.now(timezone.utc)
-    if match["commence_time"] <= now:
+    now = utcnow()
+    commence = ensure_utc(match["commence_time"])
+    if commence <= now:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Dieses Spiel hat bereits begonnen. Tipps sind nicht mehr möglich.",
@@ -53,7 +55,8 @@ async def create_tip(
         )
 
     # Check odds staleness
-    odds_age = (now - match["odds_updated_at"]).total_seconds()
+    odds_updated = ensure_utc(match["odds_updated_at"])
+    odds_age = (now - odds_updated).total_seconds()
     if odds_age > settings.ODDS_STALENESS_MAX_SECONDS:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -64,7 +67,7 @@ async def create_tip(
     locked_odds = current_odds[prediction]
 
     # Validate displayed odds aren't too far off (>20% difference = suspicious)
-    if abs(displayed_odds - locked_odds) / locked_odds > 0.2:
+    if abs(displayed_odds - locked_odds) / max(locked_odds, 0.01) > 0.2:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Die Quoten haben sich geändert. Bitte erneut versuchen.",
@@ -85,14 +88,11 @@ async def create_tip(
 
     try:
         result = await _db.db.tips.insert_one(tip_doc)
-    except Exception as e:
-        # Duplicate tip (compound unique index)
-        if "duplicate" in str(e).lower() or "E11000" in str(e):
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail="Du hast bereits einen Tipp für dieses Spiel abgegeben.",
-            )
-        raise
+    except DuplicateKeyError:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Du hast bereits einen Tipp für dieses Spiel abgegeben.",
+        )
 
     tip_doc["_id"] = result.inserted_id
     logger.info(

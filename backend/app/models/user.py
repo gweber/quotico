@@ -18,14 +18,24 @@ class UserInDB(BaseModel):
     encrypted_2fa_secret: Optional[str] = None
     encryption_key_version: int = 1
     is_deleted: bool = False
+    is_adult: bool = False
+    birth_date_verified_at: Optional[datetime] = None
+    terms_accepted_version: Optional[str] = None
+    terms_accepted_at: Optional[datetime] = None
+    # Wallet compliance
+    wallet_disclaimer_accepted_at: Optional[datetime] = None
+    # Anti-abuse household clustering
+    household_group_id: Optional[str] = None
     created_at: datetime
     updated_at: datetime
 
 
 class UserCreate(BaseModel):
-    """Request body for registration."""
+    """Request body for registration with age verification."""
     email: EmailStr
     password: str
+    birth_date: str  # YYYY-MM-DD format, validated server-side
+    disclaimer_accepted: bool = False
 
     @field_validator("password")
     @classmethod
@@ -59,4 +69,6 @@ class UserResponse(BaseModel):
     points: float
     is_admin: bool = False
     is_2fa_enabled: bool
+    is_adult: bool = True
+    terms_accepted_version: Optional[str] = None
     created_at: datetime

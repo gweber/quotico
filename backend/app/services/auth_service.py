@@ -1,6 +1,6 @@
 import logging
 import secrets
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from typing import Optional
 
 from argon2 import PasswordHasher
@@ -12,6 +12,7 @@ from jwt.exceptions import InvalidTokenError as JWTError
 from app.config import settings
 import app.database as _db
 from app.database import get_db
+from app.utils import utcnow
 
 logger = logging.getLogger("quotico.auth")
 ph = PasswordHasher()
@@ -47,7 +48,7 @@ def verify_password(password: str, hashed: str) -> bool:
 
 
 def create_access_token(user_id: str) -> str:
-    expire = datetime.now(timezone.utc) + timedelta(
+    expire = utcnow() + timedelta(
         minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES
     )
     payload = {
@@ -65,7 +66,7 @@ async def create_refresh_token(user_id: str, family: Optional[str] = None) -> st
     Each refresh token belongs to a 'family'. If a token is reused
     (replay attack), the entire family is invalidated.
     """
-    expire = datetime.now(timezone.utc) + timedelta(
+    expire = utcnow() + timedelta(
         days=settings.REFRESH_TOKEN_EXPIRE_DAYS
     )
     jti = secrets.token_hex(16)
@@ -84,7 +85,7 @@ async def create_refresh_token(user_id: str, family: Optional[str] = None) -> st
         "jti": jti,
         "user_id": user_id,
         "family": token_family,
-        "created_at": datetime.now(timezone.utc),
+        "created_at": utcnow(),
         "expires_at": expire,
     })
 
@@ -198,6 +199,12 @@ async def get_current_user(request: Request, db=Depends(get_db)) -> dict:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Nutzer nicht gefunden",
+        )
+
+    if user.get("is_banned"):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Dein Konto wurde gesperrt.",
         )
 
     return user

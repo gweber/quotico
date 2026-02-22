@@ -4,10 +4,9 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-import httpx
-
 from app.config import settings
 from app.providers.base import BaseProvider
+from app.providers.http_client import ResilientClient
 
 logger = logging.getLogger("quotico.odds_api")
 
@@ -16,6 +15,7 @@ BASE_URL = "https://api.the-odds-api.com/v4"
 # Sport key mapping: TheOddsAPI sport keys we support
 SUPPORTED_SPORTS = [
     "soccer_germany_bundesliga",
+    "soccer_germany_bundesliga2",
     "soccer_epl",
     "soccer_spain_la_liga",
     "soccer_italy_serie_a",
@@ -28,46 +28,12 @@ SUPPORTED_SPORTS = [
 # 3-way sports (Win/Draw/Loss)
 THREE_WAY_SPORTS = {
     "soccer_germany_bundesliga",
+    "soccer_germany_bundesliga2",
     "soccer_epl",
     "soccer_spain_la_liga",
     "soccer_italy_serie_a",
     "soccer_uefa_champs_league",
 }
-
-
-class CircuitBreaker:
-    """Simple circuit breaker for external API calls."""
-
-    def __init__(self, failure_threshold: int = 3, recovery_timeout: int = 300):
-        self.failure_threshold = failure_threshold
-        self.recovery_timeout = recovery_timeout
-        self.failure_count = 0
-        self.last_failure_time: Optional[float] = None
-        self.is_open = False
-
-    def record_success(self) -> None:
-        self.failure_count = 0
-        self.is_open = False
-
-    def record_failure(self) -> None:
-        self.failure_count += 1
-        self.last_failure_time = time.time()
-        if self.failure_count >= self.failure_threshold:
-            self.is_open = True
-            logger.warning(
-                "Circuit breaker OPEN after %d failures", self.failure_count
-            )
-
-    def can_attempt(self) -> bool:
-        if not self.is_open:
-            return True
-        # Allow retry after recovery timeout
-        if self.last_failure_time and (
-            time.time() - self.last_failure_time > self.recovery_timeout
-        ):
-            logger.info("Circuit breaker half-open, allowing retry")
-            return True
-        return False
 
 
 class OddsCache:
@@ -92,6 +58,15 @@ class OddsCache:
 
     def set(self, key: str, data: list[dict]) -> None:
         self._data[key] = {"data": data, "timestamp": time.time()}
+        self._cleanup()
+
+    def _cleanup(self) -> None:
+        """Remove expired entries to prevent unbounded memory growth."""
+        now = time.time()
+        expired = [k for k, v in self._data.items() if (now - v["timestamp"]) > self.ttl * 10]
+        for k in expired:
+            del self._data[k]
+            self._locks.pop(k, None)
 
     def get_lock(self, key: str) -> asyncio.Lock:
         if key not in self._locks:
@@ -103,8 +78,7 @@ class TheOddsAPIProvider(BaseProvider):
     """TheOddsAPI implementation with circuit breaker and stale-while-revalidate cache."""
 
     def __init__(self):
-        self._client = httpx.AsyncClient(timeout=15.0)
-        self._circuit = CircuitBreaker()
+        self._client = ResilientClient("odds_api")
         self._cache = OddsCache(ttl=settings.ODDS_CACHE_TTL_SECONDS)
         self._api_usage = {"requests_used": 0, "requests_remaining": None}
 
@@ -127,7 +101,7 @@ class TheOddsAPIProvider(BaseProvider):
             if self._cache.is_fresh(cache_key):
                 return self._cache.get(cache_key) or []
 
-            if not self._circuit.can_attempt():
+            if not self._client.circuit.can_attempt():
                 logger.warning("Circuit open for odds, serving stale data")
                 stale = self._cache.get(cache_key)
                 return stale if stale is not None else []
@@ -135,12 +109,15 @@ class TheOddsAPIProvider(BaseProvider):
             try:
                 is_three_way = sport_key in THREE_WAY_SPORTS
 
+                # Fetch h2h + totals markets for 3-way sports (doubles API credits)
+                markets = "h2h,totals" if is_three_way else "h2h"
+
                 resp = await self._client.get(
                     f"{BASE_URL}/sports/{sport_key}/odds",
                     params={
                         "apiKey": settings.ODDSAPIKEY,
                         "regions": "eu",
-                        "markets": "h2h",
+                        "markets": markets,
                         "oddsFormat": "decimal",
                     },
                 )
@@ -157,11 +134,11 @@ class TheOddsAPIProvider(BaseProvider):
                 raw = resp.json()
                 matches = self._parse_odds_response(raw, sport_key, is_three_way)
                 self._cache.set(cache_key, matches)
-                self._circuit.record_success()
+                self._client.circuit.record_success()
                 return matches
 
             except Exception as e:
-                self._circuit.record_failure()
+                self._client.circuit.record_failure()
                 logger.error("TheOddsAPI error for %s: %s", sport_key, e)
                 stale = self._cache.get(cache_key)
                 return stale if stale is not None else []
@@ -172,7 +149,7 @@ class TheOddsAPIProvider(BaseProvider):
         if self._cache.is_fresh(cache_key):
             return self._cache.get(cache_key) or []
 
-        if not self._circuit.can_attempt():
+        if not self._client.circuit.can_attempt():
             stale = self._cache.get(cache_key)
             return stale if stale is not None else []
 
@@ -188,10 +165,10 @@ class TheOddsAPIProvider(BaseProvider):
             raw = resp.json()
             results = self._parse_scores_response(raw, sport_key)
             self._cache.set(cache_key, results)
-            self._circuit.record_success()
+            self._client.circuit.record_success()
             return results
         except Exception as e:
-            self._circuit.record_failure()
+            self._client.circuit.record_failure()
             logger.error("TheOddsAPI scores error for %s: %s", sport_key, e)
             stale = self._cache.get(cache_key)
             return stale if stale is not None else []
@@ -203,9 +180,10 @@ class TheOddsAPIProvider(BaseProvider):
         for event in raw:
             # Find the best bookmaker odds (first available)
             odds = {}
+            totals_odds = {}
             for bookmaker in event.get("bookmakers", []):
                 for market in bookmaker.get("markets", []):
-                    if market["key"] == "h2h":
+                    if market["key"] == "h2h" and not odds:
                         outcomes = {o["name"]: o["price"] for o in market["outcomes"]}
                         home_team = event.get("home_team", "")
                         away_team = event.get("away_team", "")
@@ -221,14 +199,22 @@ class TheOddsAPIProvider(BaseProvider):
                                 "1": outcomes.get(home_team, 0),
                                 "2": outcomes.get(away_team, 0),
                             }
-                        break
-                if odds:
+
+                    elif market["key"] == "totals" and not totals_odds:
+                        for outcome in market["outcomes"]:
+                            if outcome["name"] == "Over":
+                                totals_odds["over"] = outcome["price"]
+                                totals_odds["line"] = outcome.get("point", 2.5)
+                            elif outcome["name"] == "Under":
+                                totals_odds["under"] = outcome["price"]
+
+                if odds and (totals_odds or not is_three_way):
                     break
 
             if not odds:
                 continue
 
-            matches.append({
+            match_data = {
                 "external_id": event["id"],
                 "sport_key": sport_key,
                 "teams": {
@@ -237,7 +223,11 @@ class TheOddsAPIProvider(BaseProvider):
                 },
                 "commence_time": event["commence_time"],
                 "odds": odds,
-            })
+            }
+            if totals_odds:
+                match_data["totals_odds"] = totals_odds
+
+            matches.append(match_data)
 
         return matches
 
@@ -291,7 +281,7 @@ class TheOddsAPIProvider(BaseProvider):
 
     @property
     def circuit_open(self) -> bool:
-        return self._circuit.is_open
+        return self._client.circuit.is_open
 
 
 # Singleton provider instance

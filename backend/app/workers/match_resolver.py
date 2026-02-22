@@ -1,5 +1,5 @@
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from typing import Optional
 
 from bson import ObjectId
@@ -13,14 +13,22 @@ from app.providers.football_data import (
 )
 from app.providers.openligadb import openligadb_provider, SPORT_TO_LEAGUE
 from app.providers.espn import espn_provider, SPORT_TO_ESPN
+from app.utils import utcnow
+from app.workers._state import recently_synced, set_synced
 
 logger = logging.getLogger("quotico.match_resolver")
 
 BUNDESLIGA = "soccer_germany_bundesliga"
+BUNDESLIGA2 = "soccer_germany_bundesliga2"
+GERMAN_LEAGUES = {BUNDESLIGA, BUNDESLIGA2}
 
 
 async def resolve_matches() -> None:
     """Check for completed matches and resolve pending tips.
+
+    Smart sleep: skips sports with no started-but-unresolved matches,
+    so Bundesliga can sleep while NFL keeps polling and vice versa.
+    Safety margin: polls each sport at least once every 6 hours.
 
     Provider routing:
     - Bundesliga: OpenLigaDB (primary) + football-data.org (cross-validate)
@@ -28,10 +36,27 @@ async def resolve_matches() -> None:
     - NFL/NBA: ESPN
     - Tennis/other: TheOddsAPI scores (costs credits)
     """
+    now = utcnow()
+
     for sport_key in SUPPORTED_SPORTS:
+        # Smart sleep per sport: skip if no matches need resolving
+        has_work = await _db.db.matches.find_one({
+            "sport_key": sport_key,
+            "status": {"$in": ["upcoming", "live"]},
+            "commence_time": {"$lte": now},
+        })
+
+        if not has_work:
+            # Safety margin: still poll if >6h since last sync for this sport
+            state_key = f"resolver:{sport_key}"
+            if await recently_synced(state_key, timedelta(hours=6)):
+                logger.debug("Smart sleep: %s has no unresolved matches, skipping", sport_key)
+                continue
+            logger.info("Smart sleep safety: %s >6h since last resolve, polling anyway", sport_key)
+
         try:
-            if sport_key == BUNDESLIGA:
-                await _resolve_bundesliga()
+            if sport_key in GERMAN_LEAGUES:
+                await _resolve_german_league(sport_key)
             elif sport_key in SPORT_TO_COMPETITION:
                 await _resolve_via_football_data(sport_key)
             elif sport_key in SPORT_TO_ESPN:
@@ -39,6 +64,7 @@ async def resolve_matches() -> None:
             else:
                 # Fallback: TheOddsAPI scores (tennis etc.)
                 await _resolve_via_odds_api(sport_key)
+            await set_synced(f"resolver:{sport_key}")
         except Exception as e:
             logger.error("Resolution failed for %s: %s", sport_key, e)
 
@@ -49,7 +75,7 @@ async def _resolve_match(
     match: dict, result: str, home_score: int, away_score: int
 ) -> None:
     """Resolve a single match: update status, resolve tips, award points."""
-    now = datetime.now(timezone.utc)
+    now = utcnow()
     match_id = str(match["_id"])
 
     await _db.db.matches.update_one(
@@ -153,19 +179,19 @@ async def _find_match_by_team(
     return None
 
 
-# ---------- Bundesliga: OpenLigaDB + football-data.org cross-validation ----------
+# ---------- German leagues: OpenLigaDB + football-data.org cross-validation ----------
 
-async def _resolve_bundesliga() -> None:
-    """Resolve Bundesliga with cross-validation between two free providers."""
-    primary = await openligadb_provider.get_finished_scores(BUNDESLIGA)
-    secondary = await football_data_provider.get_finished_scores(BUNDESLIGA)
+async def _resolve_german_league(sport_key: str) -> None:
+    """Resolve German leagues with cross-validation between two free providers."""
+    primary = await openligadb_provider.get_finished_scores(sport_key)
+    secondary = await football_data_provider.get_finished_scores(sport_key)
 
     if not primary:
         # Fallback to football-data.org alone
         if secondary:
-            logger.info("Bundesliga: OpenLigaDB empty, using football-data.org alone")
+            logger.info("%s: OpenLigaDB empty, using football-data.org alone", sport_key)
             for score in secondary:
-                match = await _find_match_by_team(BUNDESLIGA, score)
+                match = await _find_match_by_team(sport_key, score)
                 if match:
                     await _resolve_match(
                         match, score["result"],
@@ -174,7 +200,7 @@ async def _resolve_bundesliga() -> None:
         return
 
     for p_score in primary:
-        match = await _find_match_by_team(BUNDESLIGA, p_score)
+        match = await _find_match_by_team(sport_key, p_score)
         if not match:
             continue
 

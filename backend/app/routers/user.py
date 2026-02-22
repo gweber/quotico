@@ -1,13 +1,16 @@
 import logging
-from datetime import datetime, timezone
+from datetime import datetime
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from app.utils import utcnow
+
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pymongo.errors import DuplicateKeyError
 
 from app.database import get_db
 from app.models.user import AliasUpdate
 from app.services.alias_service import validate_alias, normalize_slug
 from app.services.auth_service import get_current_user
+from app.services.audit_service import log_audit
 
 logger = logging.getLogger("quotico.user")
 router = APIRouter(prefix="/api/user", tags=["user"])
@@ -16,6 +19,7 @@ router = APIRouter(prefix="/api/user", tags=["user"])
 @router.patch("/alias")
 async def update_alias(
     body: AliasUpdate,
+    request: Request,
     user=Depends(get_current_user),
     db=Depends(get_db),
 ):
@@ -31,7 +35,7 @@ async def update_alias(
         )
 
     slug = normalize_slug(body.alias)
-    now = datetime.now(timezone.utc)
+    now = utcnow()
 
     try:
         result = await db.users.update_one(
@@ -57,5 +61,11 @@ async def update_alias(
             detail="Alias konnte nicht geändert werden.",
         )
 
-    logger.info("User %s changed alias to: %s", str(user["_id"]), body.alias)
+    user_id = str(user["_id"])
+    old_alias = user.get("alias", "")
+    await log_audit(
+        actor_id=user_id, target_id=user_id, action="ALIAS_CHANGED",
+        metadata={"old_alias": old_alias, "new_alias": body.alias}, request=request,
+    )
+    logger.info("User %s changed alias to: %s", user_id, body.alias)
     return {"message": "Alias erfolgreich geändert.", "alias": body.alias, "alias_slug": slug}

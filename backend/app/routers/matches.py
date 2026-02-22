@@ -51,24 +51,28 @@ async def list_matches(
 async def live_scores(
     sport: Optional[str] = Query(None, description="Filter by sport key"),
 ):
-    """Get live scores from all free providers.
+    """Get live scores — only polls providers for sports with active matches.
 
-    - Bundesliga: OpenLigaDB (priority) + football-data.org fallback
-    - Other soccer: football-data.org
-    - NFL/NBA: ESPN
+    Uses DB as gatekeeper: if no matches have kicked off for a sport,
+    zero external API calls are made.
     """
-    from app.providers.odds_api import SUPPORTED_SPORTS
+    from app.services.match_service import sports_with_live_action
 
-    sport_keys = [sport] if sport else list(SUPPORTED_SPORTS)
+    # Smart gate: only poll sports that actually have matches in progress
+    active_sports = await sports_with_live_action()
+
+    if sport:
+        sport_keys = [sport] if sport in active_sports else []
+    else:
+        sport_keys = list(active_sports)
+
     results: list[LiveScoreResponse] = []
     seen_match_ids: set[str] = set()
 
     for sport_key in sport_keys:
         live_data: list[dict] = []
 
-        # Route to the right provider
         if sport_key in SPORT_TO_LEAGUE:
-            # Bundesliga: prefer OpenLigaDB
             live_data = await openligadb_provider.get_live_scores(sport_key)
             if not live_data:
                 live_data = await football_data_provider.get_live_scores(sport_key)

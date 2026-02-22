@@ -35,6 +35,41 @@ async function fetchBadges() {
 
 onMounted(fetchBadges);
 
+// Security log
+interface SecurityEvent {
+  timestamp: string;
+  action: string;
+  ip_truncated: string;
+}
+
+const securityLog = ref<SecurityEvent[]>([]);
+const securityLogLoading = ref(true);
+
+const actionLabels: Record<string, string> = {
+  LOGIN_SUCCESS: "Anmeldung",
+  LOGIN_FAILED: "Fehlgeschlagene Anmeldung",
+  REGISTER: "Registrierung",
+  AGE_VERIFIED: "Altersverifikation",
+  "2FA_ENABLED": "2FA aktiviert",
+  "2FA_DISABLED": "2FA deaktiviert",
+  ALIAS_CHANGED: "Spielername geändert",
+  DATA_EXPORTED: "Datenexport",
+  ACCOUNT_DELETED: "Konto gelöscht",
+  TERMS_ACCEPTED: "AGB akzeptiert",
+};
+
+async function fetchSecurityLog() {
+  try {
+    securityLog.value = await api.get<SecurityEvent[]>("/gdpr/security-log");
+  } catch {
+    // silently fail
+  } finally {
+    securityLogLoading.value = false;
+  }
+}
+
+onMounted(fetchSecurityLog);
+
 // GDPR Export
 const exporting = ref(false);
 
@@ -144,6 +179,51 @@ async function deleteAccount() {
 
     <!-- 2FA -->
     <TwoFaSetup />
+
+    <!-- Security Log -->
+    <div class="bg-surface-1 rounded-card p-6">
+      <h2 class="text-lg font-semibold text-text-primary mb-1">Sicherheitsprotokoll</h2>
+      <p class="text-sm text-text-secondary mb-4">
+        Deine letzten Anmeldungen und Sicherheitsänderungen.
+      </p>
+
+      <div v-if="securityLogLoading" class="space-y-2">
+        <div v-for="i in 3" :key="i" class="h-10 bg-surface-2 rounded animate-pulse" />
+      </div>
+
+      <div v-else-if="securityLog.length === 0" class="text-sm text-text-muted">
+        Keine Einträge vorhanden.
+      </div>
+
+      <div v-else class="overflow-x-auto -mx-6 px-6">
+        <table class="w-full text-sm">
+          <thead>
+            <tr class="text-left text-text-muted border-b border-surface-3">
+              <th class="pb-2 pr-4 font-medium">Datum</th>
+              <th class="pb-2 pr-4 font-medium">Aktion</th>
+              <th class="pb-2 font-medium">IP</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr
+              v-for="(entry, idx) in securityLog"
+              :key="idx"
+              class="border-b border-surface-3/50 last:border-0"
+            >
+              <td class="py-2 pr-4 text-text-primary whitespace-nowrap">
+                {{ new Date(entry.timestamp).toLocaleString("de-DE", { day: "2-digit", month: "2-digit", year: "numeric", hour: "2-digit", minute: "2-digit" }) }}
+              </td>
+              <td class="py-2 pr-4 text-text-primary">
+                {{ actionLabels[entry.action] || entry.action }}
+              </td>
+              <td class="py-2 text-text-muted font-mono text-xs">
+                {{ entry.ip_truncated || "-" }}
+              </td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
 
     <!-- GDPR Export -->
     <div class="bg-surface-1 rounded-card p-6">

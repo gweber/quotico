@@ -51,6 +51,21 @@ BADGE_DEFINITIONS = {
         "description": "100 Punkte erreicht",
         "icon": "\uD83D\uDCAF",
     },
+    "spieltag_debut": {
+        "name": "Spieltag-Debüt",
+        "description": "Deinen ersten Spieltag getippt",
+        "icon": "\uD83D\uDCCB",
+    },
+    "hellseher": {
+        "name": "Hellseher",
+        "description": "Ein exaktes Ergebnis vorhergesagt (3 Punkte)",
+        "icon": "\uD83D\uDD2E",
+    },
+    "perfekter_spieltag": {
+        "name": "Perfekter Spieltag",
+        "description": "Alle Spiele eines Spieltags exakt getippt",
+        "icon": "\u2B50",
+    },
 }
 
 

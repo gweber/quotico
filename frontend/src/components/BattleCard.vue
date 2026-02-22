@@ -18,7 +18,10 @@ const needsCommitment = computed(() => props.battle.needs_commitment ?? !hasComm
 const scoreA = computed(() => props.battle.result?.squad_a_avg ?? props.battle.squad_a.avg_points ?? 0);
 const scoreB = computed(() => props.battle.result?.squad_b_avg ?? props.battle.squad_b.avg_points ?? 0);
 const total = computed(() => scoreA.value + scoreB.value || 1);
-const percentA = computed(() => Math.round((scoreA.value / total.value) * 100));
+const percentA = computed(() => {
+  if (scoreA.value === 0 && scoreB.value === 0) return 50;
+  return Math.round((scoreA.value / total.value) * 100);
+});
 const percentB = computed(() => 100 - percentA.value);
 
 const formatDate = (iso: string) =>
@@ -78,13 +81,20 @@ const committedSquadName = computed(() => {
           <span>{{ scoreA.toFixed(1) }} Pkt</span>
           <span>{{ scoreB.toFixed(1) }} Pkt</span>
         </div>
-        <div class="h-3 rounded-full bg-surface-3 overflow-hidden flex">
+        <div
+          class="h-3 rounded-full bg-surface-3 overflow-hidden flex"
+          role="progressbar"
+          :aria-valuenow="percentA"
+          aria-valuemin="0"
+          aria-valuemax="100"
+          :aria-label="`${battle.squad_a.name} ${percentA}%, ${battle.squad_b.name} ${percentB}%`"
+        >
           <div
-            class="h-full bg-primary transition-all duration-700 ease-out rounded-l-full"
+            class="h-full bg-primary transition-all duration-700 ease-out"
             :style="{ width: `${percentA}%` }"
           />
           <div
-            class="h-full bg-danger transition-all duration-700 ease-out rounded-r-full"
+            class="h-full bg-danger transition-all duration-700 ease-out"
             :style="{ width: `${percentB}%` }"
           />
         </div>

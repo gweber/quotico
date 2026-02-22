@@ -1,0 +1,4 @@
+- keep CLAUDE.md up to date
+- never expose emails in the public frontend, only in user's own backend view allowed and in admin view. 
+- greenfield development, no shims, no migration paths
+- mongo datetime awareness

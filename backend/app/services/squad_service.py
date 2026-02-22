@@ -1,13 +1,13 @@
 import logging
 import secrets
 import string
-from datetime import datetime, timezone
 from typing import Optional
 
 from bson import ObjectId
 from fastapi import HTTPException, status
 
 import app.database as _db
+from app.utils import utcnow
 
 logger = logging.getLogger("quotico.squad_service")
 
@@ -35,7 +35,7 @@ async def create_squad(admin_id: str, name: str, description: Optional[str] = No
             detail="Konnte keinen Einladungscode generieren.",
         )
 
-    now = datetime.now(timezone.utc)
+    now = utcnow()
     squad_doc = {
         "name": name,
         "description": description,
@@ -77,7 +77,7 @@ async def join_squad(user_id: str, invite_code: str) -> dict:
         {"_id": squad["_id"]},
         {
             "$addToSet": {"members": user_id},
-            "$set": {"updated_at": datetime.now(timezone.utc)},
+            "$set": {"updated_at": utcnow()},
         },
     )
 
@@ -101,7 +101,7 @@ async def leave_squad(user_id: str, squad_id: str) -> None:
         {"_id": ObjectId(squad_id)},
         {
             "$pull": {"members": user_id},
-            "$set": {"updated_at": datetime.now(timezone.utc)},
+            "$set": {"updated_at": utcnow()},
         },
     )
 
@@ -122,7 +122,7 @@ async def remove_member(admin_id: str, squad_id: str, member_id: str) -> None:
         {"_id": ObjectId(squad_id)},
         {
             "$pull": {"members": member_id},
-            "$set": {"updated_at": datetime.now(timezone.utc)},
+            "$set": {"updated_at": utcnow()},
         },
     )
 

@@ -29,6 +29,7 @@ const cards = [
   { to: "/admin/users", label: "User Management", icon: "\uD83D\uDC65" },
   { to: "/admin/matches", label: "Match Management", icon: "\u26BD" },
   { to: "/admin/battles", label: "Battle Management", icon: "\u2694\uFE0F" },
+  { to: "/admin/audit", label: "Audit Log", icon: "\uD83D\uDCDC" },
 ];
 </script>
 

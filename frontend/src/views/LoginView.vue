@@ -1,12 +1,25 @@
 <script setup lang="ts">
-import { ref } from "vue";
-import { useRouter } from "vue-router";
+import { ref, computed } from "vue";
+import { useRouter, useRoute } from "vue-router";
 import { useAuthStore } from "@/stores/auth";
 import { useToast } from "@/composables/useToast";
 
 const router = useRouter();
+const route = useRoute();
 const auth = useAuthStore();
 const toast = useToast();
+
+const redirectTarget = computed(() => {
+  const r = route.query.redirect as string | undefined;
+  // Only allow local paths (prevent open redirect)
+  return r && r.startsWith("/") ? r : "/";
+});
+
+const googleAuthUrl = computed(() => {
+  const base = "/api/auth/google";
+  const r = route.query.redirect as string | undefined;
+  return r && r.startsWith("/") ? `${base}?redirect=${encodeURIComponent(r)}` : base;
+});
 
 const email = ref("");
 const password = ref("");
@@ -29,7 +42,7 @@ async function handleLogin() {
       // 2FA verification step
       await auth.login2fa(email.value, password.value, totpCode.value);
       toast.success("Erfolgreich angemeldet!");
-      router.push("/");
+      router.push(redirectTarget.value);
     } else {
       const result = await auth.login(email.value, password.value);
       if (result.requires2fa) {
@@ -37,7 +50,7 @@ async function handleLogin() {
         return;
       }
       toast.success("Erfolgreich angemeldet!");
-      router.push("/");
+      router.push(redirectTarget.value);
     }
   } catch (e: unknown) {
     const msg = e instanceof Error ? e.message : "Anmeldung fehlgeschlagen.";
@@ -156,7 +169,7 @@ async function handleLogin() {
 
       <!-- Google login -->
       <a
-        href="/api/auth/google"
+        :href="googleAuthUrl"
         class="w-full flex items-center justify-center gap-3 py-3 rounded-lg border border-surface-3 bg-surface-2 text-text-primary text-sm font-medium hover:bg-surface-3 transition-colors"
       >
         <svg class="w-5 h-5" viewBox="0 0 24 24">

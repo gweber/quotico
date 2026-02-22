@@ -1,30 +1,24 @@
+import csv
+import io
 import logging
 import re
 from datetime import datetime, timezone
 from typing import Optional
 
 from bson import ObjectId
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 import app.database as _db
 from app.services.alias_service import generate_default_alias
-from app.services.auth_service import get_admin_user
+from app.services.auth_service import get_admin_user, invalidate_user_tokens
+from app.services.audit_service import log_audit
 from app.providers.odds_api import odds_provider
+from app.utils import ensure_utc, utcnow
 
 logger = logging.getLogger("quotico.admin")
 router = APIRouter(prefix="/api/admin", tags=["admin"])
-
-
-async def _audit(admin_id: str, action: str, target_id: str, details: dict | None = None) -> None:
-    """Write an immutable audit record to the admin_audit_log collection."""
-    await _db.db.admin_audit_log.insert_one({
-        "admin_id": admin_id,
-        "action": action,
-        "target_id": target_id,
-        "details": details or {},
-        "timestamp": datetime.now(timezone.utc),
-    })
 
 
 # --- Request models ---
@@ -52,7 +46,7 @@ class BattleCreateAdmin(BaseModel):
 @router.get("/stats")
 async def admin_stats(admin=Depends(get_admin_user)):
     """Admin dashboard stats."""
-    now = datetime.now(timezone.utc)
+    now = utcnow()
 
     user_count = await _db.db.users.count_documents({"is_deleted": False})
     active_today = await _db.db.tips.count_documents({
@@ -91,6 +85,7 @@ async def admin_stats(admin=Depends(get_admin_user)):
 
 @router.get("/users")
 async def list_users(
+    request: Request,
     search: Optional[str] = Query(None),
     limit: int = Query(50, ge=1, le=200),
     admin=Depends(get_admin_user),
@@ -105,6 +100,17 @@ async def list_users(
         ]
 
     users = await _db.db.users.find(query).sort("created_at", -1).limit(limit).to_list(length=limit)
+
+    # GDPR: log data access when admin views user profiles
+    admin_id = str(admin["_id"])
+    for u in users:
+        await log_audit(
+            actor_id=admin_id,
+            target_id=str(u["_id"]),
+            action="USER_PROFILE_VIEWED",
+            request=request,
+        )
+
     return [
         {
             "id": str(u["_id"]),
@@ -124,14 +130,14 @@ async def list_users(
 
 @router.post("/users/{user_id}/points")
 async def adjust_points(
-    user_id: str, body: PointsAdjust, admin=Depends(get_admin_user)
+    user_id: str, body: PointsAdjust, request: Request, admin=Depends(get_admin_user)
 ):
     """Manually adjust a user's points."""
     user = await _db.db.users.find_one({"_id": ObjectId(user_id)})
     if not user:
         raise HTTPException(status_code=404, detail="Nutzer nicht gefunden.")
 
-    now = datetime.now(timezone.utc)
+    now = utcnow()
     await _db.db.users.update_one(
         {"_id": ObjectId(user_id)},
         {"$inc": {"points": body.delta}, "$set": {"updated_at": now}},
@@ -148,12 +154,15 @@ async def adjust_points(
 
     admin_id = str(admin["_id"])
     logger.info("Admin %s adjusted points for %s: %+.1f (%s)", admin_id, user_id, body.delta, body.reason)
-    await _audit(admin_id, "points_adjust", user_id, {"delta": body.delta, "reason": body.reason})
+    await log_audit(
+        actor_id=admin_id, target_id=user_id, action="MANUAL_SCORE_ADJUSTMENT",
+        metadata={"delta": body.delta, "reason": body.reason}, request=request,
+    )
     return {"message": f"Punkte angepasst: {body.delta:+.1f}", "new_total": user.get("points", 0) + body.delta}
 
 
 @router.post("/users/{user_id}/ban")
-async def ban_user(user_id: str, admin=Depends(get_admin_user)):
+async def ban_user(user_id: str, request: Request, admin=Depends(get_admin_user)):
     """Ban a user."""
     user = await _db.db.users.find_one({"_id": ObjectId(user_id)})
     if not user:
@@ -163,27 +172,30 @@ async def ban_user(user_id: str, admin=Depends(get_admin_user)):
 
     await _db.db.users.update_one(
         {"_id": ObjectId(user_id)},
-        {"$set": {"is_banned": True, "updated_at": datetime.now(timezone.utc)}},
+        {"$set": {"is_banned": True, "updated_at": utcnow()}},
     )
+    await invalidate_user_tokens(user_id)
     admin_id = str(admin["_id"])
     logger.info("Admin %s banned user %s", admin_id, user_id)
-    await _audit(admin_id, "ban_user", user_id)
+    await log_audit(actor_id=admin_id, target_id=user_id, action="USER_BAN", request=request)
     return {"message": f"{user['email']} wurde gesperrt."}
 
 
 @router.post("/users/{user_id}/unban")
-async def unban_user(user_id: str, admin=Depends(get_admin_user)):
+async def unban_user(user_id: str, request: Request, admin=Depends(get_admin_user)):
     """Unban a user."""
     await _db.db.users.update_one(
         {"_id": ObjectId(user_id)},
-        {"$set": {"is_banned": False, "updated_at": datetime.now(timezone.utc)}},
+        {"$set": {"is_banned": False, "updated_at": utcnow()}},
     )
-    await _audit(str(admin["_id"]), "unban_user", user_id)
+    await log_audit(
+        actor_id=str(admin["_id"]), target_id=user_id, action="USER_UNBAN", request=request,
+    )
     return {"message": "Sperre aufgehoben."}
 
 
 @router.post("/users/{user_id}/reset-alias")
-async def reset_alias(user_id: str, admin=Depends(get_admin_user)):
+async def reset_alias(user_id: str, request: Request, admin=Depends(get_admin_user)):
     """Reset a user's alias back to a default User#XXXXXX tag."""
     user = await _db.db.users.find_one({"_id": ObjectId(user_id)})
     if not user:
@@ -191,7 +203,7 @@ async def reset_alias(user_id: str, admin=Depends(get_admin_user)):
 
     old_alias = user.get("alias", "")
     alias, alias_slug = await generate_default_alias(_db.db)
-    now = datetime.now(timezone.utc)
+    now = utcnow()
 
     await _db.db.users.update_one(
         {"_id": ObjectId(user_id)},
@@ -207,7 +219,10 @@ async def reset_alias(user_id: str, admin=Depends(get_admin_user)):
 
     admin_id = str(admin["_id"])
     logger.info("Admin %s reset alias for %s: %s → %s", admin_id, user_id, old_alias, alias)
-    await _audit(admin_id, "reset_alias", user_id, {"old_alias": old_alias, "new_alias": alias})
+    await log_audit(
+        actor_id=admin_id, target_id=user_id, action="ALIAS_RESET",
+        metadata={"old_alias": old_alias, "new_alias": alias}, request=request,
+    )
     return {"message": f"Alias zurückgesetzt: {old_alias} → {alias}"}
 
 
@@ -245,14 +260,14 @@ async def list_all_matches(
 
 @router.post("/matches/{match_id}/override")
 async def override_result(
-    match_id: str, body: ResultOverride, admin=Depends(get_admin_user)
+    match_id: str, body: ResultOverride, request: Request, admin=Depends(get_admin_user)
 ):
     """Override a match result (force settle)."""
     match = await _db.db.matches.find_one({"_id": ObjectId(match_id)})
     if not match:
         raise HTTPException(status_code=404, detail="Spiel nicht gefunden.")
 
-    now = datetime.now(timezone.utc)
+    now = utcnow()
     old_result = match.get("result")
 
     # Update match
@@ -279,21 +294,23 @@ async def override_result(
         admin_id, match_id, old_result, body.result,
         body.home_score, body.away_score,
     )
-    await _audit(admin_id, "match_override", match_id, {
-        "old_result": old_result,
-        "new_result": body.result,
-        "home_score": body.home_score,
-        "away_score": body.away_score,
-    })
+    await log_audit(
+        actor_id=admin_id, target_id=match_id, action="MATCH_OVERRIDE",
+        metadata={
+            "old_result": old_result, "new_result": body.result,
+            "home_score": body.home_score, "away_score": body.away_score,
+        },
+        request=request,
+    )
     return {"message": f"Ergebnis überschrieben: {body.result} ({body.home_score}-{body.away_score})"}
 
 
 @router.post("/matches/{match_id}/force-settle")
 async def force_settle(
-    match_id: str, body: ResultOverride, admin=Depends(get_admin_user)
+    match_id: str, body: ResultOverride, request: Request, admin=Depends(get_admin_user)
 ):
     """Force settle a match that hasn't been resolved yet."""
-    return await override_result(match_id, body, admin)
+    return await override_result(match_id, body, request, admin)
 
 
 async def _re_resolve_tips(match_id: str, new_result: str, now: datetime, admin: dict) -> None:
@@ -336,7 +353,7 @@ async def _re_resolve_tips(match_id: str, new_result: str, now: datetime, admin:
 
 @router.post("/battles")
 async def create_battle_admin(
-    body: BattleCreateAdmin, admin=Depends(get_admin_user)
+    body: BattleCreateAdmin, request: Request, admin=Depends(get_admin_user)
 ):
     """Admin creates a battle between any two squads."""
     squad_a = await _db.db.squads.find_one({"_id": ObjectId(body.squad_a_id)})
@@ -347,13 +364,14 @@ async def create_battle_admin(
     if body.squad_a_id == body.squad_b_id:
         raise HTTPException(status_code=400, detail="Squad kann nicht gegen sich selbst kämpfen.")
 
-    now = datetime.now(timezone.utc)
+    now = utcnow()
+    start_time = ensure_utc(body.start_time)
     battle_doc = {
         "squad_a_id": body.squad_a_id,
         "squad_b_id": body.squad_b_id,
-        "start_time": body.start_time,
+        "start_time": start_time,
         "end_time": body.end_time,
-        "status": "upcoming" if body.start_time > now else "active",
+        "status": "upcoming" if start_time > now else "active",
         "result": None,
         "created_at": now,
         "updated_at": now,
@@ -363,10 +381,11 @@ async def create_battle_admin(
     battle_id = str(result.inserted_id)
     admin_id = str(admin["_id"])
     logger.info("Admin %s created battle %s: %s vs %s", admin_id, battle_id, squad_a["name"], squad_b["name"])
-    await _audit(admin_id, "create_battle", battle_id, {
-        "squad_a_id": body.squad_a_id,
-        "squad_b_id": body.squad_b_id,
-    })
+    await log_audit(
+        actor_id=admin_id, target_id=battle_id, action="BATTLE_CREATE",
+        metadata={"squad_a_id": body.squad_a_id, "squad_b_id": body.squad_b_id},
+        request=request,
+    )
     return {
         "id": battle_id,
         "message": f"Battle erstellt: {squad_a['name']} vs {squad_b['name']}",
@@ -390,3 +409,127 @@ async def list_squads(
         }
         for s in squads
     ]
+
+
+# --- Audit Log Viewer ---
+
+@router.get("/audit-logs")
+async def list_audit_logs(
+    action: Optional[str] = Query(None),
+    actor_id: Optional[str] = Query(None),
+    target_id: Optional[str] = Query(None),
+    date_from: Optional[str] = Query(None),
+    date_to: Optional[str] = Query(None),
+    limit: int = Query(50, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+    admin=Depends(get_admin_user),
+):
+    """List audit logs with filtering and pagination (admin only)."""
+    query: dict = {}
+    if action:
+        query["action"] = action
+    if actor_id:
+        query["actor_id"] = actor_id
+    if target_id:
+        query["target_id"] = target_id
+    if date_from or date_to:
+        ts_query: dict = {}
+        if date_from:
+            try:
+                ts_query["$gte"] = datetime.strptime(date_from, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+            except ValueError:
+                pass
+        if date_to:
+            try:
+                ts_query["$lte"] = datetime.strptime(date_to, "%Y-%m-%d").replace(
+                    hour=23, minute=59, second=59, tzinfo=timezone.utc
+                )
+            except ValueError:
+                pass
+        if ts_query:
+            query["timestamp"] = ts_query
+
+    total = await _db.db.audit_logs.count_documents(query)
+    logs = await _db.db.audit_logs.find(query).sort("timestamp", -1).skip(offset).limit(limit).to_list(length=limit)
+
+    return {
+        "total": total,
+        "offset": offset,
+        "limit": limit,
+        "items": [
+            {
+                "id": str(entry["_id"]),
+                "timestamp": entry["timestamp"].isoformat(),
+                "actor_id": entry["actor_id"],
+                "target_id": entry["target_id"],
+                "action": entry["action"],
+                "metadata": entry.get("metadata", {}),
+                "ip_truncated": entry.get("ip_truncated", ""),
+            }
+            for entry in logs
+        ],
+    }
+
+
+@router.get("/audit-logs/actions")
+async def list_audit_actions(admin=Depends(get_admin_user)):
+    """List all distinct action types in the audit log."""
+    actions = await _db.db.audit_logs.distinct("action")
+    return sorted(actions)
+
+
+@router.get("/audit-logs/export")
+async def export_audit_logs(
+    action: Optional[str] = Query(None),
+    actor_id: Optional[str] = Query(None),
+    target_id: Optional[str] = Query(None),
+    date_from: Optional[str] = Query(None),
+    date_to: Optional[str] = Query(None),
+    admin=Depends(get_admin_user),
+):
+    """Export audit logs as CSV for regulatory requests (admin only)."""
+    query: dict = {}
+    if action:
+        query["action"] = action
+    if actor_id:
+        query["actor_id"] = actor_id
+    if target_id:
+        query["target_id"] = target_id
+    if date_from or date_to:
+        ts_query: dict = {}
+        if date_from:
+            try:
+                ts_query["$gte"] = datetime.strptime(date_from, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+            except ValueError:
+                pass
+        if date_to:
+            try:
+                ts_query["$lte"] = datetime.strptime(date_to, "%Y-%m-%d").replace(
+                    hour=23, minute=59, second=59, tzinfo=timezone.utc
+                )
+            except ValueError:
+                pass
+        if ts_query:
+            query["timestamp"] = ts_query
+
+    logs = await _db.db.audit_logs.find(query).sort("timestamp", -1).to_list(length=50000)
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["timestamp", "actor_id", "target_id", "action", "metadata", "ip_truncated"])
+    for entry in logs:
+        writer.writerow([
+            entry["timestamp"].isoformat(),
+            entry["actor_id"],
+            entry["target_id"],
+            entry["action"],
+            str(entry.get("metadata", {})),
+            entry.get("ip_truncated", ""),
+        ])
+
+    output.seek(0)
+    return StreamingResponse(
+        iter([output.getvalue()]),
+        media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=quotico-audit-logs.csv"},
+    )

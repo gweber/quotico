@@ -9,6 +9,7 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 import app.database as _db
 from app.services.auth_service import decode_jwt
+from app.services.match_service import sports_with_live_action, next_kickoff_in
 from app.providers.football_data import (
     SPORT_TO_COMPETITION,
     football_data_provider,
@@ -16,13 +17,18 @@ from app.providers.football_data import (
 )
 from app.providers.openligadb import openligadb_provider, SPORT_TO_LEAGUE
 from app.providers.espn import espn_provider, SPORT_TO_ESPN
-from app.providers.odds_api import SUPPORTED_SPORTS
 
 logger = logging.getLogger("quotico.ws")
 
 router = APIRouter()
 
 MAX_WS_CONNECTIONS = 500
+
+# Adaptive polling intervals (seconds)
+_INTERVAL_LIVE = 30         # matches in progress → 30s
+_INTERVAL_PRE_GAME = 120    # kickoff within 30 min → 2 min
+_INTERVAL_DORMANT = 900     # nothing for next 6h → 15 min heartbeat
+_INTERVAL_DEAD_ZONE = None  # nothing today → stop polling (wake on next connect)
 
 
 class LiveScoreManager:
@@ -71,20 +77,54 @@ class LiveScoreManager:
             self._poll_task = asyncio.create_task(self._poll_loop())
 
     async def _poll_loop(self) -> None:
-        """Poll providers every 30s and broadcast changes."""
+        """Adaptive poll loop: adjusts interval based on match schedule.
+
+        Intervals:
+        - Active Play (matches live):     30s, poll only active sports
+        - Pre-Game (kickoff within 30m):  2 min, DB check only
+        - Dormant (nothing for 6h):       15 min heartbeat
+        - Dead Zone (nothing today):      stop polling entirely
+        """
         while self.connections:
             try:
-                await self._fetch_and_broadcast()
+                live_sports = await sports_with_live_action()
+
+                if live_sports:
+                    # Active Play — poll only sports with live matches
+                    await self._fetch_and_broadcast(live_sports)
+                    interval = _INTERVAL_LIVE
+                else:
+                    # Nothing live — clear stale scores
+                    if self._last_scores:
+                        self._last_scores = {}
+                        await self._broadcast_empty()
+
+                    # Determine wake-up schedule
+                    upcoming = await next_kickoff_in()
+                    if upcoming and upcoming < timedelta(minutes=30):
+                        interval = _INTERVAL_PRE_GAME
+                        logger.debug("WS pre-game: kickoff in %s, checking every %ds", upcoming, interval)
+                    elif upcoming and upcoming < timedelta(hours=6):
+                        interval = _INTERVAL_DORMANT
+                        logger.debug("WS dormant: next kickoff in %s, heartbeat every %ds", upcoming, interval)
+                    else:
+                        # Dead Zone — nothing today, stop polling
+                        logger.info("WS dead zone: no matches upcoming, stopping poll loop")
+                        self._poll_task = None
+                        return  # exits the loop; _start_polling re-creates on next connect
+
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.error("WS poll error: %s", e)
-            await asyncio.sleep(30)
+                interval = _INTERVAL_LIVE  # on error, keep trying at normal rate
 
-    async def _fetch_and_broadcast(self) -> None:
+            await asyncio.sleep(interval)
+
+    async def _fetch_and_broadcast(self, live_sports: set[str]) -> None:
         new_scores: dict[str, dict] = {}
 
-        for sport_key in SUPPORTED_SPORTS:
+        for sport_key in live_sports:
             live_data: list[dict] = []
 
             if sport_key in SPORT_TO_LEAGUE:
@@ -118,6 +158,20 @@ class LiveScoreManager:
                     dead.append(ws)
             for ws in dead:
                 self.disconnect(ws)
+
+    async def _broadcast_empty(self) -> None:
+        """Broadcast empty scores when all matches have ended."""
+        if not self.connections:
+            return
+        message = {"type": "live_scores", "data": []}
+        dead: list[WebSocket] = []
+        for ws in self.connections:
+            try:
+                await ws.send_json(message)
+            except Exception:
+                dead.append(ws)
+        for ws in dead:
+            self.disconnect(ws)
 
     async def broadcast_match_resolved(self, match_id: str, result: str) -> None:
         """Notify clients when a match is resolved."""

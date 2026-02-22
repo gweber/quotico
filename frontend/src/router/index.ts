@@ -1,4 +1,5 @@
 import { createRouter, createWebHistory } from "vue-router";
+import { useAuthStore } from "@/stores/auth";
 
 const router = createRouter({
   history: createWebHistory(),
@@ -19,6 +20,12 @@ const router = createRouter({
       name: "register",
       component: () => import("@/views/RegisterView.vue"),
       meta: { guest: true },
+    },
+    {
+      path: "/complete-profile",
+      name: "complete-profile",
+      component: () => import("@/views/CompleteProfileView.vue"),
+      meta: { requiresAuth: true },
     },
     {
       path: "/leaderboard",
@@ -44,11 +51,26 @@ const router = createRouter({
       meta: { requiresAuth: true },
     },
     {
+      path: "/spieltag/:sport?/:matchday?",
+      name: "spieltag",
+      component: () => import("@/views/SpieltagView.vue"),
+    },
+    {
       path: "/settings",
       name: "settings",
       component: () => import("@/views/SettingsView.vue"),
       meta: { requiresAuth: true },
     },
+    // Legal
+    {
+      path: "/legal/:section",
+      name: "legal",
+      component: () => import("@/views/LegalView.vue"),
+    },
+    { path: "/impressum", redirect: "/legal/impressum" },
+    { path: "/datenschutz", redirect: "/legal/datenschutz" },
+    { path: "/agb", redirect: "/legal/agb" },
+    { path: "/jugendschutz", redirect: "/legal/jugendschutz" },
     // Admin routes
     {
       path: "/admin",
@@ -74,7 +96,43 @@ const router = createRouter({
       component: () => import("@/views/admin/AdminBattleManager.vue"),
       meta: { requiresAuth: true, requiresAdmin: true },
     },
+    {
+      path: "/admin/audit",
+      name: "admin-audit",
+      component: () => import("@/views/admin/AdminAuditLog.vue"),
+      meta: { requiresAuth: true, requiresAdmin: true },
+    },
   ],
+});
+
+router.beforeEach((to) => {
+  const auth = useAuthStore();
+
+  // Auth guard: redirect unauthenticated users to login
+  if (to.meta.requiresAuth && !auth.isLoggedIn) {
+    return { name: "login", query: { redirect: to.fullPath } };
+  }
+
+  // Guest guard: redirect authenticated users away from login/register
+  if (to.meta.guest && auth.isLoggedIn) {
+    return { name: "dashboard" };
+  }
+
+  // Admin guard: redirect non-admins to dashboard
+  if (to.meta.requiresAdmin && !auth.isAdmin) {
+    return { name: "dashboard" };
+  }
+
+  // Age gate: redirect users who haven't completed profile
+  if (
+    auth.needsProfileCompletion &&
+    to.name !== "complete-profile" &&
+    to.name !== "login" &&
+    to.name !== "register" &&
+    to.name !== "legal"
+  ) {
+    return { name: "complete-profile" };
+  }
 });
 
 export default router;

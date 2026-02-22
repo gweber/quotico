@@ -1,16 +1,32 @@
 import logging
+from datetime import datetime, timedelta, timezone
 
 import app.database as _db
+from app.workers._state import recently_synced, set_synced
 
 logger = logging.getLogger("quotico.leaderboard")
+
+_STATE_KEY = "leaderboard"
 
 
 async def materialize_leaderboard() -> None:
     """Recompute the materialized leaderboard collection from users.
 
+    Smart sleep: skips if no points were awarded since last materialization.
     Runs after match resolution to keep leaderboard up to date.
     Stores alias (public name) instead of email — no PII in materialized view.
     """
+    # Check if any points were awarded since last run
+    from app.workers._state import get_synced_at
+    last_run = await get_synced_at(_STATE_KEY)
+    if last_run:
+        recent_activity = await _db.db.points_transactions.find_one(
+            {"created_at": {"$gte": last_run}},
+        )
+        if not recent_activity:
+            logger.debug("Smart sleep: no new points since last run, skipping leaderboard")
+            return
+
     pipeline = [
         {"$match": {"is_deleted": False, "points": {"$gt": 0}}},
         {"$sort": {"points": -1}},
@@ -37,4 +53,5 @@ async def materialize_leaderboard() -> None:
     ]
 
     await _db.db.leaderboard.insert_many(docs)
+    await set_synced(_STATE_KEY)
     logger.info("Leaderboard materialized: %d entries", len(docs))

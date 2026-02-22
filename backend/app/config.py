@@ -36,6 +36,9 @@ class Settings(BaseSettings):
     # football-data.org (free scores + live data)
     FOOTBALL_DATA_API_KEY: str = ""
 
+    # API key for local tools (scraper import etc.)
+    IMPORT_API_KEY: str = ""
+
     model_config = {"env_file": str(_ENV_FILE), "extra": "ignore"}
 
 

@@ -10,6 +10,8 @@ export interface User {
   points: number;
   is_admin: boolean;
   is_2fa_enabled: boolean;
+  is_adult: boolean;
+  terms_accepted_version: string | null;
   created_at: string;
 }
 
@@ -20,6 +22,9 @@ export const useAuthStore = defineStore("auth", () => {
 
   const isLoggedIn = computed(() => user.value !== null);
   const isAdmin = computed(() => user.value?.is_admin === true);
+  const needsProfileCompletion = computed(
+    () => user.value !== null && !user.value.is_adult
+  );
 
   async function fetchUser() {
     try {
@@ -46,10 +51,33 @@ export const useAuthStore = defineStore("auth", () => {
     }
   }
 
-  async function register(email: string, password: string) {
+  async function register(
+    email: string,
+    password: string,
+    birthDate: string,
+    disclaimerAccepted: boolean
+  ) {
     loading.value = true;
     try {
-      await api.post("/auth/register", { email, password });
+      await api.post("/auth/register", {
+        email,
+        password,
+        birth_date: birthDate,
+        disclaimer_accepted: disclaimerAccepted,
+      });
+      await fetchUser();
+    } finally {
+      loading.value = false;
+    }
+  }
+
+  async function completeProfile(birthDate: string, disclaimerAccepted: boolean) {
+    loading.value = true;
+    try {
+      await api.post("/auth/complete-profile", {
+        birth_date: birthDate,
+        disclaimer_accepted: disclaimerAccepted,
+      });
       await fetchUser();
     } finally {
       loading.value = false;
@@ -71,5 +99,8 @@ export const useAuthStore = defineStore("auth", () => {
     user.value = null;
   }
 
-  return { user, loading, isLoggedIn, isAdmin, fetchUser, login, login2fa, register, logout };
+  return {
+    user, loading, isLoggedIn, isAdmin, needsProfileCompletion,
+    fetchUser, login, login2fa, register, completeProfile, logout,
+  };
 });

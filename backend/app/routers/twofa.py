@@ -5,11 +5,12 @@ import logging
 import pyotp
 import qrcode
 from bson import ObjectId
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel
 
 from app.database import get_db
 from app.services.auth_service import get_current_user
+from app.services.audit_service import log_audit
 from app.services.encryption import (
     encrypt,
     decrypt,
@@ -73,7 +74,7 @@ async def setup_2fa(user=Depends(get_current_user), db=Depends(get_db)):
 
 
 @router.post("/verify")
-async def verify_2fa(body: TwoFAVerify, user=Depends(get_current_user), db=Depends(get_db)):
+async def verify_2fa(body: TwoFAVerify, request: Request, user=Depends(get_current_user), db=Depends(get_db)):
     """Verify a TOTP code and activate 2FA."""
     encrypted_secret = user.get("encrypted_2fa_secret")
     if not encrypted_secret:
@@ -114,12 +115,14 @@ async def verify_2fa(body: TwoFAVerify, user=Depends(get_current_user), db=Depen
         {"$set": {"is_2fa_enabled": True}},
     )
 
-    logger.info("2FA activated for user %s", str(user["_id"]))
+    user_id = str(user["_id"])
+    await log_audit(actor_id=user_id, target_id=user_id, action="2FA_ENABLED", request=request)
+    logger.info("2FA activated for user %s", user_id)
     return {"message": "2FA erfolgreich aktiviert."}
 
 
 @router.post("/disable")
-async def disable_2fa(body: TwoFAVerify, user=Depends(get_current_user), db=Depends(get_db)):
+async def disable_2fa(body: TwoFAVerify, request: Request, user=Depends(get_current_user), db=Depends(get_db)):
     """Disable 2FA. Requires a valid TOTP code for security."""
     if not user.get("is_2fa_enabled"):
         raise HTTPException(
@@ -148,5 +151,7 @@ async def disable_2fa(body: TwoFAVerify, user=Depends(get_current_user), db=Depe
         },
     )
 
-    logger.info("2FA disabled for user %s", str(user["_id"]))
+    user_id = str(user["_id"])
+    await log_audit(actor_id=user_id, target_id=user_id, action="2FA_DISABLED", request=request)
+    logger.info("2FA disabled for user %s", user_id)
     return {"message": "2FA deaktiviert."}

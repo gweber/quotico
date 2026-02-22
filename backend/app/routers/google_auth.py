@@ -1,6 +1,8 @@
 import logging
 import secrets
-from datetime import datetime, timezone
+from datetime import datetime
+
+from app.utils import utcnow
 from urllib.parse import urlencode
 
 import httpx
@@ -11,6 +13,7 @@ from app.config import settings
 from app.database import get_db
 from app.services.alias_service import generate_default_alias
 from app.services.auth_service import create_access_token, create_refresh_token, set_auth_cookies
+from app.services.audit_service import log_audit
 
 logger = logging.getLogger("quotico.google_auth")
 router = APIRouter(prefix="/api/auth/google", tags=["google-auth"])
@@ -35,6 +38,11 @@ async def google_login(request: Request):
 
     state = secrets.token_urlsafe(32)
     request.session["oauth_state"] = state
+
+    # Preserve redirect target through the OAuth flow
+    redirect = request.query_params.get("redirect", "")
+    if redirect and redirect.startswith("/"):
+        request.session["oauth_redirect"] = redirect
 
     params = {
         "client_id": settings.GOOGLE_CLIENT_ID,
@@ -61,7 +69,7 @@ async def google_callback(request: Request, code: str = "", state: str = "", err
         return RedirectResponse("/login?error=invalid_state")
 
     # Exchange code for tokens
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(timeout=15.0) as client:
         token_resp = await client.post(GOOGLE_TOKEN_URL, data={
             "client_id": settings.GOOGLE_CLIENT_ID,
             "client_secret": settings.GOOGLE_CLIENT_SECRET,
@@ -78,7 +86,7 @@ async def google_callback(request: Request, code: str = "", state: str = "", err
     access_token = tokens.get("access_token")
 
     # Fetch user info
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(timeout=15.0) as client:
         userinfo_resp = await client.get(
             GOOGLE_USERINFO_URL,
             headers={"Authorization": f"Bearer {access_token}"},
@@ -99,7 +107,7 @@ async def google_callback(request: Request, code: str = "", state: str = "", err
     db = await get_db()
     user = await db.users.find_one({"email": google_email, "is_deleted": False})
 
-    now = datetime.now(timezone.utc)
+    now = utcnow()
 
     if user:
         # Link Google sub if not already linked
@@ -112,6 +120,7 @@ async def google_callback(request: Request, code: str = "", state: str = "", err
             return RedirectResponse("/login?error=banned")
     else:
         # Create new user (no password — Google-only)
+        # is_adult=False — user must complete profile with age verification
         alias, alias_slug = await generate_default_alias(db)
         user_doc = {
             "email": google_email,
@@ -127,11 +136,17 @@ async def google_callback(request: Request, code: str = "", state: str = "", err
             "encrypted_2fa_secret": None,
             "encryption_key_version": 1,
             "is_deleted": False,
+            "is_adult": False,
+            "birth_date_verified_at": None,
             "created_at": now,
             "updated_at": now,
         }
         result = await db.users.insert_one(user_doc)
         user = {**user_doc, "_id": result.inserted_id}
+        await log_audit(
+            actor_id=str(user["_id"]), target_id=str(user["_id"]),
+            action="REGISTER", metadata={"method": "google"}, request=request,
+        )
         logger.info("Google user registered: %s", str(user["_id"]))
 
     # Issue JWT cookies
@@ -139,7 +154,18 @@ async def google_callback(request: Request, code: str = "", state: str = "", err
     access = create_access_token(user_id)
     refresh = await create_refresh_token(user_id)
 
-    response = RedirectResponse("/", status_code=302)
+    await log_audit(actor_id=user_id, target_id=user_id, action="LOGIN_SUCCESS",
+                    metadata={"method": "google"}, request=request)
+
+    # Redirect to complete-profile if age not verified, otherwise to saved target
+    saved_redirect = request.session.pop("oauth_redirect", None)
+    if not user.get("is_adult"):
+        redirect_to = "/complete-profile"
+    elif saved_redirect and saved_redirect.startswith("/"):
+        redirect_to = saved_redirect
+    else:
+        redirect_to = "/"
+    response = RedirectResponse(redirect_to, status_code=302)
     set_auth_cookies(response, access, refresh)
 
     logger.info("Google login: %s", user_id)

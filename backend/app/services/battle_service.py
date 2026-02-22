@@ -1,11 +1,12 @@
 import logging
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Optional
 
 from bson import ObjectId
 from fastapi import HTTPException, status
 
 import app.database as _db
+from app.utils import ensure_utc, utcnow
 
 logger = logging.getLogger("quotico.battle_service")
 
@@ -34,7 +35,7 @@ async def create_battle(
     if start_time >= end_time:
         raise HTTPException(status_code=400, detail="Startzeit muss vor Endzeit liegen.")
 
-    now = datetime.now(timezone.utc)
+    now = utcnow()
     battle_doc = {
         "squad_a_id": squad_a_id,
         "squad_b_id": squad_b_id,
@@ -64,8 +65,9 @@ async def commit_to_battle(user_id: str, battle_id: str, squad_id: str) -> dict:
         raise HTTPException(status_code=404, detail="Battle nicht gefunden.")
 
     # Lock-in check: cannot change after battle starts
-    now = datetime.now(timezone.utc)
-    if battle["status"] == "active" or now >= battle["start_time"]:
+    now = utcnow()
+    start_time = ensure_utc(battle["start_time"])
+    if battle["status"] == "active" or now >= start_time:
         existing = await _db.db.battle_participations.find_one({
             "battle_id": battle_id,
             "user_id": user_id,

@@ -3,10 +3,13 @@ import { ref, computed, onMounted } from "vue";
 import { useRoute, useRouter } from "vue-router";
 import { useSquadsStore } from "@/stores/squads";
 import { useToast } from "@/composables/useToast";
+import { useSpieltagStore } from "@/stores/spieltag";
+import SquadLeagueConfigManager from "@/components/SquadLeagueConfigManager.vue";
 
 const route = useRoute();
 const router = useRouter();
 const squads = useSquadsStore();
+const spieltagStore = useSpieltagStore();
 const toast = useToast();
 
 const squadId = computed(() => route.params.id as string);
@@ -17,6 +20,10 @@ const showLeaveConfirm = ref(false);
 onMounted(async () => {
   if (squads.squads.length === 0) {
     await squads.fetchMySquads();
+  }
+  // Fetch spieltag sports for league config manager
+  if (spieltagStore.sports.length === 0) {
+    await spieltagStore.fetchSports();
   }
   if (squadId.value) {
     await squads.fetchLeaderboard(squadId.value);
@@ -93,6 +100,14 @@ async function handleLeave() {
             >Abbrechen</button>
           </div>
         </div>
+      </div>
+
+      <!-- League Configuration -->
+      <div class="bg-surface-1 rounded-card p-5 border border-surface-3/50 mb-4">
+        <SquadLeagueConfigManager
+          :squad-id="squadId"
+          :is-admin="squad.is_admin"
+        />
       </div>
 
       <!-- Squad Leaderboard -->

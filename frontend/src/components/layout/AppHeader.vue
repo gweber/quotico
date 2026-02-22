@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref } from "vue";
+import { ref, computed, onUnmounted } from "vue";
 import { useRouter } from "vue-router";
 import { useAuthStore } from "@/stores/auth";
 import { useBetSlipStore } from "@/stores/betslip";
@@ -11,19 +11,43 @@ const betslip = useBetSlipStore();
 const toast = useToast();
 const mobileMenuOpen = ref(false);
 
-async function handleLogout() {
-  await auth.logout();
-  toast.success("Erfolgreich abgemeldet.");
-  router.push("/login");
-}
-
 const navLinks = [
   { to: "/", label: "Tipps", icon: "\u26BD" },
+  { to: "/spieltag", label: "Spieltag", icon: "\uD83D\uDCCB" },
   { to: "/squads", label: "Squads", icon: "\uD83D\uDC65" },
   { to: "/battles", label: "Battles", icon: "\u2694\uFE0F" },
   { to: "/leaderboard", label: "Rangliste", icon: "\uD83C\uDFC6" },
   { to: "/settings", label: "Einstellungen", icon: "\u2699\uFE0F" },
 ];
+
+// Filter links if profile is incomplete
+const visibleNavLinks = computed(() => {
+  if (auth.isLoggedIn && auth.needsProfileCompletion) {
+    return [];
+  }
+  return navLinks;
+});
+
+// Auto-close mobile menu on window resize to desktop
+let mediaQuery: MediaQueryList | null = null;
+function handleResize(e: MediaQueryListEvent) {
+  if (e.matches) mobileMenuOpen.value = false;
+}
+if (typeof window !== "undefined") {
+  mediaQuery = window.matchMedia("(min-width: 768px)");
+  mediaQuery.addEventListener("change", handleResize);
+}
+onUnmounted(() => {
+  mediaQuery?.removeEventListener("change", handleResize);
+});
+
+async function handleLogout() {
+  await auth.logout();
+  betslip.$reset();
+  toast.success("Erfolgreich abgemeldet.");
+  router.push("/login");
+}
+
 </script>
 
 <template>
@@ -44,7 +68,7 @@ const navLinks = [
       <!-- Center: Desktop Nav -->
       <nav class="hidden md:flex items-center gap-1" aria-label="Hauptnavigation">
         <RouterLink
-          v-for="link in navLinks"
+          v-for="link in visibleNavLinks"
           :key="link.to"
           :to="link.to"
           class="flex items-center gap-1.5 px-3 py-2 rounded-lg text-sm text-text-secondary hover:text-text-primary hover:bg-surface-2 transition-colors"
@@ -77,18 +101,22 @@ const navLinks = [
           <RouterLink
             v-if="auth.isAdmin"
             to="/admin"
-            class="hidden sm:inline-flex items-center gap-1 text-xs px-2 py-1 rounded-lg bg-warning/10 text-warning hover:bg-warning/20 transition-colors font-medium"
+            class="hidden sm:inline-flex items-center gap-1 text-xs px-2 py-1 rounded-lg bg-warning/10 text-warning hover:bg-warning/20 transition-colors font-medium flex-shrink-0"
           >
             Admin
           </RouterLink>
-          <span class="hidden sm:block text-sm text-text-secondary truncate max-w-[160px]">
+          <span
+            class="hidden sm:block text-sm text-text-secondary truncate max-w-[120px] lg:max-w-[160px]"
+            :title="auth.user?.alias"
+          >
             {{ auth.user?.alias }}
           </span>
           <button
-            class="text-sm px-3 py-1.5 rounded-lg text-text-secondary hover:text-text-primary hover:bg-surface-2 transition-colors"
+            class="text-sm px-3 py-1.5 rounded-lg text-text-secondary hover:text-text-primary hover:bg-surface-2 transition-colors disabled:opacity-50"
+            :disabled="auth.loading"
             @click="handleLogout"
           >
-            Abmelden
+            {{ auth.loading ? '...' : 'Abmelden' }}
           </button>
         </template>
         <template v-else>
@@ -141,7 +169,7 @@ const navLinks = [
         aria-label="Mobile Navigation"
       >
         <RouterLink
-          v-for="link in navLinks"
+          v-for="link in visibleNavLinks"
           :key="link.to"
           :to="link.to"
           class="flex items-center gap-2 px-3 py-3 rounded-lg text-sm text-text-secondary hover:text-text-primary hover:bg-surface-2 transition-colors"

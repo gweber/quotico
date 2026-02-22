@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, watch } from "vue";
+import { ref, watch, onUnmounted } from "vue";
 import { useApi } from "@/composables/useApi";
 import { useAuthStore } from "@/stores/auth";
 import { useToast } from "@/composables/useToast";
@@ -16,15 +16,25 @@ const showConfirm = ref(false);
 
 let debounceTimer: ReturnType<typeof setTimeout> | null = null;
 
+onUnmounted(() => {
+  if (debounceTimer) clearTimeout(debounceTimer);
+});
+
 watch(alias, (val) => {
   checkResult.value = null;
   showConfirm.value = false;
 
   if (debounceTimer) clearTimeout(debounceTimer);
 
-  if (val.length < 3) return;
+  const trimmed = val.trim();
+  if (trimmed.length < 3) return;
 
-  debounceTimer = setTimeout(() => checkAlias(val), 350);
+  if (!/^[a-zA-Z0-9_]+$/.test(trimmed)) {
+    checkResult.value = { available: false, reason: "Ungültige Zeichen." };
+    return;
+  }
+
+  debounceTimer = setTimeout(() => checkAlias(trimmed), 350);
 });
 
 async function checkAlias(name: string) {
@@ -103,6 +113,7 @@ async function saveAlias() {
               'border-danger focus:border-danger focus:ring-danger': checkResult && !checkResult.available,
             }"
             placeholder="Dein Spielername (3-20 Zeichen)"
+            :aria-invalid="checkResult && !checkResult.available ? true : undefined"
             aria-describedby="alias-feedback"
           />
           <!-- Spinner -->

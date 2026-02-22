@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref } from "vue";
+import { ref, computed } from "vue";
 import { useRouter } from "vue-router";
 import { useAuthStore } from "@/stores/auth";
 import { useToast } from "@/composables/useToast";
@@ -11,13 +11,28 @@ const toast = useToast();
 const email = ref("");
 const password = ref("");
 const passwordConfirm = ref("");
+const birthDate = ref("");
+const disclaimerAccepted = ref(false);
 const loading = ref(false);
 const errorMessage = ref("");
+
+const ageError = computed(() => {
+  if (!birthDate.value) return "";
+  const birth = new Date(birthDate.value);
+  const today = new Date();
+  let age = today.getFullYear() - birth.getFullYear();
+  const monthDiff = today.getMonth() - birth.getMonth();
+  if (monthDiff < 0 || (monthDiff === 0 && today.getDate() < birth.getDate())) {
+    age--;
+  }
+  if (age < 18) return "Du musst mindestens 18 Jahre alt sein (Jugendschutz).";
+  return "";
+});
 
 async function handleRegister() {
   errorMessage.value = "";
 
-  if (!email.value || !password.value) {
+  if (!email.value || !password.value || !birthDate.value) {
     errorMessage.value = "Bitte alle Felder ausfüllen.";
     return;
   }
@@ -32,9 +47,19 @@ async function handleRegister() {
     return;
   }
 
+  if (ageError.value) {
+    errorMessage.value = ageError.value;
+    return;
+  }
+
+  if (!disclaimerAccepted.value) {
+    errorMessage.value = "Bitte bestätige den Haftungsausschluss.";
+    return;
+  }
+
   loading.value = true;
   try {
-    await auth.register(email.value, password.value);
+    await auth.register(email.value, password.value, birthDate.value, disclaimerAccepted.value);
     toast.success("Registrierung erfolgreich! Willkommen bei Quotico.");
     router.push("/");
   } catch (e: unknown) {
@@ -116,11 +141,45 @@ async function handleRegister() {
           />
         </div>
 
+        <!-- Birth Date (Age Gate) -->
+        <div class="mb-4">
+          <label for="register-birthdate" class="block text-sm font-medium text-text-secondary mb-1.5">
+            Geburtsdatum
+          </label>
+          <input
+            id="register-birthdate"
+            v-model="birthDate"
+            type="date"
+            required
+            class="w-full px-4 py-3 bg-surface-2 border border-surface-3 rounded-lg text-text-primary text-sm transition-colors focus:border-primary focus:ring-1 focus:ring-primary"
+            :class="{ 'border-danger': ageError }"
+          />
+          <p v-if="ageError" class="text-xs text-danger mt-1">{{ ageError }}</p>
+        </div>
+
+        <!-- Disclaimer Checkbox -->
+        <div class="mb-6">
+          <label class="flex items-start gap-3 cursor-pointer">
+            <input
+              v-model="disclaimerAccepted"
+              type="checkbox"
+              class="mt-0.5 w-4 h-4 rounded border-surface-3 bg-surface-2 text-primary focus:ring-primary focus:ring-1"
+            />
+            <span class="text-xs text-text-secondary leading-relaxed">
+              Ich bestätige, dass ich mindestens 18 Jahre alt bin und akzeptiere die
+              <RouterLink to="/legal/agb" class="text-secondary underline">AGB</RouterLink>
+              sowie die
+              <RouterLink to="/legal/datenschutz" class="text-secondary underline">Datenschutzerklärung</RouterLink>.
+              Quotico.de ist kein Echtgeld-Glücksspiel.
+            </span>
+          </label>
+        </div>
+
         <!-- Submit -->
         <button
           type="submit"
           :disabled="loading"
-          class="w-full py-3 rounded-lg bg-primary text-surface-0 font-semibold text-sm hover:bg-primary-hover transition-colors disabled:opacity-50 disabled:cursor-not-allowed mt-2"
+          class="w-full py-3 rounded-lg bg-primary text-surface-0 font-semibold text-sm hover:bg-primary-hover transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
         >
           <template v-if="loading">
             <span class="inline-flex items-center gap-2">
@@ -168,7 +227,7 @@ async function handleRegister() {
 
       <!-- Legal notice -->
       <p class="text-center text-xs text-text-muted mt-4">
-        Tipspiel &mdash; kein Echtgeld. Keine Wette, keine Gewinnauszahlung.
+        Ab 18 Jahren. Tipspiel &mdash; kein Echtgeld. Keine Wette, keine Gewinnauszahlung.
       </p>
     </div>
   </div>

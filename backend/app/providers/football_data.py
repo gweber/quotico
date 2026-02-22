@@ -1,18 +1,20 @@
 import logging
 import time
 import unicodedata
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
+
+from app.utils import utcnow
 from typing import Any, Optional
 
-import httpx
-
 from app.config import settings
+from app.providers.http_client import ResilientClient
 
 logger = logging.getLogger("quotico.football_data")
 
 BASE_URL = "https://api.football-data.org/v4"
 
 # Map our sport keys to football-data.org competition codes
+# Free tier only — BL2 (2. Bundesliga) requires paid plan, use OpenLigaDB instead
 SPORT_TO_COMPETITION = {
     "soccer_germany_bundesliga": "BL1",
     "soccer_epl": "PL",
@@ -55,7 +57,7 @@ class FootballDataProvider:
     """football-data.org provider for free match scores and live data."""
 
     def __init__(self):
-        self._client = httpx.AsyncClient(timeout=15.0)
+        self._client = ResilientClient("football_data")
         self._cache: dict[str, dict[str, Any]] = {}
         self._cache_ttl = 300  # 5 minutes
 
@@ -76,7 +78,7 @@ class FootballDataProvider:
         if not api_key:
             return []
 
-        now = datetime.now(timezone.utc)
+        now = utcnow()
         date_from = (now - timedelta(days=days_back)).strftime("%Y-%m-%d")
         date_to = now.strftime("%Y-%m-%d")
 
@@ -195,6 +197,96 @@ class FootballDataProvider:
 
         except Exception as e:
             logger.error("football-data.org live error for %s: %s", sport_key, e)
+            stale = self._cache.get(cache_key)
+            return stale["data"] if stale else []
+
+
+    async def get_current_matchday_number(self, sport_key: str) -> int | None:
+        """Get the current matchday number for a competition."""
+        competition = SPORT_TO_COMPETITION.get(sport_key)
+        if not competition:
+            return None
+
+        cache_key = f"current_md:{sport_key}"
+        cached = self._get_cached(cache_key)
+        if cached is not None:
+            return cached[0]["matchday_number"] if cached else None
+
+        try:
+            api_key = getattr(settings, "FOOTBALL_DATA_API_KEY", "")
+            if not api_key:
+                return None
+
+            resp = await self._client.get(
+                f"{BASE_URL}/competitions/{competition}",
+                headers={"X-Auth-Token": api_key},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            md = data.get("currentSeason", {}).get("currentMatchday")
+            if md:
+                self._set_cache(cache_key, [{"matchday_number": md}])
+            return md
+        except Exception as e:
+            logger.error("football-data.org current matchday error for %s: %s", sport_key, e)
+            return None
+
+    async def get_matchday_data(
+        self, sport_key: str, season: int, matchday_number: int
+    ) -> list[dict[str, Any]]:
+        """Fetch all matches for a specific matchday of a competition."""
+        competition = SPORT_TO_COMPETITION.get(sport_key)
+        if not competition:
+            return []
+
+        cache_key = f"matchday:{sport_key}:{season}:{matchday_number}"
+        cached = self._get_cached(cache_key)
+        if cached is not None:
+            return cached
+
+        try:
+            api_key = getattr(settings, "FOOTBALL_DATA_API_KEY", "")
+            if not api_key:
+                return []
+
+            resp = await self._client.get(
+                f"{BASE_URL}/competitions/{competition}/matches",
+                params={"matchday": str(matchday_number)},
+                headers={"X-Auth-Token": api_key},
+            )
+            resp.raise_for_status()
+            raw = resp.json().get("matches", [])
+
+            matches = []
+            for m in raw:
+                ft = m.get("score", {}).get("fullTime", {})
+                is_finished = m.get("status") == "FINISHED"
+                home_score = ft.get("home") if is_finished else None
+                away_score = ft.get("away") if is_finished else None
+
+                matches.append({
+                    "home_team": m.get("homeTeam", {}).get("name", ""),
+                    "away_team": m.get("awayTeam", {}).get("name", ""),
+                    "utc_date": m.get("utcDate", ""),
+                    "is_finished": is_finished,
+                    "home_score": home_score,
+                    "away_score": away_score,
+                    "matchday_number": matchday_number,
+                    "season": season,
+                })
+
+            self._set_cache(cache_key, matches)
+            logger.info(
+                "football-data.org: %d matches for %s matchday %d",
+                len(matches), sport_key, matchday_number,
+            )
+            return matches
+
+        except Exception as e:
+            logger.error(
+                "football-data.org matchday error for %s/%d/%d: %s",
+                sport_key, season, matchday_number, e,
+            )
             stale = self._cache.get(cache_key)
             return stale["data"] if stale else []
 

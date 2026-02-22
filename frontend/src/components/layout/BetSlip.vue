@@ -69,8 +69,40 @@ function closeMobile() {
 
         <!-- Items -->
         <div v-else class="space-y-2">
+          <!-- Expired items -->
           <div
-            v-for="item in betslip.items"
+            v-for="item in betslip.expiredItems"
+            :key="item.matchId"
+            class="bg-surface-1 rounded-lg p-3 relative group opacity-50 border border-danger/30"
+          >
+            <button
+              class="absolute top-2 right-2 w-6 h-6 flex items-center justify-center rounded text-text-muted hover:text-danger hover:bg-danger-muted/20 transition-colors opacity-0 group-hover:opacity-100"
+              :aria-label="`Tipp entfernen: ${item.teams.home} vs ${item.teams.away}`"
+              @click="betslip.removeItem(item.matchId)"
+            >
+              <span aria-hidden="true">&times;</span>
+            </button>
+            <p class="text-xs text-text-secondary truncate pr-6 line-through">
+              {{ item.teams.home }} vs {{ item.teams.away }}
+            </p>
+            <div class="flex items-center justify-between mt-1.5">
+              <span class="text-xs text-danger font-medium">Abgelaufen</span>
+              <span class="text-sm font-mono text-text-muted line-through">{{ item.odds.toFixed(2) }}</span>
+            </div>
+          </div>
+
+          <!-- Remove expired button -->
+          <button
+            v-if="betslip.expiredItems.length > 0"
+            class="w-full py-1.5 rounded-lg text-xs text-danger hover:bg-danger-muted/10 transition-colors"
+            @click="betslip.removeExpired()"
+          >
+            Abgelaufene entfernen ({{ betslip.expiredItems.length }})
+          </button>
+
+          <!-- Valid items -->
+          <div
+            v-for="item in betslip.validItems"
             :key="item.matchId"
             class="bg-surface-1 rounded-lg p-3 relative group"
           >
@@ -101,7 +133,7 @@ function closeMobile() {
           <!-- Submit -->
           <button
             class="w-full py-3 rounded-lg bg-primary text-surface-0 font-semibold text-sm hover:bg-primary-hover transition-colors disabled:opacity-50 disabled:cursor-not-allowed mt-2"
-            :disabled="submitting"
+            :disabled="submitting || betslip.validItems.length === 0"
             @click="handleSubmit"
           >
             <template v-if="submitting">
@@ -175,8 +207,44 @@ function closeMobile() {
 
             <!-- Items -->
             <div class="space-y-2">
+              <!-- Expired items -->
               <div
-                v-for="item in betslip.items"
+                v-for="item in betslip.expiredItems"
+                :key="item.matchId"
+                class="bg-surface-2 rounded-lg p-3 flex items-center justify-between opacity-50 border border-danger/30"
+              >
+                <div class="min-w-0 flex-1">
+                  <p class="text-xs text-text-secondary truncate line-through">
+                    {{ item.teams.home }} vs {{ item.teams.away }}
+                  </p>
+                  <p class="text-xs text-danger font-medium mt-0.5">
+                    Abgelaufen
+                  </p>
+                </div>
+                <div class="flex items-center gap-3 shrink-0 ml-3">
+                  <span class="text-sm font-mono text-text-muted line-through">{{ item.odds.toFixed(2) }}</span>
+                  <button
+                    class="w-touch h-touch flex items-center justify-center rounded-lg text-text-muted hover:text-danger transition-colors"
+                    :aria-label="`Tipp entfernen: ${item.teams.home} vs ${item.teams.away}`"
+                    @click="betslip.removeItem(item.matchId)"
+                  >
+                    <span aria-hidden="true">&times;</span>
+                  </button>
+                </div>
+              </div>
+
+              <!-- Remove expired button (mobile) -->
+              <button
+                v-if="betslip.expiredItems.length > 0"
+                class="w-full py-2 rounded-lg text-xs text-danger hover:bg-danger-muted/10 transition-colors"
+                @click="betslip.removeExpired()"
+              >
+                Abgelaufene entfernen ({{ betslip.expiredItems.length }})
+              </button>
+
+              <!-- Valid items -->
+              <div
+                v-for="item in betslip.validItems"
                 :key="item.matchId"
                 class="bg-surface-2 rounded-lg p-3 flex items-center justify-between"
               >
@@ -211,7 +279,7 @@ function closeMobile() {
               </div>
               <button
                 class="w-full py-3.5 rounded-lg bg-primary text-surface-0 font-semibold hover:bg-primary-hover transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-                :disabled="submitting"
+                :disabled="submitting || betslip.validItems.length === 0"
                 @click="handleSubmit"
               >
                 <template v-if="submitting">

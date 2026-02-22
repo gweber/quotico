@@ -1,5 +1,7 @@
 import logging
-from datetime import datetime, timezone
+from datetime import datetime
+
+from app.utils import utcnow
 
 from argon2 import PasswordHasher
 
@@ -20,7 +22,7 @@ async def seed_initial_user() -> None:
         logger.debug("SEED_ADMIN_EMAIL not set, skipping seed")
         return
 
-    now = datetime.now(timezone.utc)
+    now = utcnow()
 
     # 1. Create seed user
     existing_user = await _db.db.users.find_one({"email": settings.SEED_ADMIN_EMAIL})

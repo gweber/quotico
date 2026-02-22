@@ -14,7 +14,7 @@ interface ApiOptions {
 export function useApi() {
   const baseUrl = "/api";
 
-  async function request<T>(path: string, options: ApiOptions = {}): Promise<T> {
+  async function request<T>(path: string, options: ApiOptions = {}, _isRetry = false): Promise<T> {
     const { method = "GET", body, params } = options;
 
     let url = `${baseUrl}${path}`;
@@ -38,28 +38,24 @@ export function useApi() {
     const response = await fetch(url, fetchOptions);
 
     if (!response.ok) {
+      // On first 401, try token refresh + retry before consuming body
+      if (response.status === 401 && !_isRetry) {
+        const refreshed = await refreshToken();
+        if (refreshed) {
+          return request<T>(path, options, true);
+        }
+        // Only redirect if this wasn't a silent auth check
+        if (!path.endsWith("/auth/me")) {
+          window.location.href = "/login";
+        }
+      }
+
       let errorMessage = "Ein Fehler ist aufgetreten.";
       try {
         const errorData: ApiError = await response.json();
         errorMessage = errorData.detail || errorMessage;
       } catch {
         // Response wasn't JSON
-      }
-
-      if (response.status === 401) {
-        // Try to refresh token
-        const refreshed = await refreshToken();
-        if (refreshed) {
-          // Retry original request
-          const retryResponse = await fetch(url, fetchOptions);
-          if (retryResponse.ok) {
-            return retryResponse.json();
-          }
-        }
-        // Only redirect if this wasn't a silent auth check
-        if (!path.endsWith("/auth/me")) {
-          window.location.href = "/login";
-        }
       }
 
       throw new Error(errorMessage);
@@ -90,6 +86,9 @@ export function useApi() {
 
     post: <T>(path: string, body?: unknown) =>
       request<T>(path, { method: "POST", body }),
+
+    put: <T>(path: string, body?: unknown) =>
+      request<T>(path, { method: "PUT", body }),
 
     patch: <T>(path: string, body?: unknown) =>
       request<T>(path, { method: "PATCH", body }),

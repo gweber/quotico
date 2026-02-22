@@ -72,19 +72,7 @@ const formatDate = (iso: string) =>
     minute: "2-digit",
   });
 
-const sportLabel = (key: string) => {
-  const map: Record<string, string> = {
-    soccer_germany_bundesliga: "Bundesliga",
-    soccer_epl: "Premier League",
-    soccer_spain_la_liga: "La Liga",
-    soccer_italy_serie_a: "Serie A",
-    soccer_uefa_champs_league: "Champions League",
-    americanfootball_nfl: "NFL",
-    basketball_nba: "NBA",
-    tennis_atp_french_open: "French Open",
-  };
-  return map[key] || key;
-};
+import { sportLabel } from "@/types/sports";
 
 onMounted(fetchMatches);
 </script>

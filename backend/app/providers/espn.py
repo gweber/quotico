@@ -1,9 +1,11 @@
 import logging
 import time
-from datetime import datetime, timezone
+from datetime import datetime
+
+from app.utils import utcnow
 from typing import Any, Optional
 
-import httpx
+from app.providers.http_client import ResilientClient
 
 logger = logging.getLogger("quotico.espn")
 
@@ -20,7 +22,7 @@ class ESPNProvider:
     """ESPN public scoreboard API — free, no key, NFL + NBA scores."""
 
     def __init__(self):
-        self._client = httpx.AsyncClient(timeout=15.0)
+        self._client = ResilientClient("espn")
         self._cache: dict[str, dict[str, Any]] = {}
         self._cache_ttl = 300
 
@@ -63,7 +65,7 @@ class ESPNProvider:
 
         try:
             # Fetch recent scoreboard (today and recent days)
-            now = datetime.now(timezone.utc)
+            now = utcnow()
             events = await self._fetch_scoreboard(sport_key)
 
             # Also fetch yesterday and day before for recently completed

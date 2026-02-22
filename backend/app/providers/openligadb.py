@@ -1,23 +1,26 @@
 import logging
 import time
-from datetime import datetime, timezone
+from datetime import datetime
+
+from app.utils import utcnow
 from typing import Any, Optional
 
-import httpx
+from app.providers.http_client import ResilientClient
 
 logger = logging.getLogger("quotico.openligadb")
 
 BASE_URL = "https://api.openligadb.de"
 
-# Only Bundesliga supported
+# German football leagues supported
 SPORT_TO_LEAGUE = {
     "soccer_germany_bundesliga": "bl1",
+    "soccer_germany_bundesliga2": "bl2",
 }
 
 
 def _current_season() -> int:
     """Bundesliga season year: 2025 for the 2025/26 season (starts July)."""
-    now = datetime.now(timezone.utc)
+    now = utcnow()
     return now.year if now.month >= 7 else now.year - 1
 
 
@@ -25,7 +28,7 @@ class OpenLigaDBProvider:
     """OpenLigaDB — free, no API key, Bundesliga scores + live data."""
 
     def __init__(self):
-        self._client = httpx.AsyncClient(timeout=15.0)
+        self._client = ResilientClient("openligadb")
         self._cache: dict[str, dict[str, Any]] = {}
         self._cache_ttl = 300  # 5 min for finished, overridden for live
 
@@ -127,7 +130,7 @@ class OpenLigaDBProvider:
             resp.raise_for_status()
             matches = resp.json()
 
-            now = datetime.now(timezone.utc)
+            now = utcnow()
             live = []
 
             for match in matches:
@@ -182,6 +185,93 @@ class OpenLigaDBProvider:
 
         except Exception as e:
             logger.error("OpenLigaDB live error for %s: %s", sport_key, e)
+            stale = self._cache.get(cache_key)
+            return stale["data"] if stale else []
+
+
+    async def get_current_matchday_number(self, sport_key: str) -> int | None:
+        """Get the current matchday number for a sport."""
+        league = SPORT_TO_LEAGUE.get(sport_key)
+        if not league:
+            return None
+
+        cache_key = f"current_md:{sport_key}"
+        cached = self._get_cached(cache_key)
+        if cached is not None:
+            return cached[0]["matchday_number"] if cached else None
+
+        try:
+            resp = await self._client.get(f"{BASE_URL}/getmatchdata/{league}")
+            resp.raise_for_status()
+            matches = resp.json()
+            if not matches:
+                return None
+            md = matches[0].get("group", {}).get("groupOrderID")
+            if md:
+                self._set_cache(cache_key, [{"matchday_number": md}])
+            return md
+        except Exception as e:
+            logger.error("OpenLigaDB current matchday error: %s", e)
+            return None
+
+    async def get_matchday_data(
+        self, sport_key: str, season: int, matchday_number: int
+    ) -> list[dict[str, Any]]:
+        """Fetch all matches for a specific matchday."""
+        league = SPORT_TO_LEAGUE.get(sport_key)
+        if not league:
+            return []
+
+        cache_key = f"matchday:{sport_key}:{season}:{matchday_number}"
+        cached = self._get_cached(cache_key)
+        if cached is not None:
+            return cached
+
+        try:
+            resp = await self._client.get(
+                f"{BASE_URL}/getmatchdata/{league}/{season}/{matchday_number}"
+            )
+            resp.raise_for_status()
+            raw = resp.json()
+
+            matches = []
+            for m in raw:
+                home_score = None
+                away_score = None
+                is_finished = m.get("matchIsFinished", False)
+
+                if is_finished:
+                    for r in m.get("matchResults", []):
+                        if r.get("resultTypeID") == 2:
+                            home_score = r["pointsTeam1"]
+                            away_score = r["pointsTeam2"]
+                            break
+
+                match_dt = m.get("matchDateTimeUTC", m.get("matchDateTime", ""))
+
+                matches.append({
+                    "home_team": m.get("team1", {}).get("teamName", ""),
+                    "away_team": m.get("team2", {}).get("teamName", ""),
+                    "utc_date": match_dt,
+                    "is_finished": is_finished,
+                    "home_score": home_score,
+                    "away_score": away_score,
+                    "matchday_number": matchday_number,
+                    "season": season,
+                })
+
+            self._set_cache(cache_key, matches)
+            logger.info(
+                "OpenLigaDB: %d matches for %s matchday %d",
+                len(matches), sport_key, matchday_number,
+            )
+            return matches
+
+        except Exception as e:
+            logger.error(
+                "OpenLigaDB matchday error for %s/%d/%d: %s",
+                sport_key, season, matchday_number, e,
+            )
             stale = self._cache.get(cache_key)
             return stale["data"] if stale else []
 

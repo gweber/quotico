@@ -2,6 +2,7 @@ import { defineStore } from "pinia";
 import { ref } from "vue";
 import { useApi } from "@/composables/useApi";
 import { useToast } from "@/composables/useToast";
+import type { GameModeType, LeagueConfig } from "@/types/league";
 
 export interface Squad {
   id: string;
@@ -11,6 +12,10 @@ export interface Squad {
   admin_id: string;
   member_count: number;
   is_admin: boolean;
+  league_configs: LeagueConfig[];
+  // Legacy (deprecated, kept for backward compat)
+  game_mode: string;
+  game_mode_config: Record<string, unknown>;
   created_at: string;
 }
 
@@ -79,6 +84,51 @@ export const useSquadsStore = defineStore("squads", () => {
     currentSquad.value = squad;
   }
 
+  function getGameModeForSport(
+    squadId: string,
+    sportKey: string
+  ): GameModeType {
+    const squad = squads.value.find((s) => s.id === squadId);
+    if (!squad) return "classic";
+
+    // New system: league_configs has priority
+    if (squad.league_configs && squad.league_configs.length > 0) {
+      const config = squad.league_configs.find(
+        (lc) => lc.sport_key === sportKey && !lc.deactivated_at
+      );
+      if (config) return config.game_mode;
+      return "classic";
+    }
+
+    // Legacy fallback
+    return (squad.game_mode as GameModeType) || "classic";
+  }
+
+  function getActiveLeagueConfigs(squadId: string): LeagueConfig[] {
+    const squad = squads.value.find((s) => s.id === squadId);
+    if (!squad?.league_configs) return [];
+    return squad.league_configs.filter((lc) => !lc.deactivated_at);
+  }
+
+  async function setLeagueConfig(
+    squadId: string,
+    sportKey: string,
+    gameMode: GameModeType,
+    config?: Record<string, unknown>
+  ) {
+    await api.put(`/squads/${squadId}/league-config`, {
+      sport_key: sportKey,
+      game_mode: gameMode,
+      config: config ?? {},
+    });
+    await fetchMySquads();
+  }
+
+  async function removeLeagueConfig(squadId: string, sportKey: string) {
+    await api.del(`/squads/${squadId}/league-config/${sportKey}`);
+    await fetchMySquads();
+  }
+
   return {
     squads,
     currentSquad,
@@ -91,5 +141,9 @@ export const useSquadsStore = defineStore("squads", () => {
     leaveSquad,
     kickMember,
     setCurrentSquad,
+    getGameModeForSport,
+    getActiveLeagueConfigs,
+    setLeagueConfig,
+    removeLeagueConfig,
   };
 });

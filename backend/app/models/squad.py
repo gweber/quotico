@@ -4,6 +4,15 @@ from typing import Dict, List, Optional, Any
 from pydantic import BaseModel
 
 
+class LeagueConfig(BaseModel):
+    """A single league configuration within a squad."""
+    sport_key: str
+    game_mode: str  # classic | bankroll | survivor | over_under | fantasy | spieltag
+    config: Dict[str, Any] = {}
+    activated_at: datetime
+    deactivated_at: Optional[datetime] = None
+
+
 class SquadInDB(BaseModel):
     """Full squad document as stored in MongoDB."""
     name: str
@@ -11,6 +20,12 @@ class SquadInDB(BaseModel):
     invite_code: str  # Unique, e.g. QUO-789-XY
     admin_id: str  # User._id reference
     members: List[str] = []  # List of User._ids (includes admin)
+    # Per-league game mode configuration
+    league_configs: List[LeagueConfig] = []
+    # Legacy game mode settings (deprecated, kept for backward compat)
+    game_mode: str = "classic"
+    game_mode_config: Dict[str, Any] = {}
+    game_mode_changed_at: Optional[datetime] = None
     created_at: datetime
     updated_at: datetime
 
@@ -26,6 +41,15 @@ class SquadJoin(BaseModel):
     invite_code: str
 
 
+class LeagueConfigResponse(BaseModel):
+    """League configuration returned to the client."""
+    sport_key: str
+    game_mode: str
+    config: Dict[str, Any] = {}
+    activated_at: datetime
+    deactivated_at: Optional[datetime] = None
+
+
 class SquadResponse(BaseModel):
     """Squad data returned to the client."""
     id: str
@@ -35,6 +59,10 @@ class SquadResponse(BaseModel):
     admin_id: str
     member_count: int
     is_admin: bool = False
+    league_configs: List[LeagueConfigResponse] = []
+    # Legacy (deprecated, kept for backward compat)
+    game_mode: str = "classic"
+    game_mode_config: Dict[str, Any] = {}
     created_at: datetime
 
 

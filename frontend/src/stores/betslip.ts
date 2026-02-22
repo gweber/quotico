@@ -1,5 +1,5 @@
 import { defineStore } from "pinia";
-import { ref, computed, watch } from "vue";
+import { ref, computed, watch, onUnmounted } from "vue";
 import { useApi } from "@/composables/useApi";
 import type { Match } from "./matches";
 
@@ -10,6 +10,7 @@ export interface BetSlipItem {
   predictionLabel: string; // "Bayern München" or "Unentschieden"
   odds: number;
   sportKey: string;
+  commenceTime: string; // ISO date string for expiry check
 }
 
 const STORAGE_KEY = "quotico-betslip";
@@ -20,8 +21,21 @@ export const useBetSlipStore = defineStore("betslip", () => {
   const submitting = ref(false);
   const isOpen = ref(false); // Mobile bottom sheet toggle
 
+  // Tick every 10s to detect expired items
+  const now = ref(Date.now());
+  const _ticker = setInterval(() => { now.value = Date.now(); }, 10_000);
+  onUnmounted(() => clearInterval(_ticker));
+
+  const validItems = computed(() =>
+    items.value.filter((i) => i.commenceTime && new Date(i.commenceTime).getTime() > now.value)
+  );
+
+  const expiredItems = computed(() =>
+    items.value.filter((i) => !i.commenceTime || new Date(i.commenceTime).getTime() <= now.value)
+  );
+
   const totalOdds = computed(() =>
-    items.value.reduce((sum, item) => sum + item.odds, 0)
+    validItems.value.reduce((sum, item) => sum + item.odds, 0)
   );
 
   const itemCount = computed(() => items.value.length);
@@ -43,6 +57,7 @@ export const useBetSlipStore = defineStore("betslip", () => {
       predictionLabel: labels[prediction] || prediction,
       odds: match.current_odds[prediction],
       sportKey: match.sport_key,
+      commenceTime: match.commence_time,
     });
 
     isOpen.value = true; // Auto-open on mobile
@@ -56,10 +71,25 @@ export const useBetSlipStore = defineStore("betslip", () => {
     items.value = [];
   }
 
+  function removeExpired() {
+    const removed = expiredItems.value.length;
+    if (removed > 0) {
+      items.value = validItems.value.slice();
+    }
+    return removed;
+  }
+
   async function submitAll(): Promise<{ success: string[]; errors: string[] }> {
     submitting.value = true;
     const success: string[] = [];
     const errors: string[] = [];
+    const successMatchIds = new Set<string>();
+
+    // Drop expired items before submitting
+    const expired = removeExpired();
+    if (expired > 0) {
+      errors.push(`${expired} abgelaufene${expired > 1 ? " Tipps" : "r Tipp"} entfernt.`);
+    }
 
     for (const item of items.value) {
       try {
@@ -69,6 +99,7 @@ export const useBetSlipStore = defineStore("betslip", () => {
           displayed_odds: item.odds,
         });
         success.push(`${item.teams.home} vs ${item.teams.away}`);
+        successMatchIds.add(item.matchId);
       } catch (e: unknown) {
         const msg = e instanceof Error ? e.message : "Unbekannter Fehler";
         errors.push(`${item.teams.home} vs ${item.teams.away}: ${msg}`);
@@ -76,11 +107,6 @@ export const useBetSlipStore = defineStore("betslip", () => {
     }
 
     // Remove successfully submitted items
-    const successMatchIds = new Set(
-      items.value
-        .filter((_, i) => i < success.length)
-        .map((item) => item.matchId)
-    );
     items.value = items.value.filter((i) => !successMatchIds.has(i.matchId));
 
     submitting.value = false;
@@ -107,8 +133,11 @@ export const useBetSlipStore = defineStore("betslip", () => {
     isOpen,
     totalOdds,
     itemCount,
+    validItems,
+    expiredItems,
     addItem,
     removeItem,
+    removeExpired,
     clear,
     submitAll,
   };

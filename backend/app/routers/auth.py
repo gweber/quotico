@@ -1,5 +1,7 @@
 import logging
-from datetime import datetime, timezone
+from datetime import datetime
+
+from app.utils import utcnow
 
 import pyotp
 from bson import ObjectId
@@ -25,7 +27,9 @@ from app.services.auth_service import (
     clear_auth_cookies,
     get_current_user,
 )
+from app.services.audit_service import log_audit
 from app.services.encryption import decrypt, needs_reencryption, reencrypt
+from app.config_legal import TERMS_VERSION
 from jwt.exceptions import InvalidTokenError as JWTError
 
 
@@ -40,8 +44,8 @@ router = APIRouter(prefix="/api/auth", tags=["auth"])
 
 
 @router.post("/register", status_code=status.HTTP_201_CREATED)
-async def register(body: UserCreate, response: Response, db=Depends(get_db)):
-    """Register a new user."""
+async def register(body: UserCreate, request: Request, response: Response, db=Depends(get_db)):
+    """Register a new user with age verification and disclaimer."""
     existing = await db.users.find_one({"email": body.email})
     if existing:
         raise HTTPException(
@@ -49,7 +53,30 @@ async def register(body: UserCreate, response: Response, db=Depends(get_db)):
             detail="Diese E-Mail-Adresse ist bereits registriert.",
         )
 
-    now = datetime.now(timezone.utc)
+    # Age verification (server-side)
+    try:
+        birth = datetime.strptime(body.birth_date, "%Y-%m-%d").date()
+    except (ValueError, TypeError):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Ungültiges Geburtsdatum. Format: JJJJ-MM-TT.",
+        )
+
+    today = utcnow().date()
+    age = today.year - birth.year - ((today.month, today.day) < (birth.month, birth.day))
+    if age < 18:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Du musst mindestens 18 Jahre alt sein, um Quotico.de zu nutzen (Jugendschutz).",
+        )
+
+    if not body.disclaimer_accepted:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Bitte bestätige den Haftungsausschluss.",
+        )
+
+    now = utcnow()
     alias, alias_slug = await generate_default_alias(db)
     user_doc = {
         "email": body.email,
@@ -64,6 +91,10 @@ async def register(body: UserCreate, response: Response, db=Depends(get_db)):
         "encrypted_2fa_secret": None,
         "encryption_key_version": 1,
         "is_deleted": False,
+        "is_adult": True,
+        "birth_date_verified_at": now,
+        "terms_accepted_version": TERMS_VERSION if body.disclaimer_accepted else None,
+        "terms_accepted_at": now if body.disclaimer_accepted else None,
         "created_at": now,
         "updated_at": now,
     }
@@ -74,12 +105,13 @@ async def register(body: UserCreate, response: Response, db=Depends(get_db)):
     refresh = await create_refresh_token(user_id)
     set_auth_cookies(response, access, refresh)
 
+    await log_audit(actor_id=user_id, target_id=user_id, action="REGISTER", request=request)
     logger.info("User registered: %s", user_id)
     return {"message": "Registrierung erfolgreich."}
 
 
 @router.post("/login")
-async def login(body: UserLogin, response: Response, db=Depends(get_db)):
+async def login(body: UserLogin, request: Request, response: Response, db=Depends(get_db)):
     """Login with email and password."""
     user = await db.users.find_one({"email": body.email, "is_deleted": False})
     if not user:
@@ -94,15 +126,18 @@ async def login(body: UserLogin, response: Response, db=Depends(get_db)):
             detail="Dein Konto wurde gesperrt.",
         )
 
+    user_id = str(user["_id"])
+
     if not verify_password(body.password, user["hashed_password"]):
+        await log_audit(
+            actor_id=user_id, target_id=user_id, action="LOGIN_FAILED", request=request,
+        )
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="E-Mail oder Passwort ist falsch.",
         )
 
-    user_id = str(user["_id"])
-
-    # If 2FA is enabled, require verification (handled in Phase 4)
+    # If 2FA is enabled, require verification
     if user.get("is_2fa_enabled"):
         return {
             "requires_2fa": True,
@@ -113,12 +148,13 @@ async def login(body: UserLogin, response: Response, db=Depends(get_db)):
     refresh = await create_refresh_token(user_id)
     set_auth_cookies(response, access, refresh)
 
+    await log_audit(actor_id=user_id, target_id=user_id, action="LOGIN_SUCCESS", request=request)
     logger.info("User logged in: %s", user_id)
     return {"message": "Anmeldung erfolgreich."}
 
 
 @router.post("/login/2fa")
-async def login_2fa(body: TwoFALogin, response: Response, db=Depends(get_db)):
+async def login_2fa(body: TwoFALogin, request: Request, response: Response, db=Depends(get_db)):
     """Complete login for users with 2FA enabled.
 
     Step 1: /login returns { requires_2fa: true }.
@@ -174,6 +210,7 @@ async def login_2fa(body: TwoFALogin, response: Response, db=Depends(get_db)):
     refresh = await create_refresh_token(user_id)
     set_auth_cookies(response, access, refresh)
 
+    await log_audit(actor_id=user_id, target_id=user_id, action="LOGIN_SUCCESS", request=request)
     logger.info("User logged in (2FA): %s", user_id)
     return {"message": "Anmeldung erfolgreich."}
 
@@ -241,6 +278,65 @@ async def logout(request: Request, response: Response):
     return {"message": "Abgemeldet."}
 
 
+class CompleteProfileRequest(BaseModel):
+    """Request body for completing profile after Google OAuth."""
+    birth_date: str
+    disclaimer_accepted: bool
+
+
+@router.post("/complete-profile")
+async def complete_profile(
+    body: CompleteProfileRequest,
+    request: Request,
+    user=Depends(get_current_user),
+    db=Depends(get_db),
+):
+    """Complete age verification for Google OAuth users."""
+    if user.get("is_adult"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Profil bereits vollständig.",
+        )
+
+    try:
+        birth = datetime.strptime(body.birth_date, "%Y-%m-%d").date()
+    except (ValueError, TypeError):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Ungültiges Geburtsdatum. Format: JJJJ-MM-TT.",
+        )
+
+    today = utcnow().date()
+    age = today.year - birth.year - ((today.month, today.day) < (birth.month, birth.day))
+    if age < 18:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Du musst mindestens 18 Jahre alt sein, um Quotico.de zu nutzen (Jugendschutz).",
+        )
+
+    if not body.disclaimer_accepted:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Bitte bestätige den Haftungsausschluss.",
+        )
+
+    now = utcnow()
+    update_fields = {"is_adult": True, "birth_date_verified_at": now, "updated_at": now}
+    if body.disclaimer_accepted:
+        update_fields["terms_accepted_version"] = TERMS_VERSION
+        update_fields["terms_accepted_at"] = now
+    await db.users.update_one(
+        {"_id": user["_id"]},
+        {"$set": update_fields},
+    )
+
+    user_id = str(user["_id"])
+    await log_audit(
+        actor_id=user_id, target_id=user_id, action="AGE_VERIFIED", request=request,
+    )
+    return {"message": "Profil vervollständigt."}
+
+
 @router.get("/me", response_model=UserResponse)
 async def get_me(user=Depends(get_current_user)):
     """Get current user profile."""
@@ -252,6 +348,8 @@ async def get_me(user=Depends(get_current_user)):
         points=user["points"],
         is_admin=user.get("is_admin", False),
         is_2fa_enabled=user.get("is_2fa_enabled", False),
+        is_adult=user.get("is_adult", True),
+        terms_accepted_version=user.get("terms_accepted_version"),
         created_at=user["created_at"],
     )
 
