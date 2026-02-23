@@ -30,6 +30,8 @@ const cards = [
   { to: "/admin/matches", label: "Match Management", icon: "\u26BD" },
   { to: "/admin/battles", label: "Battle Management", icon: "\u2694\uFE0F" },
   { to: "/admin/audit", label: "Audit Log", icon: "\uD83D\uDCDC" },
+  { to: "/admin/providers", label: "Provider Status", icon: "\uD83D\uDCE1" },
+  { to: "/admin/team-aliases", label: "Team Aliases", icon: "\uD83C\uDFAF" },
 ];
 </script>
 

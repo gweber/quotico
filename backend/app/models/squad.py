@@ -26,6 +26,11 @@ class SquadInDB(BaseModel):
     game_mode: str = "classic"
     game_mode_config: Dict[str, Any] = {}
     game_mode_changed_at: Optional[datetime] = None
+    auto_tipp_blocked: bool = False
+    lock_minutes: int = 15
+    is_public: bool = True  # Public squads appear in search; private only via invite/ID
+    is_open: bool = True  # If True, users can request to join; if False, squad is locked
+    invite_visible: bool = False  # If True, all members can see the invite code; otherwise admin only
     created_at: datetime
     updated_at: datetime
 
@@ -55,11 +60,17 @@ class SquadResponse(BaseModel):
     id: str
     name: str
     description: Optional[str] = None
-    invite_code: str
+    invite_code: Optional[str] = None  # None when hidden from non-admin members
     admin_id: str
     member_count: int
     is_admin: bool = False
     league_configs: List[LeagueConfigResponse] = []
+    auto_tipp_blocked: bool = False
+    lock_minutes: int = 15
+    is_public: bool = True
+    is_open: bool = True
+    invite_visible: bool = False
+    pending_requests: int = 0
     # Legacy (deprecated, kept for backward compat)
     game_mode: str = "classic"
     game_mode_config: Dict[str, Any] = {}
@@ -80,3 +91,60 @@ class SquadBattleResponse(BaseModel):
     squad_a: Dict[str, Any]
     squad_b: Dict[str, Any]
     winner: Optional[str] = None
+
+
+# ---------- War Room ----------
+
+
+class WarRoomSelection(BaseModel):
+    type: str  # "moneyline"
+    value: str  # "1", "X", "2"
+
+
+class WarRoomMember(BaseModel):
+    user_id: str
+    alias: str
+    has_tipped: bool
+    is_self: bool = False
+    selection: Optional[WarRoomSelection] = None
+    locked_odds: Optional[float] = None
+    tip_status: Optional[str] = None  # pending / won / lost / void
+    points_earned: Optional[float] = None
+    is_currently_winning: Optional[bool] = None
+
+
+class WarRoomMatch(BaseModel):
+    id: str
+    sport_key: str
+    teams: Dict[str, str]
+    commence_time: datetime
+    status: str
+    current_odds: Dict[str, float]
+    result: Optional[str] = None
+    home_score: Optional[int] = None
+    away_score: Optional[int] = None
+
+
+class WarRoomConsensus(BaseModel):
+    percentages: Dict[str, float]  # e.g. {"1": 70.0, "X": 20.0, "2": 10.0}
+    total_tippers: int
+
+
+class WarRoomResponse(BaseModel):
+    match: WarRoomMatch
+    members: List[WarRoomMember]
+    consensus: Optional[WarRoomConsensus] = None
+    mavericks: Optional[List[str]] = None  # user_ids who went against majority
+    is_post_kickoff: bool
+
+
+# ---------- Join Requests ----------
+
+
+class JoinRequestResponse(BaseModel):
+    id: str
+    squad_id: str
+    user_id: str
+    alias: str
+    status: str  # pending | approved | declined
+    created_at: datetime

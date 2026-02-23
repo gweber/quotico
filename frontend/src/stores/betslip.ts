@@ -79,10 +79,21 @@ export const useBetSlipStore = defineStore("betslip", () => {
     return removed;
   }
 
-  async function submitAll(): Promise<{ success: string[]; errors: string[] }> {
+  interface TipResponseData {
+    id: string;
+    match_id: string;
+    selection: { type: string; value: string };
+    locked_odds: number;
+    points_earned: number | null;
+    status: string;
+    created_at: string;
+  }
+
+  async function submitAll(): Promise<{ success: string[]; errors: string[]; tips: TipResponseData[] }> {
     submitting.value = true;
     const success: string[] = [];
     const errors: string[] = [];
+    const tips: TipResponseData[] = [];
     const successMatchIds = new Set<string>();
 
     // Drop expired items before submitting
@@ -93,13 +104,14 @@ export const useBetSlipStore = defineStore("betslip", () => {
 
     for (const item of items.value) {
       try {
-        await api.post("/tips/", {
+        const response = await api.post<TipResponseData>("/tips/", {
           match_id: item.matchId,
           prediction: item.prediction,
           displayed_odds: item.odds,
         });
         success.push(`${item.teams.home} vs ${item.teams.away}`);
         successMatchIds.add(item.matchId);
+        tips.push(response);
       } catch (e: unknown) {
         const msg = e instanceof Error ? e.message : "Unbekannter Fehler";
         errors.push(`${item.teams.home} vs ${item.teams.away}: ${msg}`);
@@ -110,7 +122,7 @@ export const useBetSlipStore = defineStore("betslip", () => {
     items.value = items.value.filter((i) => !successMatchIds.has(i.matchId));
 
     submitting.value = false;
-    return { success, errors };
+    return { success, errors, tips };
   }
 
   // Persist to localStorage

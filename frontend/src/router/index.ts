@@ -33,6 +33,11 @@ const router = createRouter({
       component: () => import("@/views/LeaderboardView.vue"),
     },
     {
+      path: "/join/:code",
+      name: "join-squad",
+      component: () => import("@/views/JoinSquadView.vue"),
+    },
+    {
       path: "/squads",
       name: "squads",
       component: () => import("@/views/SquadsView.vue"),
@@ -45,6 +50,12 @@ const router = createRouter({
       meta: { requiresAuth: true },
     },
     {
+      path: "/squads/:id/war-room/:matchId",
+      name: "squad-war-room",
+      component: () => import("@/views/SquadWarRoomView.vue"),
+      meta: { requiresAuth: true },
+    },
+    {
       path: "/battles",
       name: "battles",
       component: () => import("@/views/BattleCenterView.vue"),
@@ -54,6 +65,16 @@ const router = createRouter({
       path: "/spieltag/:sport?/:matchday?",
       name: "spieltag",
       component: () => import("@/views/SpieltagView.vue"),
+    },
+    {
+      path: "/teams",
+      name: "teams",
+      component: () => import("@/views/TeamsView.vue"),
+    },
+    {
+      path: "/team/:teamSlug",
+      name: "team-detail",
+      component: () => import("@/views/TeamDetailView.vue"),
     },
     {
       path: "/settings",
@@ -102,11 +123,30 @@ const router = createRouter({
       component: () => import("@/views/admin/AdminAuditLog.vue"),
       meta: { requiresAuth: true, requiresAdmin: true },
     },
+    {
+      path: "/admin/providers",
+      name: "admin-providers",
+      component: () => import("@/views/admin/AdminProviderStatus.vue"),
+      meta: { requiresAuth: true, requiresAdmin: true },
+    },
+    {
+      path: "/admin/team-aliases",
+      name: "admin-team-aliases",
+      component: () => import("@/views/admin/AdminTeamAliases.vue"),
+      meta: { requiresAuth: true, requiresAdmin: true },
+    },
   ],
 });
 
-router.beforeEach((to) => {
+router.beforeEach(async (to) => {
   const auth = useAuthStore();
+
+  // Wait for the initial auth check to complete before making guard decisions.
+  // Without this, guards redirect to /login before fetchUser() resolves
+  // (e.g. after Google OAuth redirect).
+  if (!auth.initialized) {
+    await auth.initPromise;
+  }
 
   // Auth guard: redirect unauthenticated users to login
   if (to.meta.requiresAuth && !auth.isLoggedIn) {
@@ -129,7 +169,10 @@ router.beforeEach((to) => {
     to.name !== "complete-profile" &&
     to.name !== "login" &&
     to.name !== "register" &&
-    to.name !== "legal"
+    to.name !== "legal" &&
+    to.name !== "join-squad" &&
+    to.name !== "teams" &&
+    to.name !== "team-detail"
   ) {
     return { name: "complete-profile" };
   }

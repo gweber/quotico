@@ -4,7 +4,7 @@ export type GameModeType =
   | "survivor"
   | "over_under"
   | "fantasy"
-  | "spieltag";
+  | "moneyline";
 
 export interface LeagueConfig {
   sport_key: string;
@@ -15,10 +15,10 @@ export interface LeagueConfig {
 }
 
 export const GAME_MODE_LABELS: Record<GameModeType, string> = {
-  classic: "Klassisch",
+  classic: "Tippspiel",
   bankroll: "Bankroll",
   survivor: "Survivor",
   over_under: "Über/Unter",
   fantasy: "Fantasy",
-  spieltag: "Spieltag",
+  moneyline: "Quotentipp",
 };

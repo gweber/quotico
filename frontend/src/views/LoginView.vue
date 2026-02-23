@@ -184,7 +184,7 @@ async function handleLogin() {
       <!-- Register link -->
       <p class="text-center text-sm text-text-secondary mt-6">
         Noch kein Konto?
-        <RouterLink to="/register" class="text-primary hover:text-primary-hover transition-colors font-medium">
+        <RouterLink :to="{ path: '/register', query: route.query.redirect ? { redirect: route.query.redirect } : {} }" class="text-primary hover:text-primary-hover transition-colors font-medium">
           Jetzt registrieren
         </RouterLink>
       </p>

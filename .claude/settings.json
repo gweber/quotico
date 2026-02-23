@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(MONGO_URI=\"mongodb://localhost:27017/quotico\" /Users/taro/code/quotico.de/backend/.venv/bin/python3:*)",
+      "Bash(PYTHONPATH=. python:*)",
+      "Bash(MONGO_URI=\"mongodb://localhost:27017/quotico\" PYTHONPATH=. python:*)",
+      "Bash(pnpm add:*)"
+    ],
+    "additionalDirectories": [
+      "/Users/taro/code/quotico.de/backend"
+    ]
+  }
+}

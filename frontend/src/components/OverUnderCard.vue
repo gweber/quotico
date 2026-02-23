@@ -3,10 +3,14 @@ import { ref, computed } from "vue";
 import type { SpieltagMatch } from "@/stores/spieltag";
 import { useWalletStore } from "@/stores/wallet";
 import { useToast } from "@/composables/useToast";
+import { scoreUnitLabel } from "@/types/sports";
 
 const props = defineProps<{
   match: SpieltagMatch & { totals_odds?: { over: number; under: number; line: number } };
+  sportKey?: string;
 }>();
+
+const unit = computed(() => scoreUnitLabel(props.sportKey ?? ""));
 
 const walletStore = useWalletStore();
 const toast = useToast();
@@ -102,7 +106,7 @@ function betResultClass(status: string) {
     <!-- Total goals indicator -->
     <div v-if="totalGoals !== null" class="text-center mb-2">
       <span class="text-xs text-text-muted">
-        Gesamt: {{ totalGoals }} Tore
+        Gesamt: {{ totalGoals }} {{ unit }}
         <span v-if="totalGoals > line" class="text-emerald-500 font-bold">(Über)</span>
         <span v-else-if="totalGoals < line" class="text-blue-500 font-bold">(Unter)</span>
         <span v-else class="text-amber-500 font-bold">(Push)</span>
@@ -112,7 +116,7 @@ function betResultClass(status: string) {
     <!-- Line display -->
     <div v-if="totals && !existingBet && !match.is_locked" class="space-y-2">
       <div class="text-center text-xs text-text-muted mb-1">
-        {{ line }} Tore
+        {{ line }} {{ unit }}
       </div>
       <div class="grid grid-cols-2 gap-2">
         <button

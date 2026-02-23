@@ -15,3 +15,13 @@ export const SPORT_LABELS: Record<string, string> = {
 export function sportLabel(key: string): string {
   return SPORT_LABELS[key] || key;
 }
+
+/** True for basketball sports where scores are in the hundreds. */
+export function isBasketball(sportKey: string): boolean {
+  return sportKey.startsWith("basketball_");
+}
+
+/** Sport-aware label for score totals: "Punkte" for basketball, "Tore" for football. */
+export function scoreUnitLabel(sportKey: string): string {
+  return isBasketball(sportKey) ? "Punkte" : "Tore";
+}

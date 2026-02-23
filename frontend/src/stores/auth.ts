@@ -19,6 +19,14 @@ export const useAuthStore = defineStore("auth", () => {
   const api = useApi();
   const user = ref<User | null>(null);
   const loading = ref(false);
+  const initialized = ref(false);
+
+  // Promise that resolves once the first fetchUser() completes.
+  // Router guards await this before checking auth state.
+  let _initResolve: (() => void) | null = null;
+  const initPromise = new Promise<void>((resolve) => {
+    _initResolve = resolve;
+  });
 
   const isLoggedIn = computed(() => user.value !== null);
   const isAdmin = computed(() => user.value?.is_admin === true);
@@ -31,6 +39,11 @@ export const useAuthStore = defineStore("auth", () => {
       user.value = await api.get<User>("/auth/me");
     } catch {
       user.value = null;
+    } finally {
+      if (!initialized.value) {
+        initialized.value = true;
+        _initResolve?.();
+      }
     }
   }
 
@@ -100,7 +113,8 @@ export const useAuthStore = defineStore("auth", () => {
   }
 
   return {
-    user, loading, isLoggedIn, isAdmin, needsProfileCompletion,
+    user, loading, initialized, initPromise,
+    isLoggedIn, isAdmin, needsProfileCompletion,
     fetchUser, login, login2fa, register, completeProfile, logout,
   };
 });

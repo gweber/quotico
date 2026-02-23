@@ -20,6 +20,8 @@ async def poll_odds() -> None:
     now = utcnow()
     window = now + timedelta(hours=48)
     any_polled = False
+    total_matches = 0
+    total_odds_changed = 0
 
     for sport_key in SUPPORTED_SPORTS:
         # Check if there are upcoming matches in the next 48h for this sport
@@ -42,15 +44,25 @@ async def poll_odds() -> None:
             continue
 
         try:
-            count = await sync_matches_for_sport(sport_key)
-            await set_synced(state_key)
+            result = await sync_matches_for_sport(sport_key)
+            matches_count = result["matches"]
+            odds_changed = result["odds_changed"]
+            await set_synced(state_key, metrics={"matches": matches_count, "odds_changed": odds_changed})
             any_polled = True
-            if count > 0:
-                logger.info("Polled %s: %d matches", sport_key, count)
+            total_matches += matches_count
+            total_odds_changed += odds_changed
+            if matches_count > 0:
+                logger.info("Polled %s: %d matches, %d odds changed", sport_key, matches_count, odds_changed)
+                await _snapshot_odds(sport_key)
         except Exception as e:
             logger.error("Poll failed for %s: %s", sport_key, e)
 
-    # Log API usage only if we actually polled
+    # Always record that the worker ran (so admin panel shows accurate "last sync")
+    await set_synced("odds_poller", metrics={
+        "matches": total_matches,
+        "odds_changed": total_odds_changed,
+    })
+
     if any_polled:
         usage = odds_provider.api_usage
         logger.info(
@@ -58,6 +70,33 @@ async def poll_odds() -> None:
             usage.get("requests_used", "?"),
             usage.get("requests_remaining", "?"),
         )
+
+
+async def _snapshot_odds(sport_key: str) -> None:
+    """Record current odds as a point-in-time snapshot for line movement tracking."""
+    now = utcnow()
+    matches = await _db.db.matches.find(
+        {"sport_key": sport_key, "status": "upcoming"},
+        {"_id": 1, "external_id": 1, "sport_key": 1, "current_odds": 1, "totals_odds": 1, "spreads_odds": 1},
+    ).to_list(length=200)
+
+    if not matches:
+        return
+
+    docs = [
+        {
+            "match_id": str(m["_id"]),
+            "external_id": m["external_id"],
+            "sport_key": m["sport_key"],
+            "odds": m["current_odds"],
+            "totals_odds": m.get("totals_odds", {}),
+            "spreads_odds": m.get("spreads_odds", {}),
+            "snapshot_at": now,
+        }
+        for m in matches
+    ]
+    await _db.db.odds_snapshots.insert_many(docs, ordered=False)
+    logger.debug("Snapshotted odds for %d %s matches", len(docs), sport_key)
 
 
 async def _is_initial_load(sport_key: str) -> bool:

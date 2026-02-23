@@ -35,7 +35,7 @@ async def create_parlay(
 
     game_mode = squad.get("game_mode", "classic")
     if game_mode not in ("classic", "bankroll"):
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Kombi-Joker nur im Classic- oder Bankroll-Modus.")
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Kombi-Joker nur im Tippspiel- oder Bankroll-Modus.")
     if user_id not in squad.get("members", []):
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Du bist kein Mitglied dieser Squad.")
 

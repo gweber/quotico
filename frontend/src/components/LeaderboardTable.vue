@@ -4,6 +4,7 @@ defineProps<{
     rank: number;
     alias: string;
     points: number;
+    is_bot?: boolean;
   }>;
   loading?: boolean;
   currentUserAlias?: string;
@@ -73,6 +74,13 @@ defineProps<{
               :class="entry.alias === currentUserAlias ? 'text-primary' : 'text-text-primary'"
             >
               {{ entry.alias }}
+            </span>
+            <span
+              v-if="entry.is_bot"
+              class="ml-1.5 inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-bold uppercase tracking-wider bg-primary/10 text-primary"
+              title="Automatischer Q-Bot Tipper"
+            >
+              BOT
             </span>
             <span
               v-if="entry.alias === currentUserAlias"

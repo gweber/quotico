@@ -10,14 +10,19 @@ const options = [
     desc: "Nur manuell getippte Spiele werden gewertet.",
   },
   {
-    value: "draw",
-    label: "1:1 (Unentschieden)",
-    desc: "Nicht getippte Spiele werden automatisch mit 1:1 getippt.",
+    value: "q_bot",
+    label: "Q-Bot",
+    desc: "Folgt der QuoticoTip-Empfehlung. Ohne Empfehlung: Quoten-Favorit. Ohne Quoten: 1:1.",
   },
   {
     value: "favorite",
     label: "Quoten-Favorit",
-    desc: "Nicht getippte Spiele werden auf den Quoten-Favoriten gesetzt. Bei gleichen Quoten wird Unentschieden angenommen.",
+    desc: "Nicht getippte Spiele werden auf den Quoten-Favoriten gesetzt. Ohne Quoten: 1:1.",
+  },
+  {
+    value: "draw",
+    label: "1:1 (Unentschieden)",
+    desc: "Nicht getippte Spiele werden automatisch mit 1:1 getippt.",
   },
 ];
 </script>

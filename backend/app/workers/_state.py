@@ -16,12 +16,20 @@ async def get_synced_at(worker_id: str) -> datetime | None:
     return doc["synced_at"] if doc else None
 
 
-async def set_synced(worker_id: str) -> None:
-    """Mark a worker as just synced."""
+async def get_worker_state(worker_id: str) -> dict | None:
+    """Get the full worker state doc (synced_at + last_metrics)."""
+    return await _db.db.worker_state.find_one({"_id": worker_id})
+
+
+async def set_synced(worker_id: str, metrics: dict | None = None) -> None:
+    """Mark a worker as just synced, optionally storing run metrics."""
     now = utcnow()
+    update: dict = {"synced_at": now}
+    if metrics is not None:
+        update["last_metrics"] = metrics
     await _db.db.worker_state.update_one(
         {"_id": worker_id},
-        {"$set": {"synced_at": now}},
+        {"$set": update},
         upsert=True,
     )
 

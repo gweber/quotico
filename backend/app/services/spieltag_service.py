@@ -47,14 +47,47 @@ def calculate_points(
     return 0
 
 
+def _favorite_prediction(match: dict) -> tuple[int, int]:
+    """Predict based on odds favorite, fallback to 1:1."""
+    odds = match.get("current_odds", {})
+    home_odds = odds.get("1", 0)
+    away_odds = odds.get("2", 0)
+
+    if not home_odds or not away_odds:
+        return (1, 1)
+
+    if home_odds < away_odds:
+        return (2, 1)  # Home favorite
+    elif away_odds < home_odds:
+        return (1, 2)  # Away favorite
+    else:
+        return (1, 1)  # Equal odds → draw
+
+
+def _qbot_prediction(quotico_tip: dict | None) -> tuple[int, int] | None:
+    """Convert a QuoticoTip recommendation to a score prediction."""
+    if not quotico_tip:
+        return None
+
+    sel = quotico_tip.get("recommended_selection")
+    if sel == "1":
+        return (2, 1)  # Home win
+    elif sel == "X":
+        return (1, 1)  # Draw
+    elif sel == "2":
+        return (1, 2)  # Away win
+    return None
+
+
 def generate_auto_prediction(
-    strategy: str, match: dict
+    strategy: str, match: dict, *, quotico_tip: dict | None = None,
 ) -> Optional[tuple[int, int]]:
     """Generate an auto-tipp prediction for a match.
 
     Args:
-        strategy: "draw" | "favorite" | "none"
+        strategy: "q_bot" | "draw" | "favorite" | "none"
         match: Match document from DB
+        quotico_tip: Optional QuoticoTip document for this match
 
     Returns:
         (home_score, away_score) or None if strategy is "none"
@@ -66,33 +99,30 @@ def generate_auto_prediction(
         return (1, 1)
 
     if strategy == "favorite":
-        odds = match.get("current_odds", {})
-        home_odds = odds.get("1", 0)
-        away_odds = odds.get("2", 0)
+        return _favorite_prediction(match)
 
-        if not home_odds or not away_odds:
-            return (1, 1)  # Fallback to draw if no odds
-
-        # Lower odds = favorite
-        if home_odds < away_odds:
-            return (2, 1)  # Home favorite → predict home win
-        elif away_odds < home_odds:
-            return (1, 2)  # Away favorite → predict away win
-        else:
-            return (1, 1)  # Equal odds → draw
+    if strategy == "q_bot":
+        # Chain: QuoticoTip → odds favorite → 1:1
+        qbot = _qbot_prediction(quotico_tip)
+        if qbot:
+            return qbot
+        return _favorite_prediction(match)
 
     return None
 
 
-def is_match_locked(match: dict) -> bool:
-    """Check if a match is locked for predictions (< 15 min to kickoff or started)."""
+def is_match_locked(match: dict, lock_minutes: int = LOCK_MINUTES) -> bool:
+    """Check if a match is locked for predictions.
+
+    Locked when current time >= (kickoff - lock_minutes) or match has started.
+    """
     now = utcnow()
     commence_time = match.get("commence_time")
     if not commence_time:
         return True
     commence_time = ensure_utc(commence_time)
 
-    deadline = commence_time - timedelta(minutes=LOCK_MINUTES)
+    deadline = commence_time - timedelta(minutes=lock_minutes)
     return now >= deadline
 
 
@@ -122,6 +152,7 @@ async def save_predictions(
         )
 
     # Validate squad context if provided
+    lock_mins = LOCK_MINUTES  # Default; overridden by squad setting
     if squad_id:
         squad = await _db.db.squads.find_one({"_id": ObjectId(squad_id)})
         if not squad:
@@ -135,7 +166,13 @@ async def save_predictions(
                 detail="Du bist kein Mitglied dieses Squads.",
             )
         from app.services.squad_league_service import require_active_league_config
-        require_active_league_config(squad, matchday["sport_key"], "spieltag")
+        require_active_league_config(squad, matchday["sport_key"], "classic")
+        if auto_tipp_strategy != "none" and squad.get("auto_tipp_blocked", False):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Auto-Tipp ist in diesem Squad deaktiviert.",
+            )
+        lock_mins = squad.get("lock_minutes", LOCK_MINUTES)
 
     # Get all matches for this matchday
     match_ids = matchday.get("match_ids", [])
@@ -157,6 +194,14 @@ async def save_predictions(
         for p in existing.get("predictions", []):
             existing_preds[p["match_id"]] = p
 
+    # Admin-unlocked matches bypass lock for this user
+    admin_unlocked = set(existing.get("admin_unlocked_matches", [])) if existing else set()
+
+    def _is_locked(match: dict, match_id: str) -> bool:
+        if match_id in admin_unlocked:
+            return False
+        return is_match_locked(match, lock_mins)
+
     # Process new predictions
     now = utcnow()
     final_predictions: list[dict] = []
@@ -164,7 +209,7 @@ async def save_predictions(
     # Keep locked predictions unchanged
     for match_id, pred in existing_preds.items():
         match = matches_by_id.get(match_id)
-        if match and is_match_locked(match):
+        if match and _is_locked(match, match_id):
             final_predictions.append(pred)
 
     # Add/update unlocked predictions from input
@@ -175,7 +220,7 @@ async def save_predictions(
         if not match:
             continue
 
-        if is_match_locked(match):
+        if _is_locked(match, match_id):
             continue  # Silently skip locked matches
 
         if match_id not in [str(mid) for mid in match_ids]:
@@ -193,7 +238,7 @@ async def save_predictions(
     # Keep existing unlocked predictions that weren't re-submitted
     for match_id, pred in existing_preds.items():
         match = matches_by_id.get(match_id)
-        if match and not is_match_locked(match) and match_id not in submitted_match_ids:
+        if match and not _is_locked(match, match_id) and match_id not in submitted_match_ids:
             # User didn't re-submit this one, keep it
             final_predictions.append(pred)
 
@@ -244,3 +289,170 @@ async def get_user_predictions(
         "matchday_id": matchday_id,
         "squad_id": squad_id,
     })
+
+
+# ---------- Squad admin helpers ----------
+
+async def _validate_squad_admin(
+    admin_id: str, squad_id: str, user_id: str, matchday_id: str, match_id: str,
+) -> tuple[dict, dict, dict]:
+    """Shared validation for admin unlock/prediction endpoints.
+
+    Returns (squad, matchday, match) or raises HTTPException.
+    """
+    squad = await _db.db.squads.find_one({"_id": ObjectId(squad_id)})
+    if not squad:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Squad nicht gefunden.")
+    if squad["admin_id"] != admin_id:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Nur der Squad-Admin kann das.")
+    if user_id not in squad.get("members", []):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "User ist kein Mitglied dieses Squads.")
+
+    matchday = await _db.db.matchdays.find_one({"_id": ObjectId(matchday_id)})
+    if not matchday:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Spieltag nicht gefunden.")
+    if match_id not in matchday.get("match_ids", []):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Spiel gehört nicht zu diesem Spieltag.")
+
+    match = await _db.db.matches.find_one({"_id": ObjectId(match_id)})
+    if not match:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Spiel nicht gefunden.")
+
+    return squad, matchday, match
+
+
+async def admin_unlock_match(
+    admin_id: str, squad_id: str, user_id: str, matchday_id: str, match_id: str,
+) -> dict:
+    """Squad admin unlocks a specific match for a user, bypassing the lock deadline."""
+    squad, matchday, match = await _validate_squad_admin(
+        admin_id, squad_id, user_id, matchday_id, match_id,
+    )
+
+    now = utcnow()
+    filter_key = {"user_id": user_id, "matchday_id": matchday_id, "squad_id": squad_id}
+
+    await _db.db.spieltag_predictions.update_one(
+        filter_key,
+        {
+            "$addToSet": {"admin_unlocked_matches": match_id},
+            "$set": {"updated_at": now},
+            "$setOnInsert": {
+                "sport_key": matchday["sport_key"],
+                "season": matchday["season"],
+                "matchday_number": matchday["matchday_number"],
+                "auto_tipp_strategy": "none",
+                "predictions": [],
+                "total_points": None,
+                "status": "open",
+                "created_at": now,
+            },
+        },
+        upsert=True,
+    )
+
+    logger.info(
+        "Admin %s unlocked match %s for user %s (squad=%s)",
+        admin_id, match_id, user_id, squad_id,
+    )
+    return {"unlocked": True, "match_id": match_id, "user_id": user_id}
+
+
+async def admin_save_prediction(
+    admin_id: str, squad_id: str, user_id: str,
+    matchday_id: str, match_id: str,
+    home_score: int, away_score: int,
+) -> dict:
+    """Squad admin enters a prediction on behalf of a user. Bypasses lock.
+
+    If the match is already completed, points are calculated immediately
+    and the prediction doc's total_points is recalculated.
+    """
+    squad, matchday, match = await _validate_squad_admin(
+        admin_id, squad_id, user_id, matchday_id, match_id,
+    )
+
+    now = utcnow()
+    filter_key = {"user_id": user_id, "matchday_id": matchday_id, "squad_id": squad_id}
+
+    # Score immediately if match is completed
+    points_earned = None
+    if (
+        match.get("status") == "completed"
+        and match.get("home_score") is not None
+        and match.get("away_score") is not None
+    ):
+        points_earned = calculate_points(
+            home_score, away_score,
+            match["home_score"], match["away_score"],
+        )
+
+    new_pred = {
+        "match_id": match_id,
+        "home_score": home_score,
+        "away_score": away_score,
+        "is_auto": False,
+        "is_admin_entry": True,
+        "points_earned": points_earned,
+    }
+
+    # Get existing prediction doc
+    existing = await _db.db.spieltag_predictions.find_one(filter_key)
+
+    if existing:
+        # Replace or append the prediction for this match
+        preds = [p for p in existing.get("predictions", []) if p["match_id"] != match_id]
+        preds.append(new_pred)
+
+        # Recalculate total_points
+        all_scored = all(p.get("points_earned") is not None for p in preds)
+        total_pts = sum(p["points_earned"] for p in preds if p.get("points_earned") is not None)
+
+        # Determine status
+        match_ids = matchday.get("match_ids", [])
+        all_matches_done = await _db.db.matches.count_documents({
+            "_id": {"$in": [ObjectId(mid) for mid in match_ids]},
+            "status": "completed",
+        }) == len(match_ids)
+
+        new_status = "resolved" if (all_matches_done and all_scored) else "partial"
+
+        await _db.db.spieltag_predictions.update_one(
+            {"_id": existing["_id"]},
+            {"$set": {
+                "predictions": preds,
+                "total_points": total_pts if new_status == "resolved" else None,
+                "status": new_status,
+                "updated_at": now,
+            }},
+        )
+    else:
+        # Create new prediction doc
+        doc = {
+            "user_id": user_id,
+            "matchday_id": matchday_id,
+            "squad_id": squad_id,
+            "sport_key": matchday["sport_key"],
+            "season": matchday["season"],
+            "matchday_number": matchday["matchday_number"],
+            "auto_tipp_strategy": "none",
+            "predictions": [new_pred],
+            "admin_unlocked_matches": [],
+            "total_points": None,
+            "status": "partial",
+            "created_at": now,
+            "updated_at": now,
+        }
+        await _db.db.spieltag_predictions.insert_one(doc)
+
+    logger.info(
+        "Admin %s saved prediction %d:%d for match %s user %s (squad=%s, pts=%s)",
+        admin_id, home_score, away_score, match_id, user_id, squad_id, points_earned,
+    )
+
+    return {
+        "match_id": match_id,
+        "home_score": home_score,
+        "away_score": away_score,
+        "points_earned": points_earned,
+    }

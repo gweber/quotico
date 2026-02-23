@@ -127,6 +127,43 @@ async def remove_member(admin_id: str, squad_id: str, member_id: str) -> None:
     )
 
 
+async def delete_squad(admin_id: str, squad_id: str) -> None:
+    """Delete a squad. Only the admin can delete it."""
+    squad = await _db.db.squads.find_one({"_id": ObjectId(squad_id)})
+    if not squad:
+        raise HTTPException(status_code=404, detail="Gruppe nicht gefunden.")
+
+    if squad["admin_id"] != admin_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Nur der Admin kann die Gruppe löschen.",
+        )
+
+    await _db.db.squads.delete_one({"_id": ObjectId(squad_id)})
+    logger.info("Squad deleted: %s by admin %s", squad["name"], admin_id)
+
+
+async def update_squad(admin_id: str, squad_id: str, description: str | None) -> dict:
+    """Update squad details. Only the admin can edit."""
+    squad = await _db.db.squads.find_one({"_id": ObjectId(squad_id)})
+    if not squad:
+        raise HTTPException(status_code=404, detail="Gruppe nicht gefunden.")
+
+    if squad["admin_id"] != admin_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Nur der Admin kann die Gruppe bearbeiten.",
+        )
+
+    await _db.db.squads.update_one(
+        {"_id": ObjectId(squad_id)},
+        {"$set": {"description": description, "updated_at": utcnow()}},
+    )
+
+    squad["description"] = description
+    return squad
+
+
 async def get_user_squads(user_id: str) -> list[dict]:
     """Get all squads a user is a member of."""
     return await _db.db.squads.find({"members": user_id}).to_list(length=20)

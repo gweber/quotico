@@ -38,6 +38,8 @@ async def list_matches(
             commence_time=m["commence_time"],
             status=m["status"],
             current_odds=m["current_odds"],
+            totals_odds=m.get("totals_odds", {}),
+            spreads_odds=m.get("spreads_odds", {}),
             odds_updated_at=m["odds_updated_at"],
             result=m.get("result"),
             home_score=m.get("home_score"),
@@ -127,6 +129,21 @@ async def _match_live_score(sport_key: str, score: dict) -> Optional[dict]:
     return None
 
 
+@router.get("/{match_id}/odds-timeline")
+async def match_odds_timeline(match_id: str):
+    """Odds snapshots for a single match, sorted chronologically."""
+    snapshots = await _db.db.odds_snapshots.find(
+        {"match_id": match_id},
+        {"_id": 0, "snapshot_at": 1, "odds": 1, "totals_odds": 1},
+    ).sort("snapshot_at", 1).to_list(length=500)
+
+    return {
+        "match_id": match_id,
+        "snapshots": snapshots,
+        "snapshot_count": len(snapshots),
+    }
+
+
 @router.get("/{match_id}", response_model=MatchResponse)
 async def get_match(match_id: str):
     """Get a single match by ID."""
@@ -143,6 +160,8 @@ async def get_match(match_id: str):
         commence_time=match["commence_time"],
         status=match["status"],
         current_odds=match["current_odds"],
+        totals_odds=match.get("totals_odds", {}),
+        spreads_odds=match.get("spreads_odds", {}),
         odds_updated_at=match["odds_updated_at"],
         result=match.get("result"),
         home_score=match.get("home_score"),
@@ -155,5 +174,5 @@ async def provider_status():
     """Check odds provider health (circuit breaker state, API usage)."""
     return {
         "circuit_open": odds_provider.circuit_open,
-        "api_usage": odds_provider.api_usage,
+        "api_usage": await odds_provider.load_usage(),
     }

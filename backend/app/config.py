@@ -39,6 +39,9 @@ class Settings(BaseSettings):
     # API key for local tools (scraper import etc.)
     IMPORT_API_KEY: str = ""
 
+    # Q-Bot: minimum QuoticoTip confidence to auto-tip
+    QBOT_MIN_CONFIDENCE: float = 0.55
+
     model_config = {"env_file": str(_ENV_FILE), "extra": "ignore"}
 
 

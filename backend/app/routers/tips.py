@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, status
+from fastapi import APIRouter, Depends, Query, status
 
 from app.database import get_db
 from app.models.tip import TipCreate, TipResponse
@@ -33,10 +33,14 @@ async def submit_tip(
 
 
 @router.get("/mine", response_model=list[TipResponse])
-async def my_tips(user=Depends(get_current_user)):
-    """Get all tips for the current user."""
+async def my_tips(
+    user=Depends(get_current_user),
+    match_ids: str | None = Query(None, description="Comma-separated match IDs to filter by"),
+):
+    """Get tips for the current user, optionally filtered by match IDs."""
     user_id = str(user["_id"])
-    tips = await get_user_tips(user_id)
+    ids = match_ids.split(",") if match_ids else None
+    tips = await get_user_tips(user_id, match_ids=ids)
     return [
         TipResponse(
             id=str(t["_id"]),

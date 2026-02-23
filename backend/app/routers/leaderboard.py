@@ -25,7 +25,7 @@ async def get_leaderboard(limit: int = Query(50, ge=1, le=200)) -> list[dict[str
         entries = (
             await _db.db.users.find(
                 {"is_deleted": False, "points": {"$gt": 0}},
-                {"alias": 1, "points": 1},
+                {"alias": 1, "points": 1, "is_bot": 1},
             )
             .sort("points", -1)
             .limit(limit)
@@ -37,6 +37,7 @@ async def get_leaderboard(limit: int = Query(50, ge=1, le=200)) -> list[dict[str
             "rank": i + 1,
             "alias": e.get("alias", "Anonymous"),
             "points": round(e.get("points", 0), 2),
+            "is_bot": e.get("is_bot", False),
         }
         for i, e in enumerate(entries)
     ]

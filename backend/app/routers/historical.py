@@ -10,6 +10,12 @@ from pydantic import BaseModel, Field
 import app.database as _db
 from app.config import settings
 from app.services.auth_service import get_admin_user
+from app.services.historical_service import (
+    build_match_context,
+    clear_context_cache,
+    sport_keys_for,
+    team_name_key,
+)
 from app.utils import utcnow
 
 logger = logging.getLogger("quotico.historical")
@@ -113,7 +119,12 @@ class AliasBatch(BaseModel):
 
 @router.post("/import", response_model=ImportResult)
 async def import_matches(batch: ImportBatch, _=Depends(verify_import_key)):
-    """Bulk upsert historical matches. Called by the local scraper tool."""
+    """Bulk upsert historical matches. Called by the local scraper tool.
+
+    Dedup uses normalized team keys (not raw names) so scraper records
+    correctly overwrite auto-archived records from the match resolver
+    even when team name spellings differ between providers.
+    """
     from pymongo import UpdateOne
 
     now = utcnow()
@@ -131,13 +142,18 @@ async def import_matches(batch: ImportBatch, _=Depends(verify_import_key)):
 
         doc["updated_at"] = now
 
+        # Dedup by normalized team keys + date — matches unique index
+        # (date needed for NBA playoffs: same home/away pair, different dates)
+        home_key = doc.get("home_team_key") or team_name_key(doc["home_team"])
+        away_key = doc.get("away_team_key") or team_name_key(doc["away_team"])
+
         ops.append(UpdateOne(
             {
                 "sport_key": doc["sport_key"],
                 "season": doc["season"],
+                "home_team_key": home_key,
+                "away_team_key": away_key,
                 "match_date": doc["match_date"],
-                "home_team": doc["home_team"],
-                "away_team": doc["away_team"],
             },
             {
                 "$set": doc,
@@ -154,6 +170,8 @@ async def import_matches(batch: ImportBatch, _=Depends(verify_import_key)):
         "Historical import: %d received, %d upserted, %d modified",
         len(batch.matches), result.upserted_count, result.modified_count,
     )
+
+    clear_context_cache()
 
     return ImportResult(
         received=len(batch.matches),
@@ -200,7 +218,7 @@ async def import_aliases(batch: AliasBatch, _=Depends(verify_import_key)):
 
 
 # ---------------------------------------------------------------------------
-# Read endpoints (public, for match card enrichment in phase 2)
+# Read endpoints (public)
 # ---------------------------------------------------------------------------
 
 @router.get("/h2h")
@@ -209,11 +227,13 @@ async def head_to_head(
     home_team_key: str = Query(...),
     away_team_key: str = Query(...),
     limit: int = Query(10, ge=1, le=50),
+    skip: int = Query(0, ge=0, le=200),
 ):
     """Get head-to-head history between two teams (either direction)."""
+    related_keys = sport_keys_for(sport_key)
     matches = await _db.db.historical_matches.find(
         {
-            "sport_key": sport_key,
+            "sport_key": {"$in": related_keys},
             "$or": [
                 {"home_team_key": home_team_key, "away_team_key": away_team_key},
                 {"home_team_key": away_team_key, "away_team_key": home_team_key},
@@ -222,11 +242,11 @@ async def head_to_head(
         {
             "_id": 0,
             "match_date": 1, "home_team": 1, "away_team": 1,
+            "home_team_key": 1, "away_team_key": 1,
             "home_goals": 1, "away_goals": 1, "result": 1,
-            "ht_home_goals": 1, "ht_away_goals": 1,
-            "odds": 1, "season_label": 1,
+            "season_label": 1,
         },
-    ).sort("match_date", -1).to_list(length=limit)
+    ).sort("match_date", -1).skip(skip).to_list(length=limit)
 
     return {"matches": matches, "count": len(matches)}
 
@@ -255,6 +275,48 @@ async def team_form(
     ).sort("match_date", -1).to_list(length=limit)
 
     return {"matches": matches, "count": len(matches)}
+
+
+@router.get("/match-context")
+async def match_context(
+    home_team: str = Query(..., description="Home team name (from provider)"),
+    away_team: str = Query(..., description="Away team name (from provider)"),
+    sport_key: str = Query(...),
+    h2h_limit: int = Query(10, ge=1, le=20),
+    form_limit: int = Query(10, ge=1, le=20),
+):
+    """Combined H2H + form for a single fixture."""
+    return await build_match_context(home_team, away_team, sport_key, h2h_limit, form_limit)
+
+
+class BulkFixture(BaseModel):
+    home_team: str
+    away_team: str
+    sport_key: str
+
+
+class BulkContextRequest(BaseModel):
+    fixtures: list[BulkFixture] = Field(..., max_length=20)
+    h2h_limit: int = Field(10, ge=1, le=20)
+    form_limit: int = Field(10, ge=1, le=20)
+
+
+@router.post("/match-context-bulk")
+async def match_context_bulk(req: BulkContextRequest):
+    """Combined H2H + form for multiple fixtures in a single request."""
+    import asyncio
+
+    results = await asyncio.gather(*(
+        build_match_context(f.home_team, f.away_team, f.sport_key, req.h2h_limit, req.form_limit)
+        for f in req.fixtures
+    ))
+
+    return {
+        "results": [
+            {"home_team": f.home_team, "away_team": f.away_team, "sport_key": f.sport_key, **ctx}
+            for f, ctx in zip(req.fixtures, results)
+        ]
+    }
 
 
 @router.get("/stats")

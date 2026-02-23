@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted } from "vue";
+import { ref, watch, onMounted } from "vue";
 import { useRouter } from "vue-router";
 import { useSquadsStore } from "@/stores/squads";
 import { useToast } from "@/composables/useToast";
@@ -15,8 +15,22 @@ const createDesc = ref("");
 const joinCode = ref("");
 const submitting = ref(false);
 
+// Public squads
+const searchQuery = ref("");
+const requestedSquadIds = ref(new Set<string>());
+const requestingId = ref<string | null>(null);
+let searchTimeout: ReturnType<typeof setTimeout> | null = null;
+
+watch(searchQuery, (q) => {
+  if (searchTimeout) clearTimeout(searchTimeout);
+  searchTimeout = setTimeout(() => {
+    squads.fetchPublicSquads(q.trim());
+  }, 300);
+});
+
 onMounted(() => {
   squads.fetchMySquads();
+  squads.fetchPublicSquads();
 });
 
 async function handleCreate() {
@@ -47,6 +61,18 @@ async function handleJoin() {
     toast.error(e.message || "Ungültiger Einladungscode.");
   } finally {
     submitting.value = false;
+  }
+}
+
+async function handleRequestJoin(squadId: string) {
+  requestingId.value = squadId;
+  try {
+    await squads.requestJoin(squadId);
+    requestedSquadIds.value.add(squadId);
+  } catch (e: any) {
+    toast.error(e.message || "Anfrage fehlgeschlagen.");
+  } finally {
+    requestingId.value = null;
   }
 }
 </script>
@@ -121,6 +147,68 @@ async function handleJoin() {
           </div>
         </div>
       </RouterLink>
+    </div>
+
+    <!-- Public Squads -->
+    <div class="mt-10">
+      <h2 class="text-lg font-bold text-text-primary mb-4">Squads entdecken</h2>
+
+      <!-- Search -->
+      <input
+        v-model="searchQuery"
+        type="text"
+        placeholder="Squad suchen..."
+        class="w-full bg-surface-1 border border-surface-3/50 rounded-lg px-4 py-2.5 text-sm text-text-primary placeholder:text-text-muted/50 focus:outline-none focus:ring-1 focus:ring-primary mb-4"
+      />
+
+      <!-- Loading -->
+      <div v-if="squads.publicLoading" class="space-y-3">
+        <div v-for="n in 3" :key="n" class="bg-surface-1 rounded-card h-16 animate-pulse" />
+      </div>
+
+      <!-- Results -->
+      <div v-else-if="squads.publicSquads.length > 0" class="space-y-3">
+        <div
+          v-for="ps in squads.publicSquads"
+          :key="ps.id"
+          class="bg-surface-1 rounded-card p-4 border border-surface-3/50 flex items-center justify-between"
+        >
+          <div class="min-w-0 flex-1">
+            <h3 class="text-sm font-semibold text-text-primary">{{ ps.name }}</h3>
+            <p v-if="ps.description" class="text-xs text-text-muted mt-0.5 truncate">{{ ps.description }}</p>
+            <span class="text-xs text-text-muted">{{ ps.member_count }} Mitglieder</span>
+          </div>
+          <div class="shrink-0 ml-4">
+            <button
+              v-if="ps.is_open && !requestedSquadIds.has(ps.id)"
+              class="px-3 py-1.5 text-xs font-medium rounded-lg bg-primary/10 text-primary border border-primary/30 hover:bg-primary/20 transition-colors disabled:opacity-50"
+              :disabled="requestingId === ps.id"
+              @click="handleRequestJoin(ps.id)"
+            >
+              {{ requestingId === ps.id ? "..." : "Anfrage senden" }}
+            </button>
+            <span
+              v-else-if="requestedSquadIds.has(ps.id)"
+              class="px-3 py-1.5 text-xs font-medium rounded-lg bg-success/10 text-success border border-success/30"
+            >
+              Angefragt
+            </span>
+            <span
+              v-else
+              class="px-3 py-1.5 text-xs font-medium rounded-lg bg-surface-2 text-text-muted border border-surface-3"
+            >
+              Geschlossen
+            </span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Empty -->
+      <div v-else class="text-center py-8">
+        <p class="text-sm text-text-muted">
+          {{ searchQuery.trim() ? "Keine Squads gefunden." : "Keine öffentlichen Squads verfügbar." }}
+        </p>
+      </div>
     </div>
 
     <!-- Create Modal -->

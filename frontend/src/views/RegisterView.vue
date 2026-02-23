@@ -1,12 +1,18 @@
 <script setup lang="ts">
 import { ref, computed } from "vue";
-import { useRouter } from "vue-router";
+import { useRouter, useRoute } from "vue-router";
 import { useAuthStore } from "@/stores/auth";
 import { useToast } from "@/composables/useToast";
 
 const router = useRouter();
+const route = useRoute();
 const auth = useAuthStore();
 const toast = useToast();
+
+const redirectTarget = computed(() => {
+  const r = route.query.redirect as string | undefined;
+  return r && r.startsWith("/") ? r : "/";
+});
 
 const email = ref("");
 const password = ref("");
@@ -61,7 +67,7 @@ async function handleRegister() {
   try {
     await auth.register(email.value, password.value, birthDate.value, disclaimerAccepted.value);
     toast.success("Registrierung erfolgreich! Willkommen bei Quotico.");
-    router.push("/");
+    router.push(redirectTarget.value);
   } catch (e: unknown) {
     const msg = e instanceof Error ? e.message : "Registrierung fehlgeschlagen.";
     errorMessage.value = msg;
@@ -220,14 +226,14 @@ async function handleRegister() {
       <!-- Login link -->
       <p class="text-center text-sm text-text-secondary mt-6">
         Bereits registriert?
-        <RouterLink to="/login" class="text-primary hover:text-primary-hover transition-colors font-medium">
+        <RouterLink :to="{ path: '/login', query: route.query.redirect ? { redirect: route.query.redirect } : {} }" class="text-primary hover:text-primary-hover transition-colors font-medium">
           Jetzt anmelden
         </RouterLink>
       </p>
 
       <!-- Legal notice -->
       <p class="text-center text-xs text-text-muted mt-4">
-        Ab 18 Jahren. Tipspiel &mdash; kein Echtgeld. Keine Wette, keine Gewinnauszahlung.
+        Ab 18 Jahren. Tippspiel &mdash; kein Echtgeld. Keine Wette, keine Gewinnauszahlung.
       </p>
     </div>
   </div>

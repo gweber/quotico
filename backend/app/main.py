@@ -28,8 +28,14 @@ async def lifespan(app: FastAPI):
     await connect_db()
 
     # Seed on startup
-    from app.seed import seed_initial_user
+    from app.seed import seed_initial_user, seed_qbot_user
     await seed_initial_user()
+    await seed_qbot_user()
+
+    # Seed canonical team name map + load into memory
+    from app.services.historical_service import seed_canonical_map, reload_canonical_cache
+    await seed_canonical_map()
+    await reload_canonical_cache()
 
     # Start background workers
     from app.workers.odds_poller import poll_odds
@@ -45,6 +51,8 @@ async def lifespan(app: FastAPI):
     from app.workers.fantasy_resolver import resolve_fantasy_picks
     from app.workers.parlay_resolver import resolve_parlays
     from app.workers.wallet_maintenance import run_wallet_maintenance
+    from app.workers.quotico_tip_worker import generate_quotico_tips
+    from app.workers.qbot_worker import run_qbot
 
     # ~8 calls per poll, 500/day budget → poll every 30min = ~384 calls/day
     scheduler.add_job(poll_odds, "interval", minutes=30, id="odds_poller")
@@ -65,12 +73,19 @@ async def lifespan(app: FastAPI):
     # Wallet maintenance (daily bonus for bankrupt wallets)
     scheduler.add_job(run_wallet_maintenance, "interval", hours=6, id="wallet_maintenance")
 
-    # Initial poll on startup (delayed 5s to let app fully start)
-    async def initial_poll():
+    # QuoticoTip EV engine (generates value-bet recommendations)
+    scheduler.add_job(generate_quotico_tips, "interval", minutes=30, id="quotico_tip_worker")
+
+    # Q-Bot auto-tipper (places tips from QuoticoTip recommendations)
+    scheduler.add_job(run_qbot, "interval", minutes=30, id="qbot_worker")
+
+    # Initial sync on startup (delayed 5s to let app fully start)
+    async def initial_sync():
         await asyncio.sleep(5)
+        await sync_matchdays()
         await poll_odds()
 
-    asyncio.create_task(initial_poll())
+    asyncio.create_task(initial_sync())
     scheduler.start()
     logger.info("Background scheduler started")
 
@@ -123,6 +138,8 @@ from app.routers.survivor import router as survivor_router
 from app.routers.fantasy import router as fantasy_router
 from app.routers.parlay import router as parlay_router
 from app.routers.historical import router as historical_router
+from app.routers.quotico_tips import router as quotico_tips_router
+from app.routers.teams import router as teams_router
 
 app.include_router(auth_router)
 app.include_router(user_router)
@@ -144,6 +161,8 @@ app.include_router(survivor_router)
 app.include_router(fantasy_router)
 app.include_router(parlay_router)
 app.include_router(historical_router)
+app.include_router(quotico_tips_router)
+app.include_router(teams_router)
 
 
 @app.exception_handler(InvalidId)

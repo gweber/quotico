@@ -21,6 +21,7 @@ class MatchInDB(BaseModel):
     status: MatchStatus = MatchStatus.upcoming
     current_odds: Dict[str, float]  # {"1": 1.8, "X": 3.4, "2": 4.1} or {"1": 1.5, "2": 2.3}
     totals_odds: Dict[str, float] = {}  # {"over": 1.85, "under": 2.05, "line": 2.5}
+    spreads_odds: Dict[str, float] = {}  # {"home_line": -5.5, "home_odds": 1.91, "away_line": 5.5, "away_odds": 1.91}
     odds_updated_at: datetime
     result: Optional[str] = None
     home_score: Optional[int] = None
@@ -41,6 +42,7 @@ class MatchResponse(BaseModel):
     status: str
     current_odds: Dict[str, float]
     totals_odds: Dict[str, float] = {}
+    spreads_odds: Dict[str, float] = {}
     odds_updated_at: datetime
     result: Optional[str] = None
     home_score: Optional[int] = None

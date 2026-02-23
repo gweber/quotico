@@ -1,6 +1,7 @@
 import { defineStore } from "pinia";
 import { ref } from "vue";
 import { useApi } from "@/composables/useApi";
+import { prefetchUserTips } from "@/composables/useUserTips";
 
 export interface Match {
   id: string;
@@ -9,6 +10,8 @@ export interface Match {
   commence_time: string;
   status: string;
   current_odds: Record<string, number>;
+  totals_odds?: { over: number; under: number; line: number };
+  spreads_odds?: { home_line: number; home_odds: number; away_line: number; away_odds: number };
   odds_updated_at: string;
   result?: string;
   home_score?: number | null;
@@ -83,6 +86,11 @@ export const useMatchesStore = defineStore("matches", () => {
         if (msg.type === "match_resolved") {
           // Refetch matches to get updated status
           fetchMatches(activeSport.value ?? undefined);
+          // Refetch user tip for this match to get won/lost status
+          const matchId = msg.data?.match_id;
+          if (matchId) {
+            prefetchUserTips([matchId]);
+          }
         }
       } catch {
         // Ignore non-JSON (pong)

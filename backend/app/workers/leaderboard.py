@@ -31,7 +31,7 @@ async def materialize_leaderboard() -> None:
         {"$match": {"is_deleted": False, "points": {"$gt": 0}}},
         {"$sort": {"points": -1}},
         {"$limit": 500},
-        {"$project": {"alias": 1, "points": 1}},
+        {"$project": {"alias": 1, "points": 1, "is_bot": 1}},
     ]
 
     users = await _db.db.users.aggregate(pipeline).to_list(length=500)
@@ -48,6 +48,7 @@ async def materialize_leaderboard() -> None:
             "alias": u.get("alias", "Anonymous"),
             "points": u["points"],
             "rank": i + 1,
+            "is_bot": u.get("is_bot", False),
         }
         for i, u in enumerate(users)
     ]

@@ -52,8 +52,8 @@ BADGE_DEFINITIONS = {
         "icon": "\uD83D\uDCAF",
     },
     "spieltag_debut": {
-        "name": "Spieltag-Debüt",
-        "description": "Deinen ersten Spieltag getippt",
+        "name": "Tippspiel-Debüt",
+        "description": "Dein erstes Tippspiel abgeschlossen",
         "icon": "\uD83D\uDCCB",
     },
     "hellseher": {

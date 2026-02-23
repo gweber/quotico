@@ -12,6 +12,7 @@ ALIAS_BLACKLIST = frozenset({
     "admin", "administrator", "support", "quotico", "moderator", "mod",
     "system", "root", "superuser", "helpdesk", "official", "staff",
     "team", "bot", "null", "undefined", "anonymous", "deleted",
+    "qbot",
 })
 
 

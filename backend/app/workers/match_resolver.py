@@ -13,6 +13,7 @@ from app.providers.football_data import (
 )
 from app.providers.openligadb import openligadb_provider, SPORT_TO_LEAGUE
 from app.providers.espn import espn_provider, SPORT_TO_ESPN
+from app.services.match_service import _MAX_DURATION, _DEFAULT_DURATION
 from app.utils import utcnow
 from app.workers._state import recently_synced, set_synced
 
@@ -40,10 +41,14 @@ async def resolve_matches() -> None:
 
     for sport_key in SUPPORTED_SPORTS:
         # Smart sleep per sport: skip if no matches need resolving
+        # Also check completed-without-result matches (auto-closed but scores
+        # may have become available since then)
         has_work = await _db.db.matches.find_one({
             "sport_key": sport_key,
-            "status": {"$in": ["upcoming", "live"]},
-            "commence_time": {"$lte": now},
+            "$or": [
+                {"status": {"$in": ["upcoming", "live"]}, "commence_time": {"$lte": now}},
+                {"status": "completed", "result": None},
+            ],
         })
 
         if not has_work:
@@ -67,6 +72,48 @@ async def resolve_matches() -> None:
             await set_synced(f"resolver:{sport_key}")
         except Exception as e:
             logger.error("Resolution failed for %s: %s", sport_key, e)
+
+    # Safety net: auto-close matches stuck past their duration window.
+    # If providers never returned a result, don't leave them as "live" forever.
+    await _auto_close_stale_matches(now)
+
+    # Expire stale open/pending battle challenges whose start_time has passed.
+    from app.services.battle_service import expire_stale_challenges
+    await expire_stale_challenges()
+
+
+async def _auto_close_stale_matches(now: datetime) -> None:
+    """Auto-close matches stuck as 'live' or 'upcoming' past their expected duration.
+
+    Uses the max expected duration as the cutoff (e.g. 190 min for soccer) —
+    any match past this is definitely over even if providers didn't report it.
+
+    These matches are marked 'completed' WITHOUT a result, so tips stay
+    as 'pending' for admin review (force-settle via /api/admin/matches/{id}/override).
+    The resolver will still attempt to fetch scores for completed-without-result
+    matches on subsequent runs.
+    """
+    for sport_key in SUPPORTED_SPORTS:
+        max_dur = _MAX_DURATION.get(sport_key, _DEFAULT_DURATION)
+        cutoff = now - max_dur  # past expected duration = definitely over
+
+        stale = await _db.db.matches.find({
+            "sport_key": sport_key,
+            "status": {"$in": ["upcoming", "live"]},
+            "commence_time": {"$lte": cutoff},
+        }).to_list(length=100)
+
+        for match in stale:
+            await _db.db.matches.update_one(
+                {"_id": match["_id"]},
+                {"$set": {"status": "completed", "updated_at": now}},
+            )
+            match_id = str(match["_id"])
+            teams = match.get("teams", {})
+            logger.warning(
+                "Auto-closed stale match %s (%s vs %s, %s) — no provider result, needs admin review",
+                match_id, teams.get("home"), teams.get("away"), sport_key,
+            )
 
 
 # ---------- Shared resolution logic ----------
@@ -148,6 +195,29 @@ async def _resolve_match(
         home_score, away_score, len(pending_tips), len(points_ops),
     )
 
+    # Broadcast to connected WebSocket clients for instant UI updates
+    from app.routers.ws import live_manager
+    await live_manager.broadcast_match_resolved(match_id, result)
+
+    # Update QuoticoTip for backtesting (if one was generated for this match)
+    tip_doc = await _db.db.quotico_tips.find_one({"match_id": match_id})
+    if tip_doc:
+        await _db.db.quotico_tips.update_one(
+            {"match_id": match_id},
+            {"$set": {
+                "status": "resolved",
+                "actual_result": result,
+                "was_correct": result == tip_doc.get("recommended_selection"),
+            }},
+        )
+
+    # Archive to historical_matches for H2H/form data
+    try:
+        from app.services.historical_service import archive_resolved_match
+        await archive_resolved_match(match, result, home_score, away_score)
+    except Exception as e:
+        logger.warning("Historical archive failed for %s (non-fatal): %s", match_id, e)
+
 
 async def _find_match_by_team(
     sport_key: str, score_data: dict
@@ -164,7 +234,11 @@ async def _find_match_by_team(
 
     candidates = await _db.db.matches.find({
         "sport_key": sport_key,
-        "status": {"$ne": "completed"},
+        # Include non-completed matches AND completed-without-result (auto-closed)
+        "$or": [
+            {"status": {"$ne": "completed"}},
+            {"status": "completed", "result": None},
+        ],
         "commence_time": {
             "$gte": match_time - timedelta(hours=6),
             "$lte": match_time + timedelta(hours=6),
@@ -299,7 +373,10 @@ async def _resolve_via_odds_api(sport_key: str) -> None:
         external_id = score_data["external_id"]
         match = await _db.db.matches.find_one({
             "external_id": external_id,
-            "status": {"$ne": "completed"},
+            "$or": [
+                {"status": {"$ne": "completed"}},
+                {"status": "completed", "result": None},
+            ],
         })
         if not match:
             continue

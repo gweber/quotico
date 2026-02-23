@@ -74,12 +74,35 @@ async def _resolve_matchday(matchday: dict) -> None:
         "status": {"$ne": "resolved"},
     }).to_list(length=10000)
 
+    # Pre-fetch squads for auto-tipp blocking check (avoids N+1 queries)
+    squad_ids = list({p["squad_id"] for p in predictions if p.get("squad_id")})
+    squads_by_id: dict[str, dict] = {}
+    if squad_ids:
+        _squads = await _db.db.squads.find(
+            {"_id": {"$in": [ObjectId(sid) for sid in squad_ids]}},
+            {"auto_tipp_blocked": 1},
+        ).to_list(length=len(squad_ids))
+        squads_by_id = {str(s["_id"]): s for s in _squads}
+
+    # Pre-fetch QuoticoTips for Q-Bot auto-tipp strategy
+    match_id_strs = [str(m["_id"]) for m in matches]
+    qtips_by_match: dict[str, dict] = {}
+    has_qbot = any(p.get("auto_tipp_strategy") == "q_bot" for p in predictions)
+    if has_qbot and match_id_strs:
+        _qtips = await _db.db.quotico_tips.find(
+            {"match_id": {"$in": match_id_strs}},
+            {"match_id": 1, "recommended_selection": 1, "confidence": 1},
+        ).to_list(length=len(match_id_strs))
+        qtips_by_match = {t["match_id"]: t for t in _qtips}
+
     now = utcnow()
     resolved_count = 0
 
     for pred_doc in predictions:
         updated = await _score_prediction(
-            pred_doc, matches_by_id, completed_matches, all_done, now
+            pred_doc, matches_by_id, completed_matches, all_done, now,
+            squads_by_id=squads_by_id,
+            qtips_by_match=qtips_by_match,
         )
         if updated:
             resolved_count += 1
@@ -104,6 +127,9 @@ async def _score_prediction(
     completed_matches: dict[str, dict],
     all_done: bool,
     now: datetime,
+    *,
+    squads_by_id: dict[str, dict] | None = None,
+    qtips_by_match: dict[str, dict] | None = None,
 ) -> bool:
     """Score a single user's predictions and optionally apply auto-tipps.
 
@@ -111,7 +137,14 @@ async def _score_prediction(
     """
     existing_preds = {p["match_id"]: p for p in pred_doc.get("predictions", [])}
     auto_strategy = pred_doc.get("auto_tipp_strategy", "none")
-    matchday_id = pred_doc["matchday_id"]
+
+    # Check if the squad blocks auto-tipp
+    squad_id = pred_doc.get("squad_id")
+    auto_blocked = False
+    if squad_id and squads_by_id:
+        squad = squads_by_id.get(squad_id)
+        if squad and squad.get("auto_tipp_blocked", False):
+            auto_blocked = True
 
     updated_predictions = []
     total_points = 0
@@ -121,8 +154,9 @@ async def _score_prediction(
         pred = existing_preds.get(match_id)
 
         # Apply auto-tipp if no prediction exists and matchday is fully done
-        if pred is None and all_done and auto_strategy != "none":
-            auto = generate_auto_prediction(auto_strategy, match)
+        if pred is None and all_done and auto_strategy != "none" and not auto_blocked:
+            qtip = (qtips_by_match or {}).get(match_id)
+            auto = generate_auto_prediction(auto_strategy, match, quotico_tip=qtip)
             if auto:
                 pred = {
                     "match_id": match_id,

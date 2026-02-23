@@ -20,6 +20,7 @@ async def connect_db() -> None:
     await _migrate_game_mode_fields()
     await _migrate_league_configs()
     await _migrate_spieltag_prediction_squad_id()
+    await _migrate_historical_unique_index()
 
 
 async def close_db() -> None:
@@ -112,6 +113,21 @@ async def _migrate_league_configs() -> None:
     if migrated:
         log.info("Migrated %d squads to league_configs", migrated)
 
+    # Rename "spieltag" game mode value → "classic" (they were duplicates)
+    r1 = await db.squads.update_many(
+        {"game_mode": "spieltag"},
+        {"$set": {"game_mode": "classic"}},
+    )
+    r2 = await db.squads.update_many(
+        {"league_configs.game_mode": "spieltag"},
+        {"$set": {"league_configs.$.game_mode": "classic"}},
+    )
+    if r1.modified_count or r2.modified_count:
+        log.info(
+            "Renamed spieltag→classic: %d game_mode, %d league_configs",
+            r1.modified_count, r2.modified_count,
+        )
+
 
 async def _migrate_spieltag_prediction_squad_id() -> None:
     """Backfill squad_id=None for existing spieltag_predictions."""
@@ -135,6 +151,22 @@ async def _migrate_spieltag_prediction_squad_id() -> None:
         await db.spieltag_leaderboard.drop_index("sport_key_1_season_1_user_id_1")
     except Exception:
         pass
+
+
+async def _migrate_historical_unique_index() -> None:
+    """Drop old unique indexes that don't include match_date."""
+    import logging
+    log = logging.getLogger("quotico.db")
+    old_indexes = [
+        "sport_key_1_season_1_match_date_1_home_team_1_away_team_1",  # raw-name index
+        "sport_key_1_season_1_home_team_key_1_away_team_key_1",       # key-only (no date)
+    ]
+    for idx in old_indexes:
+        try:
+            await db.historical_matches.drop_index(idx)
+            log.info("Dropped old historical_matches index: %s", idx)
+        except Exception:
+            pass  # Already dropped or never existed
 
 
 async def _ensure_indexes() -> None:
@@ -171,6 +203,10 @@ async def _ensure_indexes() -> None:
     await db.squads.create_index(
         [("league_configs.sport_key", 1), ("league_configs.game_mode", 1)]
     )
+
+    # Join requests
+    await db.join_requests.create_index([("squad_id", 1), ("status", 1)])
+    await db.join_requests.create_index([("squad_id", 1), ("user_id", 1), ("status", 1)])
 
     # Matches - external ID for upsert
     await db.matches.create_index("external_id", unique=True)
@@ -322,14 +358,16 @@ async def _ensure_indexes() -> None:
     await db.device_fingerprints.create_index("fingerprint_hash")
 
     # Historical matches (imported from football-data.co.uk via tools/scrapper.py)
+    # Unique by team keys + match_date — handles NBA playoffs (same home/away, different dates)
     await db.historical_matches.create_index(
-        [("sport_key", 1), ("season", 1), ("match_date", 1), ("home_team", 1), ("away_team", 1)],
+        [("sport_key", 1), ("season", 1), ("home_team_key", 1), ("away_team_key", 1), ("match_date", 1)],
         unique=True,
     )
     await db.historical_matches.create_index([("sport_key", 1), ("match_date", -1)])
     await db.historical_matches.create_index([("sport_key", 1), ("season", 1)])
-    await db.historical_matches.create_index([("home_team_key", 1), ("sport_key", 1)])
-    await db.historical_matches.create_index([("away_team_key", 1), ("sport_key", 1)])
+    # Team form queries: filter by team_key + sport_key, sort by match_date desc
+    await db.historical_matches.create_index([("home_team_key", 1), ("sport_key", 1), ("match_date", -1)])
+    await db.historical_matches.create_index([("away_team_key", 1), ("sport_key", 1), ("match_date", -1)])
     # H2H lookups for match card enrichment
     await db.historical_matches.create_index(
         [("home_team_key", 1), ("away_team_key", 1), ("sport_key", 1), ("match_date", -1)]
@@ -339,3 +377,17 @@ async def _ensure_indexes() -> None:
     await db.team_aliases.create_index([("sport_key", 1), ("team_name", 1)], unique=True)
     await db.team_aliases.create_index([("sport_key", 1), ("team_key", 1)])
     await db.team_aliases.create_index("canonical_name", sparse=True)
+
+    # ---- QuoticoTip EV Engine ----
+
+    # Odds snapshots (line movement tracking for sharp money detection)
+    await db.odds_snapshots.create_index([("match_id", 1), ("snapshot_at", 1)])
+    await db.odds_snapshots.create_index(
+        "snapshot_at", expireAfterSeconds=60 * 60 * 24 * 14  # TTL: 14 days
+    )
+
+    # QuoticoTips (pre-computed value bet recommendations)
+    await db.quotico_tips.create_index("match_id", unique=True)
+    await db.quotico_tips.create_index(
+        [("sport_key", 1), ("status", 1), ("confidence", -1)]
+    )

@@ -1,4 +1,5 @@
 import logging
+import secrets
 from datetime import datetime
 
 from app.utils import utcnow
@@ -14,6 +15,10 @@ ph = PasswordHasher()
 
 SEED_SQUAD_NAME = "Beta-Tester"
 SEED_SQUAD_CODE = "QUO-START-2026"
+
+QBOT_EMAIL = "qbot@quotico.de"
+QBOT_ALIAS = "Q-Bot"
+QBOT_ALIAS_SLUG = "qbot"
 
 
 async def seed_initial_user() -> None:
@@ -73,3 +78,36 @@ async def seed_initial_user() -> None:
         }
         await _db.db.squads.insert_one(squad_doc)
         logger.info("Seed squad created: %s", SEED_SQUAD_NAME)
+
+
+async def seed_qbot_user() -> str:
+    """Create the Q-Bot system user if it doesn't exist.
+
+    Returns the Q-Bot user_id (str) for use by workers.
+    """
+    existing = await _db.db.users.find_one({"email": QBOT_EMAIL})
+    if existing:
+        logger.info("Q-Bot user already exists: %s", existing["_id"])
+        return str(existing["_id"])
+
+    now = utcnow()
+    user_doc = {
+        "email": QBOT_EMAIL,
+        "hashed_password": ph.hash(secrets.token_hex(32)),
+        "alias": QBOT_ALIAS,
+        "alias_slug": QBOT_ALIAS_SLUG,
+        "has_custom_alias": True,
+        "points": 0.0,
+        "is_admin": False,
+        "is_banned": False,
+        "is_bot": True,
+        "is_2fa_enabled": False,
+        "encrypted_2fa_secret": None,
+        "encryption_key_version": 1,
+        "is_deleted": False,
+        "created_at": now,
+        "updated_at": now,
+    }
+    result = await _db.db.users.insert_one(user_doc)
+    logger.info("Q-Bot user created: %s", result.inserted_id)
+    return str(result.inserted_id)

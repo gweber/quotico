@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed } from "vue";
+import { ref, onMounted, nextTick, watch } from "vue";
 import type { Matchday } from "@/stores/spieltag";
 
 const props = defineProps<{
@@ -11,41 +11,44 @@ const emit = defineEmits<{
   select: [id: string];
 }>();
 
-const statusIcon = (md: Matchday) => {
-  if (md.all_resolved) return "\u2705";
-  if (md.status === "in_progress") return "\u26BD";
-  return "";
-};
+const scrollContainer = ref<HTMLElement | null>(null);
 
-// Show a window of matchdays around the current one
-const visibleMatchdays = computed(() => {
-  if (props.matchdays.length <= 10) return props.matchdays;
+function statusClass(md: Matchday): string {
+  if (md.all_resolved) return "border-emerald-500/40";
+  if (md.status === "in_progress") return "border-primary/60";
+  return "border-transparent";
+}
 
-  const currentIdx = props.matchdays.findIndex(
-    (md) => md.id === props.currentId
-  );
-  const center = currentIdx >= 0 ? currentIdx : 0;
-  const start = Math.max(0, center - 4);
-  const end = Math.min(props.matchdays.length, start + 10);
-  return props.matchdays.slice(start, end);
-});
+function scrollToActive() {
+  if (!scrollContainer.value || !props.currentId) return;
+  const el = scrollContainer.value.querySelector(`[data-md-id="${props.currentId}"]`);
+  if (el) {
+    el.scrollIntoView({ behavior: "smooth", block: "nearest", inline: "center" });
+  }
+}
+
+onMounted(() => nextTick(scrollToActive));
+watch(() => props.currentId, () => nextTick(scrollToActive));
 </script>
 
 <template>
-  <div class="flex items-center gap-1 overflow-x-auto pb-1 scrollbar-hide">
+  <div
+    ref="scrollContainer"
+    class="flex items-center gap-0.5 overflow-x-auto pb-1 scrollbar-hide"
+  >
     <button
-      v-for="md in visibleMatchdays"
+      v-for="md in matchdays"
       :key="md.id"
-      class="shrink-0 flex items-center gap-1 px-3 py-1.5 rounded-full text-sm font-medium transition-colors"
-      :class="
+      :data-md-id="md.id"
+      class="shrink-0 w-8 h-8 rounded-md text-xs font-semibold transition-colors border-b-2"
+      :class="[
         md.id === currentId
-          ? 'bg-primary text-surface-0'
-          : 'bg-surface-2 text-text-secondary hover:bg-surface-3 hover:text-text-primary'
-      "
+          ? 'bg-primary text-surface-0 border-primary'
+          : `bg-surface-2 text-text-secondary hover:bg-surface-3 hover:text-text-primary ${statusClass(md)}`,
+      ]"
       @click="emit('select', md.id)"
     >
-      <span>{{ md.matchday_number }}</span>
-      <span v-if="statusIcon(md)" class="text-xs">{{ statusIcon(md) }}</span>
+      {{ md.matchday_number }}
     </button>
   </div>
 </template>

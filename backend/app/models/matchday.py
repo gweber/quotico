@@ -14,6 +14,7 @@ class MatchdayStatus(str, Enum):
 
 
 class AutoTippStrategy(str, Enum):
+    q_bot = "q_bot"       # Follow QuoticoTip → fallback odds favorite → fallback 1:1
     draw = "draw"         # Predict 1:1 for all untipped matches
     favorite = "favorite" # Predict based on odds favorite
     none = "none"         # No auto-tipp
@@ -43,6 +44,7 @@ class MatchPrediction(BaseModel):
     home_score: int
     away_score: int
     is_auto: bool = False
+    is_admin_entry: bool = False
     points_earned: Optional[int] = None  # 0/1/2/3 after resolution
 
 
@@ -56,6 +58,7 @@ class SpieltagPredictionInDB(BaseModel):
     matchday_number: int
     auto_tipp_strategy: AutoTippStrategy = AutoTippStrategy.none
     predictions: list[MatchPrediction] = Field(default_factory=list)
+    admin_unlocked_matches: list[str] = Field(default_factory=list)
     total_points: Optional[int] = None
     status: str = "open"  # "open" | "partial" | "resolved"
     created_at: datetime
@@ -76,6 +79,24 @@ class SavePredictionsRequest(BaseModel):
     predictions: list[PredictionInput]
     auto_tipp_strategy: AutoTippStrategy = AutoTippStrategy.none
     squad_id: Optional[str] = None  # Optional squad context
+
+
+class AdminUnlockRequest(BaseModel):
+    """Request for squad admin to unlock a match for a user."""
+    squad_id: str
+    matchday_id: str
+    user_id: str
+    match_id: str
+
+
+class AdminPredictionRequest(BaseModel):
+    """Request for squad admin to enter a prediction on behalf of a user."""
+    squad_id: str
+    matchday_id: str
+    user_id: str
+    match_id: str
+    home_score: int = Field(ge=0, le=99)
+    away_score: int = Field(ge=0, le=99)
 
 
 class MatchdayResponse(BaseModel):
@@ -99,10 +120,14 @@ class MatchdayDetailMatch(BaseModel):
     commence_time: datetime
     status: str
     current_odds: dict[str, float] = Field(default_factory=dict)
+    totals_odds: dict[str, float] = Field(default_factory=dict)
+    spreads_odds: dict[str, float] = Field(default_factory=dict)
     result: Optional[str] = None
     home_score: Optional[int] = None
     away_score: Optional[int] = None
     is_locked: bool = False  # True if < 15 min to kickoff or started
+    h2h_context: Optional[dict] = None  # Embedded historical H2H + form data
+    quotico_tip: Optional[dict] = None  # Embedded QuoticoTip recommendation
 
 
 class PredictionResponse(BaseModel):
@@ -111,6 +136,7 @@ class PredictionResponse(BaseModel):
     home_score: int
     away_score: int
     is_auto: bool = False
+    is_admin_entry: bool = False
     points_earned: Optional[int] = None
 
 
@@ -120,6 +146,7 @@ class SpieltagPredictionResponse(BaseModel):
     squad_id: Optional[str] = None
     auto_tipp_strategy: str
     predictions: list[PredictionResponse]
+    admin_unlocked_matches: list[str] = Field(default_factory=list)
     total_points: Optional[int] = None
     status: str
 

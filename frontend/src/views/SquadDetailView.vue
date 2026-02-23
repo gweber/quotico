@@ -16,6 +16,87 @@ const squadId = computed(() => route.params.id as string);
 const squad = computed(() => squads.squads.find((s) => s.id === squadId.value) ?? null);
 const copied = ref(false);
 const showLeaveConfirm = ref(false);
+const showDeleteConfirm = ref(false);
+const togglingAutoTipp = ref(false);
+const lockMinutesDraft = ref(15);
+const savingLockMinutes = ref(false);
+
+async function handleToggleAutoTipp() {
+  if (!squad.value) return;
+  togglingAutoTipp.value = true;
+  try {
+    const newBlocked = !squad.value.auto_tipp_blocked;
+    await squads.toggleAutoTipp(squadId.value, newBlocked);
+    toast.success(newBlocked ? "Auto-Tipp blockiert." : "Auto-Tipp erlaubt.");
+  } catch (e: unknown) {
+    toast.error(e instanceof Error ? e.message : "Fehler.");
+  } finally {
+    togglingAutoTipp.value = false;
+  }
+}
+async function handleSaveLockMinutes() {
+  if (!squad.value) return;
+  savingLockMinutes.value = true;
+  try {
+    await squads.setLockMinutes(squadId.value, lockMinutesDraft.value);
+    toast.success(`Tippfrist auf ${lockMinutesDraft.value} Minuten gesetzt.`);
+  } catch (e: unknown) {
+    toast.error(e instanceof Error ? e.message : "Fehler.");
+  } finally {
+    savingLockMinutes.value = false;
+  }
+}
+
+async function handleToggleInviteVisible() {
+  if (!squad.value) return;
+  try {
+    await squads.setInviteVisible(squadId.value, !squad.value.invite_visible);
+    toast.success(squad.value.invite_visible ? "Einladungslink für Mitglieder verborgen." : "Einladungslink für Mitglieder freigegeben.");
+  } catch (e: unknown) {
+    toast.error(e instanceof Error ? e.message : "Fehler.");
+  }
+}
+
+async function toggleVisibility() {
+  if (!squad.value) return;
+  try {
+    await squads.setVisibility(squadId.value, !squad.value.is_public);
+    toast.success(squad.value.is_public ? "Squad ist jetzt privat." : "Squad ist jetzt öffentlich.");
+  } catch (e: unknown) {
+    toast.error(e instanceof Error ? e.message : "Fehler.");
+  }
+}
+
+async function toggleOpen() {
+  if (!squad.value) return;
+  try {
+    await squads.setOpen(squadId.value, !squad.value.is_open);
+    toast.success(squad.value.is_open ? "Squad nimmt keine Anfragen mehr an." : "Squad nimmt jetzt Anfragen an.");
+  } catch (e: unknown) {
+    toast.error(e instanceof Error ? e.message : "Fehler.");
+  }
+}
+
+async function handleApprove(requestId: string) {
+  try {
+    await squads.approveJoinRequest(squadId.value, requestId);
+    toast.success("Beitritt genehmigt.");
+  } catch (e: unknown) {
+    toast.error(e instanceof Error ? e.message : "Fehler.");
+  }
+}
+
+async function handleDecline(requestId: string) {
+  try {
+    await squads.declineJoinRequest(squadId.value, requestId);
+    toast.success("Anfrage abgelehnt.");
+  } catch (e: unknown) {
+    toast.error(e instanceof Error ? e.message : "Fehler.");
+  }
+}
+
+const editingDescription = ref(false);
+const descriptionDraft = ref("");
 
 onMounted(async () => {
   if (squads.squads.length === 0) {
@@ -28,19 +109,61 @@ onMounted(async () => {
   if (squadId.value) {
     await squads.fetchLeaderboard(squadId.value);
   }
+  if (squad.value) {
+    lockMinutesDraft.value = squad.value.lock_minutes ?? 15;
+    if (squad.value.is_admin && squad.value.pending_requests > 0) {
+      await squads.fetchJoinRequests(squadId.value);
+    }
+  }
 });
 
-async function copyInviteCode() {
-  if (!squad.value) return;
-  await navigator.clipboard.writeText(squad.value.invite_code);
+function inviteLink(): string {
+  if (!squad.value) return "";
+  return `${window.location.origin}/join/${squad.value.invite_code}`;
+}
+
+const canNativeShare = typeof navigator !== "undefined" && !!navigator.share;
+
+async function copyLink() {
+  await navigator.clipboard.writeText(inviteLink());
   copied.value = true;
-  toast.success("Einladungscode kopiert!");
+  toast.success("Einladungslink kopiert!");
   setTimeout(() => (copied.value = false), 2000);
+}
+
+async function nativeShare() {
+  if (!squad.value) return;
+  try {
+    await navigator.share({
+      title: `Squad "${squad.value.name}" bei Quotico`,
+      text: "Tritt meinem Squad bei!",
+      url: inviteLink(),
+    });
+  } catch {
+    // User cancelled — ignore
+  }
 }
 
 async function handleLeave() {
   await squads.leaveSquad(squadId.value);
   router.push("/squads");
+}
+
+async function handleDelete() {
+  await squads.deleteSquad(squadId.value);
+  router.push("/squads");
+}
+
+function startEditDescription() {
+  descriptionDraft.value = squad.value?.description ?? "";
+  editingDescription.value = true;
+}
+
+async function saveDescription() {
+  const desc = descriptionDraft.value.trim() || null;
+  await squads.updateSquad(squadId.value, desc);
+  editingDescription.value = false;
+  toast.success("Beschreibung aktualisiert.");
 }
 </script>
 
@@ -55,28 +178,105 @@ async function handleLeave() {
       <!-- Header -->
       <div class="bg-surface-1 rounded-card p-5 border border-surface-3/50 mb-4">
         <div class="flex items-start justify-between">
-          <div>
+          <div class="flex-1 min-w-0">
             <h1 class="text-xl font-bold text-text-primary">{{ squad.name }}</h1>
-            <p v-if="squad.description" class="text-sm text-text-muted mt-1">{{ squad.description }}</p>
+
+            <!-- Description: editable for admin -->
+            <div v-if="editingDescription" class="mt-2 space-y-2">
+              <textarea
+                v-model="descriptionDraft"
+                class="w-full bg-surface-2 border border-surface-3 rounded-lg px-3 py-2 text-sm text-text-primary placeholder:text-text-muted resize-none focus:outline-none focus:ring-1 focus:ring-primary"
+                rows="2"
+                placeholder="Beschreibung hinzufügen..."
+                maxlength="200"
+              />
+              <div class="flex items-center gap-2">
+                <button
+                  class="text-xs px-3 py-1 rounded bg-primary text-surface-0 hover:bg-primary/80 transition-colors"
+                  @click="saveDescription"
+                >Speichern</button>
+                <button
+                  class="text-xs text-text-muted hover:text-text-primary"
+                  @click="editingDescription = false"
+                >Abbrechen</button>
+              </div>
+            </div>
+            <div v-else class="mt-1 group">
+              <p v-if="squad.description" class="text-sm text-text-muted">
+                {{ squad.description }}
+                <button
+                  v-if="squad.is_admin"
+                  class="ml-1 text-text-muted/50 hover:text-text-secondary opacity-0 group-hover:opacity-100 transition-opacity"
+                  title="Beschreibung bearbeiten"
+                  @click="startEditDescription"
+                >
+                  <svg class="w-3 h-3 inline" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M15.232 5.232l3.536 3.536m-2.036-5.036a2.5 2.5 0 113.536 3.536L6.5 21.036H3v-3.572L16.732 3.732z" /></svg>
+                </button>
+              </p>
+              <button
+                v-else-if="squad.is_admin"
+                class="text-xs text-text-muted/50 hover:text-text-secondary transition-colors"
+                @click="startEditDescription"
+              >+ Beschreibung hinzufügen</button>
+            </div>
+
             <p class="text-xs text-text-muted mt-2">{{ squad.member_count }} Mitglieder</p>
           </div>
           <span
             v-if="squad.is_admin"
-            class="px-2 py-0.5 text-xs font-medium bg-primary-muted/20 text-primary rounded-full"
+            class="px-2 py-0.5 text-xs font-medium bg-primary-muted/20 text-primary rounded-full shrink-0"
           >Admin</span>
         </div>
 
-        <!-- Invite code -->
-        <div class="mt-4 flex items-center gap-3">
-          <div class="flex-1 bg-surface-2 rounded-lg px-4 py-2.5 font-mono text-sm text-text-primary tracking-wider text-center border border-surface-3">
-            {{ squad.invite_code }}
+        <!-- Invite link (visible to admin, or members if invite_visible) -->
+        <div v-if="squad.invite_code" class="mt-4 space-y-2">
+          <label class="text-xs text-text-muted">Einladungslink</label>
+          <div class="flex items-center gap-2">
+            <div class="flex-1 bg-surface-2 rounded-lg px-3 py-2.5 text-sm text-text-secondary truncate border border-surface-3">
+              {{ inviteLink() }}
+            </div>
+            <button
+              class="shrink-0 px-4 py-2.5 text-sm rounded-lg bg-primary text-surface-0 font-medium hover:bg-primary/90 transition-colors"
+              @click="copyLink"
+            >
+              {{ copied ? "Kopiert!" : "Kopieren" }}
+            </button>
+            <button
+              v-if="canNativeShare"
+              class="shrink-0 p-2.5 rounded-lg bg-surface-2 text-text-secondary hover:bg-surface-3 transition-colors border border-surface-3"
+              title="Teilen"
+              @click="nativeShare"
+            >
+              <svg class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+                <path stroke-linecap="round" stroke-linejoin="round" d="M8.684 13.342C8.886 12.938 9 12.482 9 12c0-.482-.114-.938-.316-1.342m0 2.684a3 3 0 110-2.684m0 2.684l6.632 3.316m-6.632-6l6.632-3.316m0 0a3 3 0 105.367-2.684 3 3 0 00-5.367 2.684zm0 9.316a3 3 0 105.368 2.684 3 3 0 00-5.368-2.684z" />
+              </svg>
+            </button>
           </div>
-          <button
-            class="shrink-0 px-4 py-2.5 text-sm rounded-lg bg-surface-2 text-text-primary hover:bg-surface-3 transition-colors border border-surface-3"
-            @click="copyInviteCode"
+          <!-- Invite visibility toggle (admin only) -->
+          <div v-if="squad.is_admin" class="flex items-center justify-between pt-1">
+            <span class="text-xs text-text-muted">
+              {{ squad.invite_visible ? "Mitglieder sehen den Einladungslink." : "Nur du siehst den Einladungslink." }}
+            </span>
+            <button
+              class="text-xs text-text-muted hover:text-text-secondary transition-colors"
+              @click="handleToggleInviteVisible"
+            >
+              {{ squad.invite_visible ? "Für Mitglieder verbergen" : "Für Mitglieder freigeben" }}
+            </button>
+          </div>
+        </div>
+
+        <!-- War Room link -->
+        <div class="mt-4 pt-4 border-t border-surface-3/50">
+          <RouterLink
+            :to="`/squads/${squadId}/war-room/next`"
+            class="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-surface-2 text-text-secondary hover:bg-surface-3 hover:text-text-primary transition-colors text-sm font-medium border border-surface-3"
           >
-            {{ copied ? "Kopiert!" : "Kopieren" }}
-          </button>
+            <svg class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+              <path stroke-linecap="round" stroke-linejoin="round" d="M3.75 13.5l10.5-11.25L12 10.5h8.25L9.75 21.75 12 13.5H3.75z" />
+            </svg>
+            War Room
+          </RouterLink>
         </div>
 
         <!-- Leave button (non-admin) -->
@@ -100,6 +300,66 @@ async function handleLeave() {
             >Abbrechen</button>
           </div>
         </div>
+
+      </div>
+
+      <!-- Admin: Join Requests -->
+      <div v-if="squad.is_admin && squads.joinRequests.length > 0" class="bg-surface-1 rounded-card p-5 border border-surface-3/50 mb-4">
+        <h3 class="text-sm font-semibold text-text-primary mb-3">
+          Beitrittsanfragen
+          <span class="ml-1 px-1.5 py-0.5 text-xs bg-primary/15 text-primary rounded-full">{{ squads.joinRequests.length }}</span>
+        </h3>
+        <div class="space-y-3">
+          <div
+            v-for="req in squads.joinRequests"
+            :key="req.id"
+            class="flex items-center justify-between py-2 border-b border-surface-3/30 last:border-0"
+          >
+            <div>
+              <p class="text-sm text-text-primary">{{ req.alias }}</p>
+              <p class="text-xs text-text-muted">{{ new Date(req.created_at).toLocaleDateString("de-DE") }}</p>
+            </div>
+            <div class="flex gap-2">
+              <button
+                class="px-3 py-1 text-xs font-medium rounded-lg bg-primary/10 text-primary border border-primary/30 hover:bg-primary/20 transition-colors"
+                @click="handleApprove(req.id)"
+              >
+                Annehmen
+              </button>
+              <button
+                class="px-3 py-1 text-xs font-medium rounded-lg bg-surface-2 text-text-muted border border-surface-3 hover:bg-surface-3/50 transition-colors"
+                @click="handleDecline(req.id)"
+              >
+                Ablehnen
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Admin: Danger zone -->
+      <div v-if="squad.is_admin" class="bg-surface-1 rounded-card p-5 border border-danger/20 mb-4">
+        <h3 class="text-sm font-semibold text-danger mb-3">Gefahrenzone</h3>
+        <div v-if="!showDeleteConfirm" class="flex items-center justify-between">
+          <p class="text-xs text-text-muted">Squad dauerhaft löschen. Diese Aktion kann nicht rückgängig gemacht werden.</p>
+          <button
+            class="shrink-0 ml-4 px-4 py-2 text-xs font-medium rounded-lg border border-danger text-danger hover:bg-danger hover:text-white transition-colors"
+            @click="showDeleteConfirm = true"
+          >
+            Squad löschen
+          </button>
+        </div>
+        <div v-else class="flex items-center gap-3">
+          <span class="text-xs text-danger">Bist du sicher?</span>
+          <button
+            class="text-xs px-4 py-2 rounded-lg bg-danger text-white font-medium hover:bg-danger/80 transition-colors"
+            @click="handleDelete"
+          >Ja, endgültig löschen</button>
+          <button
+            class="text-xs text-text-muted hover:text-text-primary"
+            @click="showDeleteConfirm = false"
+          >Abbrechen</button>
+        </div>
       </div>
 
       <!-- League Configuration -->
@@ -108,6 +368,119 @@ async function handleLeave() {
           :squad-id="squadId"
           :is-admin="squad.is_admin"
         />
+
+        <!-- Admin Settings -->
+        <template v-if="squad.is_admin">
+          <!-- Auto-Tipp toggle -->
+          <div class="mt-4 pt-4 border-t border-surface-3/50">
+            <div class="flex items-center justify-between">
+              <div>
+                <p class="text-sm font-medium text-text-primary">Auto-Tipp</p>
+                <p class="text-xs text-text-muted">
+                  {{ squad.auto_tipp_blocked
+                    ? "Mitglieder können keine Auto-Tipps verwenden."
+                    : "Mitglieder können Auto-Tipps für nicht getippte Spiele nutzen."
+                  }}
+                </p>
+              </div>
+              <button
+                class="relative shrink-0 w-10 h-6 rounded-full transition-colors focus:outline-none focus:ring-2 focus:ring-primary/50"
+                :class="squad.auto_tipp_blocked ? 'bg-surface-3' : 'bg-primary'"
+                :disabled="togglingAutoTipp"
+                @click="handleToggleAutoTipp"
+              >
+                <span
+                  class="absolute top-0.5 left-0.5 w-5 h-5 bg-white rounded-full shadow transition-transform"
+                  :class="squad.auto_tipp_blocked ? '' : 'translate-x-4'"
+                />
+              </button>
+            </div>
+          </div>
+
+          <!-- Lock deadline -->
+          <div class="mt-4 pt-4 border-t border-surface-3/50">
+            <div class="flex items-center justify-between">
+              <div>
+                <p class="text-sm font-medium text-text-primary">Tippfrist</p>
+                <p class="text-xs text-text-muted">
+                  Tipps sperren {{ squad.lock_minutes }} Min. vor Anpfiff.
+                </p>
+              </div>
+              <div class="flex items-center gap-2">
+                <select
+                  v-model.number="lockMinutesDraft"
+                  class="bg-surface-2 border border-surface-3 rounded-lg px-2 py-1.5 text-sm text-text-primary focus:outline-none focus:ring-1 focus:ring-primary"
+                >
+                  <option :value="0">0 Min.</option>
+                  <option :value="5">5 Min.</option>
+                  <option :value="10">10 Min.</option>
+                  <option :value="15">15 Min.</option>
+                  <option :value="30">30 Min.</option>
+                  <option :value="60">60 Min.</option>
+                  <option :value="120">120 Min.</option>
+                </select>
+                <button
+                  v-if="lockMinutesDraft !== (squad.lock_minutes ?? 15)"
+                  class="px-3 py-1.5 text-xs font-medium rounded-lg bg-primary text-surface-0 hover:bg-primary/80 transition-colors disabled:opacity-50"
+                  :disabled="savingLockMinutes"
+                  @click="handleSaveLockMinutes"
+                >
+                  {{ savingLockMinutes ? "..." : "Speichern" }}
+                </button>
+              </div>
+            </div>
+          </div>
+
+          <!-- Visibility toggle -->
+          <div class="mt-4 pt-4 border-t border-surface-3/50">
+            <div class="flex items-center justify-between">
+              <div>
+                <p class="text-sm font-medium text-text-primary">Sichtbarkeit</p>
+                <p class="text-xs text-text-muted mt-0.5">
+                  {{ squad.is_public
+                    ? "Öffentlich — wird in der Squad-Suche angezeigt."
+                    : "Privat — nur per Einladungscode oder ID erreichbar."
+                  }}
+                </p>
+              </div>
+              <button
+                class="relative w-10 h-6 rounded-full transition-colors"
+                :class="squad.is_public ? 'bg-primary' : 'bg-surface-3'"
+                @click="toggleVisibility"
+              >
+                <span
+                  class="absolute top-1 left-1 w-4 h-4 bg-white rounded-full transition-transform"
+                  :class="squad.is_public ? 'translate-x-4' : ''"
+                />
+              </button>
+            </div>
+          </div>
+
+          <!-- Open / Locked toggle -->
+          <div class="mt-4 pt-4 border-t border-surface-3/50">
+            <div class="flex items-center justify-between">
+              <div>
+                <p class="text-sm font-medium text-text-primary">Beitrittsanfragen</p>
+                <p class="text-xs text-text-muted mt-0.5">
+                  {{ squad.is_open
+                    ? "Offen — Nutzer können Beitrittsanfragen senden."
+                    : "Gesperrt — Keine neuen Beitrittsanfragen möglich."
+                  }}
+                </p>
+              </div>
+              <button
+                class="relative w-10 h-6 rounded-full transition-colors"
+                :class="squad.is_open ? 'bg-primary' : 'bg-surface-3'"
+                @click="toggleOpen"
+              >
+                <span
+                  class="absolute top-1 left-1 w-4 h-4 bg-white rounded-full transition-transform"
+                  :class="squad.is_open ? 'translate-x-4' : ''"
+                />
+              </button>
+            </div>
+          </div>
+        </template>
       </div>
 
       <!-- Squad Leaderboard -->

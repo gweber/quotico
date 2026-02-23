@@ -1,5 +1,6 @@
 """Spieltag-Modus: sync matchdays from providers into MongoDB."""
 
+import asyncio
 import logging
 from datetime import datetime, timedelta
 
@@ -11,6 +12,9 @@ from app.providers.openligadb import openligadb_provider, _current_season
 from app.workers._state import recently_synced, set_synced
 
 logger = logging.getLogger("quotico.matchday_sync")
+
+# Rate-limit pause between API calls for football-data.org (free tier: 10 req/min)
+_FOOTBALL_DATA_DELAY = 7  # seconds between matchday fetches
 
 
 def _get_season_for_sport(sport_key: str) -> int:
@@ -38,29 +42,38 @@ async def _sync_sport_matchdays(sport_key: str, config: dict) -> None:
     Smart sleep per sport: skips external API calls when no matchday
     activity is expected (all completed and next kickoff >48h away).
     Safety margin: syncs at least once every 6 hours.
+    Bootstrap always runs when the full season isn't populated yet.
     """
     now = utcnow()
-    window = now + timedelta(hours=48)
+    max_matchdays = config["matchdays_per_season"]
+    season = _get_season_for_sport(sport_key)
 
-    # Smart sleep: check if this sport has active or imminent matchdays
-    active = await _db.db.matchdays.find_one({
+    # Check if full-season bootstrap is needed (always runs — skip smart sleep)
+    existing_count = await _db.db.matchdays.count_documents({
         "sport_key": sport_key,
-        "$or": [
-            {"status": "in_progress"},
-            {"status": "upcoming", "first_kickoff": {"$lte": window}},
-        ],
+        "season": season,
     })
+    needs_bootstrap = existing_count < max_matchdays
 
-    if not active:
-        # No active or imminent matchdays — check safety margin via synced_at
-        state_key = f"matchday_sync:{sport_key}"
-        if await recently_synced(state_key, timedelta(hours=6)):
-            logger.debug("Smart sleep: %s has no active/upcoming matchdays, skipping sync", sport_key)
-            return
-        logger.info("Smart sleep safety: %s >6h since last sync, syncing anyway", sport_key)
+    if not needs_bootstrap:
+        # Smart sleep: skip sync if no active/imminent matchdays
+        window = now + timedelta(hours=48)
+        active = await _db.db.matchdays.find_one({
+            "sport_key": sport_key,
+            "$or": [
+                {"status": "in_progress"},
+                {"status": "upcoming", "first_kickoff": {"$lte": window}},
+            ],
+        })
+
+        if not active:
+            state_key = f"matchday_sync:{sport_key}"
+            if await recently_synced(state_key, timedelta(hours=6)):
+                logger.debug("Smart sleep: %s has no active/upcoming matchdays, skipping sync", sport_key)
+                return
+            logger.info("Smart sleep safety: %s >6h since last sync, syncing anyway", sport_key)
 
     provider_name = config["provider"]
-    season = _get_season_for_sport(sport_key)
 
     # Get current matchday number from provider
     if provider_name == "openligadb":
@@ -72,15 +85,28 @@ async def _sync_sport_matchdays(sport_key: str, config: dict) -> None:
         logger.warning("Could not determine current matchday for %s", sport_key)
         return
 
-    # Sync window: previous, current, next
-    max_matchdays = config["matchdays_per_season"]
-    matchdays_to_sync = [
-        md for md in [current_md - 1, current_md, current_md + 1]
-        if 1 <= md <= max_matchdays
-    ]
-
-    for md_number in matchdays_to_sync:
-        await _sync_single_matchday(sport_key, config, season, md_number)
+    if needs_bootstrap:
+        # Full-season sync: fetch all matchdays so the nav shows 1–34 (or 1–38, etc.)
+        logger.info(
+            "Full-season sync for %s: %d/%d matchdays exist, syncing all",
+            sport_key, existing_count, max_matchdays,
+        )
+        delay = _FOOTBALL_DATA_DELAY if provider_name == "football_data" else 0
+        for md_number in range(1, max_matchdays + 1):
+            try:
+                await _sync_single_matchday(sport_key, config, season, md_number)
+            except Exception as e:
+                logger.error("Full sync failed for %s matchday %d: %s", sport_key, md_number, e)
+            if delay and md_number < max_matchdays:
+                await asyncio.sleep(delay)
+    else:
+        # Incremental sync: previous, current, next matchday
+        matchdays_to_sync = [
+            md for md in [current_md - 1, current_md, current_md + 1]
+            if 1 <= md <= max_matchdays
+        ]
+        for md_number in matchdays_to_sync:
+            await _sync_single_matchday(sport_key, config, season, md_number)
 
     await set_synced(f"matchday_sync:{sport_key}")
 

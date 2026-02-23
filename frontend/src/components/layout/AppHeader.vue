@@ -13,6 +13,7 @@ const mobileMenuOpen = ref(false);
 
 const navLinks = [
   { to: "/", label: "Tipps", icon: "\u26BD" },
+  { to: "/teams", label: "Teams", icon: "\uD83C\uDFDF\uFE0F" },
   { to: "/spieltag", label: "Spieltag", icon: "\uD83D\uDCCB" },
   { to: "/squads", label: "Squads", icon: "\uD83D\uDC65" },
   { to: "/battles", label: "Battles", icon: "\u2694\uFE0F" },
@@ -61,7 +62,7 @@ async function handleLogout() {
         <span
           class="hidden sm:inline-flex items-center px-2 py-0.5 text-xs font-medium bg-surface-2 text-text-secondary rounded-full border border-surface-3"
         >
-          Tipspiel &mdash; kein Echtgeld
+          Tippspiel &mdash; kein Echtgeld
         </span>
       </div>
 
@@ -181,7 +182,7 @@ async function handleLogout() {
         </RouterLink>
         <!-- Mobile badge -->
         <div class="sm:hidden px-3 py-2 text-xs text-text-muted">
-          Tipspiel &mdash; kein Echtgeld
+          Tippspiel &mdash; kein Echtgeld
         </div>
       </nav>
     </Transition>

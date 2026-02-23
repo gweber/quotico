@@ -48,7 +48,9 @@ async function handleComplete() {
   try {
     await auth.completeProfile(birthDate.value, disclaimerAccepted.value);
     toast.success("Profil vervollständigt! Willkommen bei Quotico.");
-    router.push("/");
+    // Check for pending invite link from before auth flow
+    const pendingInvite = localStorage.getItem("pendingInvite");
+    router.push(pendingInvite ? `/join/${pendingInvite}` : "/");
   } catch (e: unknown) {
     const msg = e instanceof Error ? e.message : "Fehler beim Vervollständigen.";
     errorMessage.value = msg;

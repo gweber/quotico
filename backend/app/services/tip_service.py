@@ -102,10 +102,65 @@ async def create_tip(
     return tip_doc
 
 
-async def get_user_tips(user_id: str, limit: int = 50) -> list[dict]:
-    """Get all tips for a user, with match context."""
+async def create_tip_internal(
+    user_id: str, match_id: str, prediction: str
+) -> dict:
+    """Create a tip for internal/bot use — no HTTP exceptions, no odds drift check.
+
+    Raises ValueError for invalid state.
+    Raises DuplicateKeyError for duplicate tips (caller handles idempotency).
+    """
+    match = await _db.db.matches.find_one({"_id": ObjectId(match_id)})
+    if not match:
+        raise ValueError(f"Match {match_id} not found")
+
+    now = utcnow()
+    commence = ensure_utc(match["commence_time"])
+    if commence <= now:
+        raise ValueError(f"Match {match_id} already started")
+
+    if match["status"] != "upcoming":
+        raise ValueError(f"Match {match_id} status is {match['status']}")
+
+    current_odds = match.get("current_odds", {})
+    if prediction not in current_odds:
+        raise ValueError(f"Invalid prediction '{prediction}' for match {match_id}")
+
+    locked_odds = current_odds[prediction]
+    odds_updated = ensure_utc(match["odds_updated_at"])
+    odds_age = int((now - odds_updated).total_seconds())
+
+    tip_doc = {
+        "user_id": user_id,
+        "match_id": match_id,
+        "selection": {"type": "moneyline", "value": prediction},
+        "locked_odds": locked_odds,
+        "locked_odds_age_seconds": odds_age,
+        "points_earned": None,
+        "status": "pending",
+        "void_reason": None,
+        "resolved_at": None,
+        "created_at": now,
+    }
+
+    result = await _db.db.tips.insert_one(tip_doc)
+    tip_doc["_id"] = result.inserted_id
+    logger.info(
+        "Internal tip created: user=%s match=%s prediction=%s odds=%.2f",
+        user_id, match_id, prediction, locked_odds,
+    )
+    return tip_doc
+
+
+async def get_user_tips(
+    user_id: str, limit: int = 50, match_ids: list[str] | None = None
+) -> list[dict]:
+    """Get tips for a user, optionally filtered by match IDs."""
+    match_filter: dict = {"user_id": user_id}
+    if match_ids:
+        match_filter["match_id"] = {"$in": match_ids}
     pipeline = [
-        {"$match": {"user_id": user_id}},
+        {"$match": match_filter},
         {"$sort": {"created_at": -1}},
         {"$limit": limit},
         {

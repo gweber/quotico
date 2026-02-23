@@ -8,6 +8,7 @@ interface LeaderboardEntry {
   rank: number;
   alias: string;
   points: number;
+  is_bot?: boolean;
 }
 
 const api = useApi();

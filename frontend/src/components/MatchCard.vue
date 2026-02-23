@@ -2,15 +2,31 @@
 import { ref, computed, onMounted, onUnmounted } from "vue";
 import type { Match } from "@/stores/matches";
 import { useMatchesStore } from "@/stores/matches";
+import { useAuthStore } from "@/stores/auth";
 import { useBetSlipStore } from "@/stores/betslip";
+import { RouterLink } from "vue-router";
 import OddsButton from "./OddsButton.vue";
+import MatchHistory from "./MatchHistory.vue";
+import OddsTimelineToggle from "./OddsTimelineToggle.vue";
+import QuoticoTipBadge from "./QuoticoTipBadge.vue";
+import { getCachedTip } from "@/composables/useQuoticoTip";
+import { getCachedUserTip } from "@/composables/useUserTips";
+import { teamSlug } from "@/composables/useTeam";
 
 const props = defineProps<{
   match: Match;
 }>();
 
+const quoticoTip = computed(() => getCachedTip(props.match.id));
+
+const auth = useAuthStore();
 const betslip = useBetSlipStore();
 const matchesStore = useMatchesStore();
+
+// User's placed tip for this match (if any)
+const userTip = computed(() =>
+  auth.isLoggedIn ? getCachedUserTip(props.match.id) : undefined
+);
 
 // --- Countdown timer ---
 const now = ref(Date.now());
@@ -66,6 +82,10 @@ onUnmounted(() => {
   if (timer) clearInterval(timer);
 });
 
+// --- Spread & Totals ---
+const spread = computed(() => props.match.spreads_odds);
+const totals = computed(() => props.match.totals_odds);
+
 // --- Odds logic ---
 const isThreeWay = computed(() => props.match.current_odds["X"] !== undefined);
 
@@ -84,7 +104,7 @@ const oddsEntries = computed(() => {
   ];
 });
 
-const buttonsDisabled = computed(() => !isUpcoming.value || isExpired.value);
+const buttonsDisabled = computed(() => !isUpcoming.value || isExpired.value || !!userTip.value);
 
 function handleSelect(prediction: string) {
   if (buttonsDisabled.value) return;
@@ -146,12 +166,18 @@ const statusClass = computed(() => {
       <!-- Teams + Score -->
       <div class="flex-1 min-w-0 flex items-center gap-3">
         <div class="flex-1 min-w-0">
-          <p class="text-sm font-medium text-text-primary truncate">
+          <RouterLink
+            :to="{ name: 'team-detail', params: { teamSlug: teamSlug(match.teams.home) }, query: { sport: match.sport_key } }"
+            class="text-sm font-medium text-text-primary truncate block hover:text-primary transition-colors"
+          >
             {{ match.teams.home }}
-          </p>
-          <p class="text-sm font-medium text-text-primary truncate mt-1">
+          </RouterLink>
+          <RouterLink
+            :to="{ name: 'team-detail', params: { teamSlug: teamSlug(match.teams.away) }, query: { sport: match.sport_key } }"
+            class="text-sm font-medium text-text-primary truncate block mt-1 hover:text-primary transition-colors"
+          >
             {{ match.teams.away }}
-          </p>
+          </RouterLink>
         </div>
 
         <!-- Live / Final score -->
@@ -175,9 +201,48 @@ const statusClass = computed(() => {
           :label="entry.label"
           :odds="match.current_odds[entry.key]"
           :disabled="buttonsDisabled"
+          :user-tip="userTip"
           @click="handleSelect(entry.key)"
         />
       </div>
+    </div>
+
+    <!-- User tip status -->
+    <div v-if="userTip" class="mt-2 flex items-center justify-end text-xs">
+      <span v-if="userTip.status === 'pending'" class="text-text-muted">
+        Getippt @ {{ userTip.locked_odds.toFixed(2) }}
+      </span>
+      <span v-else-if="userTip.status === 'won'" class="text-success font-semibold">
+        Gewonnen +{{ userTip.points_earned?.toFixed(1) }} Pkt
+      </span>
+      <span v-else-if="userTip.status === 'lost'" class="text-danger font-medium">
+        Verloren
+      </span>
+      <span v-else-if="userTip.status === 'void'" class="text-warning font-medium">
+        Ungültig
+      </span>
+    </div>
+
+    <!-- Spread + Totals row (NBA, NFL) -->
+    <div
+      v-if="spread || totals"
+      class="mt-2 flex items-center gap-3 text-xs text-text-muted"
+    >
+      <template v-if="spread">
+        <span class="flex items-center gap-1" title="Spread (Handicap)">
+          <span class="font-medium text-text-secondary">Spread</span>
+          <span class="tabular-nums">
+            {{ spread.home_line > 0 ? '+' : '' }}{{ spread.home_line }}
+          </span>
+          <span class="text-text-muted/60">({{ spread.home_odds?.toFixed(2) }})</span>
+        </span>
+      </template>
+      <template v-if="totals">
+        <span class="flex items-center gap-1" title="Over/Under (Gesamtpunkte)">
+          <span class="font-medium text-text-secondary">O/U</span>
+          <span class="tabular-nums">{{ totals.line }}</span>
+        </span>
+      </template>
     </div>
 
     <!-- Result banner (completed matches) -->
@@ -190,5 +255,27 @@ const statusClass = computed(() => {
         {{ match.home_score }} : {{ match.away_score }}
       </span>
     </div>
+
+    <!-- Historical context -->
+    <MatchHistory
+      :home-team="match.teams.home"
+      :away-team="match.teams.away"
+      :sport-key="match.sport_key"
+    />
+
+    <!-- Odds timeline -->
+    <OddsTimelineToggle
+      :match-id="match.id"
+      :home-team="match.teams.home"
+      :away-team="match.teams.away"
+    />
+
+    <!-- QuoticoTip value bet recommendation -->
+    <QuoticoTipBadge
+      v-if="quoticoTip"
+      :tip="quoticoTip"
+      :home-team="match.teams.home"
+      :away-team="match.teams.away"
+    />
   </article>
 </template>

@@ -4,6 +4,7 @@ import { useBetSlipStore } from "@/stores/betslip";
 import { useAuthStore } from "@/stores/auth";
 import { useToast } from "@/composables/useToast";
 import { useRouter } from "vue-router";
+import { cacheUserTip } from "@/composables/useUserTips";
 
 const betslip = useBetSlipStore();
 const auth = useAuthStore();
@@ -19,8 +20,13 @@ async function handleSubmit() {
   }
 
   submitting.value = true;
-  const { success, errors } = await betslip.submitAll();
+  const { success, errors, tips } = await betslip.submitAll();
   submitting.value = false;
+
+  // Cache returned tips so MatchCard updates immediately
+  for (const tip of tips) {
+    cacheUserTip(tip);
+  }
 
   if (success.length > 0) {
     toast.success(

@@ -20,11 +20,11 @@ const showAddMenu = ref(false);
 const sportLabels = SPORT_LABELS;
 
 const modes: { value: GameModeType; label: string }[] = [
-  { value: "spieltag", label: "Spieltag" },
-  { value: "classic", label: "Classic" },
+  { value: "classic", label: "Tippspiel" },
+  { value: "moneyline", label: "Quotentipp" },
   { value: "bankroll", label: "Bankroll" },
   { value: "survivor", label: "Survivor" },
-  { value: "over_under", label: "Uber/Unter" },
+  { value: "over_under", label: "Über/Unter" },
   { value: "fantasy", label: "Fantasy" },
 ];
 
@@ -43,9 +43,9 @@ const availableToAdd = computed(() =>
 async function addLeague(sportKey: string) {
   saving.value = true;
   try {
-    await squadsStore.setLeagueConfig(props.squadId, sportKey, "spieltag");
+    await squadsStore.setLeagueConfig(props.squadId, sportKey, "classic");
     toast.success(
-      `${sportLabels[sportKey] || sportKey} hinzugefuegt!`
+      `${sportLabels[sportKey] || sportKey} hinzugefügt!`
     );
     showAddMenu.value = false;
   } catch (e: unknown) {
@@ -59,7 +59,7 @@ async function changeMode(sportKey: string, newMode: GameModeType) {
   saving.value = true;
   try {
     await squadsStore.setLeagueConfig(props.squadId, sportKey, newMode);
-    toast.success("Modus geaendert!");
+    toast.success("Modus geändert!");
   } catch (e: unknown) {
     toast.error(e instanceof Error ? e.message : "Fehler.");
   } finally {
@@ -70,7 +70,7 @@ async function changeMode(sportKey: string, newMode: GameModeType) {
 async function removeLeague(sportKey: string) {
   if (
     !confirm(
-      "Liga deaktivieren? Laufende Vorhersagen bleiben erhalten, neue werden nicht moeglich."
+      "Liga deaktivieren? Laufende Vorhersagen bleiben erhalten, neue werden nicht möglich."
     )
   )
     return;
@@ -98,7 +98,7 @@ async function removeLeague(sportKey: string) {
         class="text-xs text-primary font-medium hover:underline"
         @click="showAddMenu = !showAddMenu"
       >
-        + Liga hinzufuegen
+        + Liga hinzufügen
       </button>
     </div>
 
@@ -163,7 +163,7 @@ async function removeLeague(sportKey: string) {
       v-else
       class="text-center py-6 text-text-muted text-sm"
     >
-      Keine Ligen konfiguriert. {{ isAdmin ? "Fuege eine Liga hinzu!" : "" }}
+      Keine Ligen konfiguriert. {{ isAdmin ? "Füge eine Liga hinzu!" : "" }}
     </div>
 
     <!-- Add league menu -->

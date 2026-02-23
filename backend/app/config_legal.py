@@ -13,35 +13,30 @@ LEGAL_DOCS = {
         "slug": "impressum",
         "content_html": """
 <h2>Angaben gemäß § 5 DDG</h2>
-<p><strong>[Vorname Nachname / Firmenname]</strong></p>
+<p><strong>Günter Weber</strong></p>
 <p>
-  [Straße Hausnummer]<br>
-  [PLZ Ort]<br>
+  Mommenheimer Straße 48<br>
+  55129 Mainz<br>
   Deutschland
 </p>
 
 <h3>Kontakt</h3>
 <p>
   E-Mail: <a href="mailto:kontakt@quotico.de">kontakt@quotico.de</a><br>
-  Telefon: [+49 XXX XXXXXXX]
+  Telefon: +49 160 99488893
 </p>
 
-<h3>Vertretungsberechtigte Person(en)</h3>
-<p>[Vorname Nachname, Geschäftsführer/Inhaber]</p>
-
-<h3>Registereintrag</h3>
-<p>[Handelsregister: Amtsgericht [Ort], HRB [Nummer] — falls zutreffend]</p>
-
-<h3>Umsatzsteuer-Identifikationsnummer / Wirtschafts-Identifikationsnummer</h3>
-<p>[USt-IdNr. gemäß § 27a UStG: DE XXXXXXXXX — falls vorhanden]</p>
-<p>[W-IdNr. gemäß § 139c AO — falls vorhanden]</p>
+<h3>Vertretungsberechtigte Person</h3>
+<p>Günter Weber</p>
 
 <h3>Verantwortlich für den Inhalt gemäß § 18 Abs. 2 MStV</h3>
-<p>[Vorname Nachname]<br>[Anschrift wie oben]</p>
+<p>Günter Weber<br>
+Mommenheimer Straße 48<br>
+55129 Mainz<br>Deutschland</p>
 
 <h3>Haftungshinweis</h3>
 <p>
-  Quotico.de ist ein Tipspiel zur Unterhaltung. Es handelt sich ausdrücklich
+  Quotico.de ist ein Tippspiel zur Unterhaltung. Es handelt sich ausdrücklich
   nicht um Glücksspiel im Sinne des Glücksspielstaatsvertrags (GlüStV).
   Es wird kein echtes Geld eingesetzt oder ausgezahlt.
 </p>
@@ -60,8 +55,8 @@ LEGAL_DOCS = {
         "content_html": """
 <h2>1. Verantwortlicher</h2>
 <p>
-  [Vorname Nachname / Firmenname]<br>
-  [Straße Hausnummer], [PLZ Ort]<br>
+  Günter Weber<br>
+  Mommenheimer Straße 48, 55129 Mainz<br>
   E-Mail: <a href="mailto:kontakt@quotico.de">kontakt@quotico.de</a>
 </p>
 
@@ -81,7 +76,7 @@ LEGAL_DOCS = {
   <li><strong>IP-Adressen</strong> — in Audit-Logs und Fingerprint-Datensätzen anonymisiert gespeichert (letztes Oktett durch „xxx" ersetzt). Vollständige IP-Adressen werden zu keinem Zeitpunkt in der Datenbank gespeichert, sondern ausschließlich in Server-Logdateien für max. 7 Tage vorgehalten (Art. 6 Abs. 1 lit. f DSGVO)</li>
   <li><strong>2FA-Geheimnisse</strong> — mit Fernet (AES-128-CBC) verschlüsselt gespeichert, mit Unterstützung für Schlüsselrotation (Art. 6 Abs. 1 lit. b DSGVO)</li>
   <li><strong>Google-OAuth-Daten</strong> — bei Nutzung der Google-Anmeldung: E-Mail-Adresse und Google-Sub-ID. Es werden keine Google-Zugangsdaten gespeichert (Art. 6 Abs. 1 lit. b DSGVO)</li>
-  <li><strong>Tipps und Punkte</strong> — Ihre Vorhersagen (1/X/2-Tipps und Spieltag-Ergebnisprognosen), gesperrte Quoten und erzielte Punkte (Art. 6 Abs. 1 lit. b DSGVO)</li>
+  <li><strong>Tipps und Punkte</strong> — Ihre Vorhersagen (1/X/2-Tipps und Tippspiel-Ergebnisprognosen), gesperrte Quoten und erzielte Punkte (Art. 6 Abs. 1 lit. b DSGVO)</li>
   <li><strong>Wallet-Daten</strong> — virtueller Kontostand, Einsätze, Transaktionshistorie und Spielmodus-Aktivitäten (Bankroll-Wetten, Survivor-Picks, Over/Under-Tipps, Fantasy-Picks, Kombi-Joker). Diese Daten haben keinen realen Geldwert. (Art. 6 Abs. 1 lit. b DSGVO)</li>
   <li><strong>Wallet-Disclaimer-Zustimmung</strong> — Zeitpunkt der Bestätigung, dass Quotico-Coins keinen realen Gegenwert haben (Art. 6 Abs. 1 lit. c DSGVO, Jugendschutz)</li>
   <li><strong>Geräte-Fingerprint (Hash)</strong> — ein SHA-256-Hashwert, der client-seitig aus allgemeinen Geräteeigenschaften (User-Agent, Bildschirmauflösung, Zeitzone, Sprache, Plattform) berechnet wird. <strong>Ausschließlich der Hash wird an den Server übermittelt und gespeichert</strong> — die einzelnen Geräteeigenschaften werden weder übertragen noch in der Datenbank gespeichert. Eine Rückberechnung der Einzelmerkmale aus dem Hash ist nicht möglich. (Art. 6 Abs. 1 lit. f DSGVO — berechtigtes Interesse: Schutz vor Mehrfach-Accounts und Manipulation)</li>
@@ -230,7 +225,7 @@ LEGAL_DOCS = {
 
 <h2>§ 2 Leistungsbeschreibung</h2>
 <p>
-  Quotico.de ist ein kostenloses Tipspiel zur Unterhaltung. Nutzer geben
+  Quotico.de ist ein kostenloses Tippspiel zur Unterhaltung. Nutzer geben
   Vorhersagen zu Fußball-Ergebnissen ab und sammeln dabei virtuelle Punkte.
   Innerhalb von Squads stehen verschiedene Spielmodi zur Verfügung:
 </p>
@@ -311,7 +306,7 @@ LEGAL_DOCS = {
 
 <h3>1. Einordnung des Angebots</h3>
 <p>
-  Quotico.de ist ein <strong>Tipspiel zur Unterhaltung</strong> (Simulation).
+  Quotico.de ist ein <strong>Tippspiel zur Unterhaltung</strong> (Simulation).
   Es wird kein echtes Geld eingesetzt und es erfolgen keine Auszahlungen.
   Die Plattform stellt kein Glücksspiel im Sinne des Glücksspielstaatsvertrags
   (GlüStV 2021) dar, da die wesentlichen Merkmale — Entgelt, Zufallsabhängigkeit
@@ -352,7 +347,7 @@ LEGAL_DOCS = {
 </p>
 <ul>
   <li>Im Seitenfuß: „Ab 18 Jahren. Kein echtes Geld. Quotico dient nur der Unterhaltung."</li>
-  <li>In der Kopfzeile: „Tipspiel — kein Echtgeld"</li>
+  <li>In der Kopfzeile: „Tippspiel — kein Echtgeld"</li>
   <li>Bei der Registrierung: Pflicht-Checkbox mit Bestätigung der Volljährigkeit</li>
 </ul>
 

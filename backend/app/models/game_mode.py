@@ -9,7 +9,7 @@ class GameMode(str, Enum):
     survivor = "survivor"
     over_under = "over_under"
     fantasy = "fantasy"
-    spieltag = "spieltag"
+    moneyline = "moneyline"
 
 
 GAME_MODE_DEFAULTS: dict[str, dict] = {
@@ -29,14 +29,14 @@ GAME_MODE_DEFAULTS: dict[str, dict] = {
         "scoring": "goals",
         "pure_stats_only": True,
     },
-    "spieltag": {},
+    "moneyline": {},
 }
 
 GAME_MODE_LABELS: dict[str, str] = {
-    "classic": "Klassisch",
+    "classic": "Tippspiel",
     "bankroll": "Bankroll",
     "survivor": "Survivor",
     "over_under": "Über/Unter",
     "fantasy": "Fantasy",
-    "spieltag": "Spieltag",
+    "moneyline": "Quotentipp",
 }

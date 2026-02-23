@@ -61,17 +61,18 @@ async def next_kickoff_in() -> timedelta | None:
     return None
 
 
-async def sync_matches_for_sport(sport_key: str) -> int:
+async def sync_matches_for_sport(sport_key: str) -> dict:
     """Fetch odds from provider and upsert matches in DB.
 
-    Returns the number of matches upserted.
+    Returns {"matches": count, "odds_changed": changed_count}.
     """
     matches_data = await odds_provider.get_odds(sport_key)
     if not matches_data:
-        return 0
+        return {"matches": 0, "odds_changed": 0}
 
     now = utcnow()
     count = 0
+    odds_changed = 0
 
     for m in matches_data:
         commence_time = m["commence_time"]
@@ -98,13 +99,20 @@ async def sync_matches_for_sport(sport_key: str) -> int:
         }
         if "totals_odds" in m:
             set_fields["totals_odds"] = m["totals_odds"]
+        if "spreads_odds" in m:
+            set_fields["spreads_odds"] = m["spreads_odds"]
 
         # Only update status for non-terminal matches
         existing = await _db.db.matches.find_one(
             {"external_id": m["external_id"]},
-            projection={"status": 1},
+            projection={"status": 1, "current_odds": 1, "totals_odds": 1, "spreads_odds": 1},
         )
         if existing:
+            # Detect odds changes
+            if (existing.get("current_odds") != m["odds"]
+                    or existing.get("totals_odds") != m.get("totals_odds", {})
+                    or existing.get("spreads_odds") != m.get("spreads_odds", {})):
+                odds_changed += 1
             cur_status = existing.get("status")
             if cur_status not in (MatchStatus.completed, MatchStatus.cancelled):
                 if commence_time > now:
@@ -113,23 +121,28 @@ async def sync_matches_for_sport(sport_key: str) -> int:
                     set_fields["status"] = MatchStatus.live
                 # Past duration but not resolved → leave as-is for match_resolver
 
+        set_on_insert: dict = {
+            "external_id": m["external_id"],
+            "result": None,
+            "created_at": now,
+        }
+        # Only set status in $setOnInsert when it's not already in $set,
+        # otherwise MongoDB throws a path conflict error.
+        if "status" not in set_fields:
+            set_on_insert["status"] = initial_status
+
         await _db.db.matches.update_one(
             {"external_id": m["external_id"]},
             {
                 "$set": set_fields,
-                "$setOnInsert": {
-                    "external_id": m["external_id"],
-                    "status": initial_status,
-                    "result": None,
-                    "created_at": now,
-                },
+                "$setOnInsert": set_on_insert,
             },
             upsert=True,
         )
         count += 1
 
-    logger.info("Synced %d matches for %s", count, sport_key)
-    return count
+    logger.info("Synced %d matches for %s (%d odds changed)", count, sport_key, odds_changed)
+    return {"matches": count, "odds_changed": odds_changed}
 
 
 async def get_match_by_id(match_id: str) -> Optional[dict]:

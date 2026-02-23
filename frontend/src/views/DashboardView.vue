@@ -2,6 +2,9 @@
 import { ref, onMounted, onUnmounted } from "vue";
 import { useMatchesStore } from "@/stores/matches";
 import { useAuthStore } from "@/stores/auth";
+import { prefetchMatchHistory } from "@/composables/useMatchHistory";
+import { prefetchQuoticoTips } from "@/composables/useQuoticoTip";
+import { prefetchUserTips } from "@/composables/useUserTips";
 import SportNav from "@/components/layout/SportNav.vue";
 import BetSlip from "@/components/layout/BetSlip.vue";
 import MatchCard from "@/components/MatchCard.vue";
@@ -12,6 +15,27 @@ const aliasBannerDismissed = ref(false);
 
 onMounted(async () => {
   await matches.fetchMatches();
+
+  // Prefetch historical data, QuoticoTips, and user tips for all visible matches
+  if (matches.matches.length > 0) {
+    const prefetches: Promise<void>[] = [
+      prefetchMatchHistory(
+        matches.matches.map((m) => ({
+          home_team: m.teams.home,
+          away_team: m.teams.away,
+          sport_key: m.sport_key,
+        })),
+      ),
+      prefetchQuoticoTips(),
+    ];
+
+    if (auth.isLoggedIn) {
+      prefetches.push(prefetchUserTips(matches.matches.map((m) => m.id)));
+    }
+
+    await Promise.all(prefetches);
+  }
+
   matches.connectLive();
 });
 

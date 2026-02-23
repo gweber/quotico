@@ -49,12 +49,14 @@ onMounted(async () => {
 </script>
 
 <template>
-  <template v-if="appReady">
+  <div v-if="appReady" class="flex flex-col min-h-screen">
     <a href="#main-content" class="skip-link">Zum Inhalt springen</a>
     <AppHeader v-if="!isAuthPage" />
     <ToastNotification />
     <AgeGateModal v-if="showAgeGate" @confirmed="handleAgeGateConfirmed" />
-    <RouterView />
+    <main class="flex-1">
+      <RouterView />
+    </main>
     <AppFooter v-if="!isAuthPage" />
-  </template>
+  </div>
 </template>

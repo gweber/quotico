@@ -1,15 +1,25 @@
 <script setup lang="ts">
 import { computed } from "vue";
+import { RouterLink } from "vue-router";
 import type { SpieltagMatch } from "@/stores/spieltag";
 import { useSpieltagStore } from "@/stores/spieltag";
+import MatchHistory from "./MatchHistory.vue";
+import QuoticoTipBadge from "./QuoticoTipBadge.vue";
+import { getCachedTip } from "@/composables/useQuoticoTip";
+import { teamSlug } from "@/composables/useTeam";
 
 const props = defineProps<{
   match: SpieltagMatch;
+  sportKey?: string;
 }>();
+
+const quoticoTip = computed(() => getCachedTip(props.match.id));
 
 const spieltag = useSpieltagStore();
 
 const draft = computed(() => spieltag.draftPredictions.get(props.match.id));
+const isAdminUnlocked = computed(() => spieltag.adminUnlockedSet.has(props.match.id));
+const isEditable = computed(() => !props.match.is_locked || isAdminUnlocked.value);
 
 const pointsEarned = computed(() => {
   if (!spieltag.predictions) return null;
@@ -46,7 +56,7 @@ const kickoffLabel = computed(() => {
 });
 
 const countdown = computed(() => {
-  if (props.match.is_locked) return null;
+  if (props.match.is_locked && !isAdminUnlocked.value) return null;
   const now = Date.now();
   const kickoff = new Date(props.match.commence_time).getTime();
   const diff = kickoff - now;
@@ -81,7 +91,7 @@ function updateAway(e: Event) {
 <template>
   <div
     class="bg-surface-1 rounded-card p-4 border border-surface-3/50 transition-colors"
-    :class="{ 'opacity-60': match.is_locked && !pointsEarned }"
+    :class="{ 'opacity-60': match.is_locked && !isAdminUnlocked && !pointsEarned }"
   >
     <!-- Top row: kickoff + countdown/points -->
     <div class="flex items-center justify-between mb-3">
@@ -100,6 +110,12 @@ function updateAway(e: Event) {
         {{ countdown }}
       </span>
       <span
+        v-else-if="isAdminUnlocked"
+        class="text-xs text-amber-500 font-medium"
+      >
+        Vom Admin entsperrt
+      </span>
+      <span
         v-else-if="match.is_locked"
         class="text-xs text-text-muted"
       >
@@ -111,9 +127,12 @@ function updateAway(e: Event) {
     <div class="flex items-center gap-3">
       <!-- Home team -->
       <div class="flex-1 text-right">
-        <span class="text-sm font-medium text-text-primary truncate block">
+        <RouterLink
+          :to="{ name: 'team-detail', params: { teamSlug: teamSlug(match.teams.home) }, query: sportKey ? { sport: sportKey } : {} }"
+          class="text-sm font-medium text-text-primary truncate block hover:text-primary transition-colors"
+        >
           {{ match.teams.home }}
-        </span>
+        </RouterLink>
       </div>
 
       <!-- Score inputs or result -->
@@ -128,7 +147,7 @@ function updateAway(e: Event) {
             {{ match.away_score }}
           </span>
         </template>
-        <template v-else-if="!match.is_locked">
+        <template v-else-if="isEditable">
           <!-- Editable inputs -->
           <input
             type="number"
@@ -164,10 +183,50 @@ function updateAway(e: Event) {
 
       <!-- Away team -->
       <div class="flex-1">
-        <span class="text-sm font-medium text-text-primary truncate block">
+        <RouterLink
+          :to="{ name: 'team-detail', params: { teamSlug: teamSlug(match.teams.away) }, query: sportKey ? { sport: sportKey } : {} }"
+          class="text-sm font-medium text-text-primary truncate block hover:text-primary transition-colors"
+        >
           {{ match.teams.away }}
-        </span>
+        </RouterLink>
       </div>
+    </div>
+
+    <!-- Odds context (read-only, visually subordinate) -->
+    <div
+      v-if="match.current_odds && Object.keys(match.current_odds).length > 0"
+      class="mt-2 flex items-center justify-center gap-2"
+      role="group"
+      aria-label="Quoten"
+    >
+      <span
+        class="flex flex-col items-center min-w-[3rem] py-1 px-1.5 bg-surface-2 border border-surface-3/50 rounded-lg"
+        :title="`Heimsieg: ${match.current_odds['1']?.toFixed(2) ?? '-'}`"
+      >
+        <span class="text-[10px] leading-none text-text-muted">1</span>
+        <span class="text-xs font-mono font-semibold tabular-nums text-text-muted mt-0.5">
+          {{ match.current_odds['1']?.toFixed(2) ?? '-' }}
+        </span>
+      </span>
+      <span
+        v-if="match.current_odds['X'] !== undefined"
+        class="flex flex-col items-center min-w-[3rem] py-1 px-1.5 bg-surface-2 border border-surface-3/50 rounded-lg"
+        :title="`Unentschieden: ${match.current_odds['X'].toFixed(2)}`"
+      >
+        <span class="text-[10px] leading-none text-text-muted">X</span>
+        <span class="text-xs font-mono font-semibold tabular-nums text-text-muted mt-0.5">
+          {{ match.current_odds['X'].toFixed(2) }}
+        </span>
+      </span>
+      <span
+        class="flex flex-col items-center min-w-[3rem] py-1 px-1.5 bg-surface-2 border border-surface-3/50 rounded-lg"
+        :title="`Auswärtssieg: ${match.current_odds['2']?.toFixed(2) ?? '-'}`"
+      >
+        <span class="text-[10px] leading-none text-text-muted">2</span>
+        <span class="text-xs font-mono font-semibold tabular-nums text-text-muted mt-0.5">
+          {{ match.current_odds['2']?.toFixed(2) ?? '-' }}
+        </span>
+      </span>
     </div>
 
     <!-- Bottom: prediction vs result comparison -->
@@ -177,5 +236,22 @@ function updateAway(e: Event) {
     >
       Dein Tipp: {{ draft.home }}:{{ draft.away }}
     </div>
+
+    <!-- Historical context (embedded from API response) -->
+    <MatchHistory
+      v-if="sportKey"
+      :home-team="match.teams.home"
+      :away-team="match.teams.away"
+      :sport-key="sportKey"
+      :context="(match.h2h_context as any) ?? undefined"
+    />
+
+    <!-- QuoticoTip value bet recommendation -->
+    <QuoticoTipBadge
+      v-if="quoticoTip"
+      :tip="quoticoTip"
+      :home-team="match.teams.home"
+      :away-team="match.teams.away"
+    />
   </div>
 </template>

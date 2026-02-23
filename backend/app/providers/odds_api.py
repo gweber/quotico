@@ -35,6 +35,12 @@ THREE_WAY_SPORTS = {
     "soccer_uefa_champs_league",
 }
 
+# Sports that carry totals (over/under) odds
+TOTALS_SPORTS = THREE_WAY_SPORTS | {"basketball_nba", "americanfootball_nfl"}
+
+# Sports that carry spread (handicap) odds
+SPREADS_SPORTS = {"basketball_nba", "americanfootball_nfl"}
+
 
 class OddsCache:
     """Stale-while-revalidate in-memory cache with mutex for thundering herd protection."""
@@ -81,6 +87,45 @@ class TheOddsAPIProvider(BaseProvider):
         self._client = ResilientClient("odds_api")
         self._cache = OddsCache(ttl=settings.ODDS_CACHE_TTL_SECONDS)
         self._api_usage = {"requests_used": 0, "requests_remaining": None}
+        self._usage_loaded = False
+
+    async def _load_persisted_usage(self) -> None:
+        """Load API usage from DB on first access."""
+        if self._usage_loaded:
+            return
+        self._usage_loaded = True
+        try:
+            import app.database as _db
+            doc = await _db.db.meta.find_one({"_id": "odds_api_usage"})
+            if doc:
+                self._api_usage["requests_used"] = doc.get("requests_used", 0)
+                self._api_usage["requests_remaining"] = doc.get("requests_remaining")
+        except Exception:
+            pass
+
+    def _track_usage_headers(self, resp) -> None:
+        """Extract and store API usage from response headers."""
+        used = resp.headers.get("x-requests-used")
+        remaining = resp.headers.get("x-requests-remaining")
+        if used is not None:
+            self._api_usage["requests_used"] = int(used)
+        if remaining is not None:
+            self._api_usage["requests_remaining"] = int(remaining)
+
+    async def _persist_usage(self) -> None:
+        """Persist API usage to DB so it survives restarts."""
+        try:
+            import app.database as _db
+            await _db.db.meta.update_one(
+                {"_id": "odds_api_usage"},
+                {"$set": {
+                    "requests_used": self._api_usage["requests_used"],
+                    "requests_remaining": self._api_usage["requests_remaining"],
+                }},
+                upsert=True,
+            )
+        except Exception:
+            pass
 
     async def get_odds(self, sport_key: str) -> list[dict[str, Any]]:
         cache_key = f"odds:{sport_key}"
@@ -109,8 +154,13 @@ class TheOddsAPIProvider(BaseProvider):
             try:
                 is_three_way = sport_key in THREE_WAY_SPORTS
 
-                # Fetch h2h + totals markets for 3-way sports (doubles API credits)
-                markets = "h2h,totals" if is_three_way else "h2h"
+                # Build market list: h2h always, totals/spreads per sport
+                market_parts = ["h2h"]
+                if sport_key in TOTALS_SPORTS:
+                    market_parts.append("totals")
+                if sport_key in SPREADS_SPORTS:
+                    market_parts.append("spreads")
+                markets = ",".join(market_parts)
 
                 resp = await self._client.get(
                     f"{BASE_URL}/sports/{sport_key}/odds",
@@ -124,12 +174,8 @@ class TheOddsAPIProvider(BaseProvider):
                 resp.raise_for_status()
 
                 # Track API usage
-                self._api_usage["requests_used"] = resp.headers.get(
-                    "x-requests-used", self._api_usage["requests_used"]
-                )
-                self._api_usage["requests_remaining"] = resp.headers.get(
-                    "x-requests-remaining"
-                )
+                self._track_usage_headers(resp)
+                await self._persist_usage()
 
                 raw = resp.json()
                 matches = self._parse_odds_response(raw, sport_key, is_three_way)
@@ -162,6 +208,8 @@ class TheOddsAPIProvider(BaseProvider):
                 },
             )
             resp.raise_for_status()
+            self._track_usage_headers(resp)
+            await self._persist_usage()
             raw = resp.json()
             results = self._parse_scores_response(raw, sport_key)
             self._cache.set(cache_key, results)
@@ -176,18 +224,22 @@ class TheOddsAPIProvider(BaseProvider):
     def _parse_odds_response(
         self, raw: list[dict], sport_key: str, is_three_way: bool
     ) -> list[dict[str, Any]]:
+        want_totals = sport_key in TOTALS_SPORTS
+        want_spreads = sport_key in SPREADS_SPORTS
+
         matches = []
         for event in raw:
             # Find the best bookmaker odds (first available)
             odds = {}
             totals_odds = {}
+            spreads_odds = {}
+            home_team = event.get("home_team", "")
+            away_team = event.get("away_team", "")
+
             for bookmaker in event.get("bookmakers", []):
                 for market in bookmaker.get("markets", []):
                     if market["key"] == "h2h" and not odds:
                         outcomes = {o["name"]: o["price"] for o in market["outcomes"]}
-                        home_team = event.get("home_team", "")
-                        away_team = event.get("away_team", "")
-
                         if is_three_way:
                             odds = {
                                 "1": outcomes.get(home_team, 0),
@@ -208,7 +260,23 @@ class TheOddsAPIProvider(BaseProvider):
                             elif outcome["name"] == "Under":
                                 totals_odds["under"] = outcome["price"]
 
-                if odds and (totals_odds or not is_three_way):
+                    elif market["key"] == "spreads" and not spreads_odds:
+                        for outcome in market["outcomes"]:
+                            point = outcome.get("point", 0)
+                            if outcome["name"] == home_team:
+                                spreads_odds["home_line"] = point
+                                spreads_odds["home_odds"] = outcome["price"]
+                            elif outcome["name"] == away_team:
+                                spreads_odds["away_line"] = point
+                                spreads_odds["away_odds"] = outcome["price"]
+
+                # Break once we have all requested markets from one bookmaker
+                has_all = odds
+                if want_totals and not totals_odds:
+                    has_all = False
+                if want_spreads and not spreads_odds:
+                    has_all = False
+                if has_all:
                     break
 
             if not odds:
@@ -218,14 +286,16 @@ class TheOddsAPIProvider(BaseProvider):
                 "external_id": event["id"],
                 "sport_key": sport_key,
                 "teams": {
-                    "home": event.get("home_team", "Unknown"),
-                    "away": event.get("away_team", "Unknown"),
+                    "home": home_team or "Unknown",
+                    "away": away_team or "Unknown",
                 },
                 "commence_time": event["commence_time"],
                 "odds": odds,
             }
             if totals_odds:
                 match_data["totals_odds"] = totals_odds
+            if spreads_odds:
+                match_data["spreads_odds"] = spreads_odds
 
             matches.append(match_data)
 
@@ -274,6 +344,11 @@ class TheOddsAPIProvider(BaseProvider):
             })
 
         return results
+
+    async def load_usage(self) -> dict:
+        """Return API usage, loading from DB if needed."""
+        await self._load_persisted_usage()
+        return self._api_usage
 
     @property
     def api_usage(self) -> dict:
