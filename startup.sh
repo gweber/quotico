@@ -32,6 +32,9 @@ for XG in "${XG_LEAGUES[@]}"; do
     python -m tools.enrich_matches_xg --sport "$XG" 
 done
 
+echo "🚀 Phase 2.1: time maschine"
+python -m tools.engine_time_maschine --mode auto --interval-days 30 --concurrency 2 
+
 echo "🚀 Phase 3: Paralleler Backfill auf allen 8 P-Cores"
 for LG in "${LEAGUES[@]}"; do
     echo "  -> Zünde Backfill-Kern für $LG..."

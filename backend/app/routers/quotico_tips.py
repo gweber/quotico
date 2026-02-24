@@ -80,6 +80,7 @@ async def list_tips(
             justification=tip["justification"],
             skip_reason=tip.get("skip_reason"),
             qbot_logic=tip.get("qbot_logic"),
+            decision_trace=tip.get("decision_trace"),
             generated_at=ensure_utc(tip["generated_at"]),
         ))
     return results
@@ -270,6 +271,7 @@ async def get_tip(match_id: str):
         justification=tip["justification"],
         skip_reason=tip.get("skip_reason"),
         qbot_logic=tip.get("qbot_logic"),
+        decision_trace=tip.get("decision_trace"),
         generated_at=ensure_utc(tip["generated_at"]),
     )
 
@@ -365,6 +367,7 @@ async def backfill_quotico_tips(
             continue
         try:
             tip = await generate_quotico_tip(match, before_date=match["match_date"])
+            tip = await enrich_tip(tip)
             tip = resolve_tip(tip, match)
             if not dry_run:
                 await _db.db.quotico_tips.insert_one(tip)

@@ -16,6 +16,7 @@ from app.services.alias_service import generate_default_alias
 from app.services.auth_service import get_admin_user, invalidate_user_tokens
 from app.services.audit_service import log_audit
 from app.services.historical_service import clear_context_cache
+from app.services.qbot_backtest_service import simulate_strategy_backtest
 from app.services.team_mapping_service import (
     team_name_key, _strip_accents_lower, make_canonical_id,
     load_cache as reload_canonical_cache,
@@ -94,6 +95,10 @@ async def admin_stats(admin=Depends(get_admin_user)):
 # Worker definitions: id -> (label, provider, import path)
 _WORKER_REGISTRY: dict[str, dict] = {
     "odds_poller": {"label": "Odds Poller", "provider": "odds_api"},
+    "calibration_eval": {"label": "Calibration: Daily Eval", "provider": None},
+    "calibration_refine": {"label": "Calibration: Weekly Refine", "provider": None},
+    "calibration_explore": {"label": "Calibration: Monthly Explore", "provider": None},
+    "reliability_check": {"label": "Reliability Check", "provider": None},
     "match_resolver": {"label": "Match Resolver", "provider": "multiple"},
     "matchday_sync": {"label": "Matchday Sync", "provider": "multiple"},
     "leaderboard": {"label": "Leaderboard", "provider": None},
@@ -114,6 +119,7 @@ _TRIGGERABLE_WORKERS = {
     "odds_poller", "match_resolver", "matchday_sync",
     "leaderboard", "matchday_resolver", "matchday_leaderboard",
     "quotico_tip_worker",
+    "calibration_eval", "calibration_refine", "calibration_explore", "reliability_check"
 }
 
 
@@ -216,6 +222,18 @@ def _get_worker_fn(worker_id: str):
     if worker_id == "quotico_tip_worker":
         from app.workers.quotico_tip_worker import generate_quotico_tips
         return generate_quotico_tips
+    if worker_id == "calibration_eval":
+        from app.workers.calibration_worker import run_daily_evaluation
+        return run_daily_evaluation
+    if worker_id == "calibration_refine":
+        from app.workers.calibration_worker import run_weekly_refinement
+        return run_weekly_refinement
+    if worker_id == "calibration_explore":
+        from app.workers.calibration_worker import run_monthly_exploration
+        return run_monthly_exploration
+    if worker_id == "reliability_check":
+        from app.workers.calibration_worker import run_reliability_check
+        return run_reliability_check
     return None
 
 
@@ -934,10 +952,8 @@ async def reseed_team_mappings(
 
 @router.get("/qbot/strategies")
 async def qbot_strategies(admin=Depends(get_admin_user)):
-    """Active Qbot strategies with fitness metrics, stress test results, and DNA."""
-    strategies = await _db.db.qbot_strategies.find(
-        {"is_active": True},
-    ).sort("created_at", -1).to_list(100)
+    """Qbot strategies grouped by league with active/shadow/archived categories."""
+    strategies = await _db.db.qbot_strategies.find({}).sort("created_at", -1).to_list(2000)
 
     now = utcnow()
     gene_ranges = {
@@ -956,35 +972,105 @@ async def qbot_strategies(admin=Depends(get_admin_user)):
         "bayes_trust_factor": [0.0, 1.5],
     }
 
-    results = []
-    total_val_roi = 0.0
-    worst_league = None
-    worst_roi = 999.0
-    oldest_days = 0
-    all_stress_passed = True
-
+    by_sport_docs: dict[str, list[dict]] = {}
     for doc in strategies:
+        sport_key = doc.get("sport_key", "all")
+        by_sport_docs.setdefault(sport_key, []).append(doc)
+
+    def classify_strategy(doc: dict, val_f: dict, stress: dict, stage_used: int | None) -> str:
+        val_roi = float(val_f.get("roi", 0.0))
+        ruin_prob = float(stress.get("monte_carlo_ruin_prob", 1.0))
+        stress_passed = bool(stress.get("stress_passed", False))
+        is_active = bool(doc.get("is_active", False))
+        is_shadow = bool(doc.get("is_shadow", False))
+
+        if val_roi < 0 or ruin_prob > 0.20:
+            return "failed"
+        if is_active and stress_passed and val_roi > 0:
+            return "active"
+        if is_shadow or stage_used == 2:
+            return "shadow"
+        return "shadow"
+
+    def strategy_archetype(doc: dict) -> str:
+        raw = doc.get("archetype")
+        if isinstance(raw, str) and raw:
+            return raw
+        if bool(doc.get("is_ensemble", False)):
+            return "consensus"
+        return "standard"
+
+    def summarize_identity(doc: dict) -> dict:
+        val_f = doc.get("validation_fitness", {}) or {}
+        stress = doc.get("stress_test", {}) or {}
+        notes = doc.get("optimization_notes", {}) or {}
+        stage_info = notes.get("stage_info", {}) or {}
+        category = classify_strategy(doc, val_f, stress, stage_info.get("stage_used"))
+        return {
+            "id": str(doc["_id"]),
+            "archetype": strategy_archetype(doc),
+            "version": doc.get("version", "v1"),
+            "generation": doc.get("generation", 0),
+            "is_active": bool(doc.get("is_active", False)),
+            "is_shadow": bool(doc.get("is_shadow", False)),
+            "category": category,
+            "roi": float(val_f.get("roi", 0.0)),
+            "total_bets": int(val_f.get("total_bets", 0)),
+            "created_at": ensure_utc(doc.get("created_at", now)).isoformat(),
+        }
+
+    def active_comparison(doc: dict, active_doc: dict | None) -> dict | None:
+        if not active_doc:
+            return None
+        if str(doc.get("_id")) == str(active_doc.get("_id")):
+            return None
+        val_doc = doc.get("validation_fitness", {}) or {}
+        val_active = active_doc.get("validation_fitness", {}) or {}
+        return {
+            "active_id": str(active_doc["_id"]),
+            "roi_diff": round(float(val_doc.get("roi", 0.0)) - float(val_active.get("roi", 0.0)), 4),
+            "bets_diff": int(val_doc.get("total_bets", 0)) - int(val_active.get("total_bets", 0)),
+            "sharpe_diff": round(float(val_doc.get("sharpe", 0.0)) - float(val_active.get("sharpe", 0.0)), 4),
+        }
+
+    def build_item(
+        doc: dict,
+        *,
+        selection_source: str,
+        active_doc: dict | None = None,
+        identities: dict[str, dict] | None = None,
+    ) -> dict:
         created = ensure_utc(doc.get("created_at", now))
         age_days = (now - created).days
-
-        train_f = doc.get("training_fitness", {})
-        val_f = doc.get("validation_fitness", {})
-        stress = doc.get("stress_test", {})
-
-        train_roi = train_f.get("roi", 0.0)
-        val_roi = val_f.get("roi", 0.0)
+        train_f = doc.get("training_fitness", {}) or {}
+        val_f = doc.get("validation_fitness", {}) or {}
+        stress = doc.get("stress_test", {}) or {}
+        notes = doc.get("optimization_notes", {}) or {}
+        stage_info = notes.get("stage_info", {}) or {}
+        rescue_log = notes.get("rescue_log", {}) or {}
+        stage_used = stage_info.get("stage_used")
+        train_roi = float(train_f.get("roi", 0.0))
+        val_roi = float(val_f.get("roi", 0.0))
         overfit_warning = (train_roi - val_roi) > 0.15
+        category = classify_strategy(doc, val_f, stress, stage_used)
 
-        if not stress.get("stress_passed", True):
-            all_stress_passed = False
+        if stage_used == 2:
+            stage_label = "Stage: 2 (Relaxed)"
+        elif stage_used == 1:
+            stage_label = "Stage: 1 (Ideal)"
+        else:
+            stage_label = f"Stage: {stage_used}" if stage_used is not None else "Stage: n/a"
 
-        total_val_roi += val_roi
-        if val_roi < worst_roi:
-            worst_roi = val_roi
-            worst_league = doc.get("sport_key", "all")
-        oldest_days = max(oldest_days, age_days)
+        rescue_applied = bool(rescue_log.get("applied", False))
+        rescue_scale = rescue_log.get("final_risk_scaling")
+        if rescue_applied and rescue_scale is not None:
+            rescue_label = f"Rescue: Applied (Scale {rescue_scale})"
+        elif rescue_applied:
+            rescue_label = "Rescue: Applied"
+        else:
+            rescue_label = "Rescue: Not Applied"
 
-        results.append({
+        return {
             "id": str(doc["_id"]),
             "sport_key": doc.get("sport_key", "all"),
             "version": doc.get("version", "v1"),
@@ -993,22 +1079,315 @@ async def qbot_strategies(admin=Depends(get_admin_user)):
             "training_fitness": train_f,
             "validation_fitness": val_f,
             "stress_test": stress if stress else None,
-            "is_active": True,
+            "is_active": bool(doc.get("is_active", False)),
+            "is_shadow": bool(doc.get("is_shadow", False)),
             "created_at": created.isoformat(),
             "age_days": age_days,
             "overfit_warning": overfit_warning,
-        })
+            "category": category,
+            "optimization_notes": notes,
+            "stage_used": stage_used,
+            "stage_label": stage_label,
+            "rescue_applied": rescue_applied,
+            "rescue_scale": rescue_scale,
+            "rescue_label": rescue_label,
+            "selection_source": selection_source,
+            "archetype": strategy_archetype(doc),
+            "identities": identities,
+            "active_comparison": active_comparison(doc, active_doc),
+        }
 
-    n = len(results)
+    representatives: list[dict] = []
+    shadow_extras: list[dict] = []
+    by_sport: dict[str, dict] = {}
+
+    for sport_key, docs in by_sport_docs.items():
+        active_doc = next((d for d in docs if d.get("is_active", False)), None)
+        selected = active_doc or docs[0]
+        identities: dict[str, dict] = {}
+        for d in docs:
+            key = strategy_archetype(d)
+            if key not in {"consensus", "profit_hunter", "volume_grinder"}:
+                continue
+            if key not in identities:
+                identities[key] = summarize_identity(d)
+        if "consensus" not in identities:
+            identities["consensus"] = summarize_identity(selected)
+
+        item = build_item(
+            selected,
+            selection_source="active" if active_doc is not None else "latest",
+            active_doc=active_doc,
+            identities=identities,
+        )
+        representatives.append(item)
+        by_sport[sport_key] = {
+            "strategy": item,
+            "category": item["category"],
+            "identities": identities,
+        }
+
+        # Bonus: expose shadow identities even when league representative is active.
+        seen_shadow_keys: set[str] = set()
+        for d in docs:
+            if str(d.get("_id")) == str(selected.get("_id")):
+                continue
+            shadow_cat = classify_strategy(
+                d,
+                d.get("validation_fitness", {}) or {},
+                d.get("stress_test", {}) or {},
+                ((d.get("optimization_notes", {}) or {}).get("stage_info", {}) or {}).get("stage_used"),
+            )
+            if shadow_cat != "shadow":
+                continue
+            key = strategy_archetype(d)
+            normalized = key if key in {"consensus", "profit_hunter", "volume_grinder"} else "standard"
+            if normalized in seen_shadow_keys:
+                continue
+            seen_shadow_keys.add(normalized)
+            shadow_extras.append(
+                build_item(
+                    d,
+                    selection_source="shadow_identity",
+                    active_doc=active_doc,
+                    identities=identities,
+                )
+            )
+
+    active = [r for r in representatives if r["category"] == "active"]
+    shadow = [r for r in representatives if r["category"] == "shadow"]
+    failed = [r for r in representatives if r["category"] == "failed"]
+
+    existing_shadow_ids = {s["id"] for s in shadow}
+    for extra in shadow_extras:
+        if extra["id"] not in existing_shadow_ids:
+            shadow.append(extra)
+            existing_shadow_ids.add(extra["id"])
+
+    active.sort(key=lambda r: float(r.get("validation_fitness", {}).get("roi", -999)), reverse=True)
+    shadow.sort(key=lambda r: float(r.get("validation_fitness", {}).get("roi", -999)), reverse=True)
+    failed.sort(
+        key=lambda r: (
+            float(r.get("stress_test", {}).get("monte_carlo_ruin_prob", 0.0)),
+            -float(r.get("validation_fitness", {}).get("roi", 0.0)),
+        ),
+        reverse=True,
+    )
+
+    results = active + shadow + failed
+    count_active = len(active)
+    count_shadow = len(shadow)
+    count_failed = len(failed)
+    portfolio_avg_roi = (
+        sum(float(r.get("validation_fitness", {}).get("roi", 0.0)) for r in active) / count_active
+        if count_active
+        else 0.0
+    )
+    worst_league = None
+    worst_roi = 999.0
+    oldest_days = 0
+    all_stress_passed = True
+    for r in results:
+        val_roi = float(r.get("validation_fitness", {}).get("roi", 0.0))
+        if val_roi < worst_roi:
+            worst_roi = val_roi
+            worst_league = r.get("sport_key", "all")
+        oldest_days = max(oldest_days, int(r.get("age_days", 0)))
+        stress = r.get("stress_test") or {}
+        if r["category"] == "active" and not bool(stress.get("stress_passed", False)):
+            all_stress_passed = False
+
     return {
         "strategies": results,
+        "categories": {
+            "active": active,
+            "shadow": shadow,
+            "failed": failed,
+            "archived": failed,
+        },
+        "by_sport": by_sport,
         "gene_ranges": gene_ranges,
         "summary": {
-            "total_active": n,
-            "avg_val_roi": round(total_val_roi / n, 4) if n else 0.0,
+            "portfolio_avg_roi": round(portfolio_avg_roi, 4),
+            "count_active": count_active,
+            "count_shadow": count_shadow,
+            "count_failed": count_failed,
+            "total_active": count_active,
+            "avg_val_roi": round(portfolio_avg_roi, 4),
             "worst_league": worst_league,
             "worst_roi": round(worst_roi, 4) if worst_league else 0.0,
             "oldest_strategy_days": oldest_days,
             "all_stress_passed": all_stress_passed,
         },
     }
+
+
+@router.get("/qbot/strategies/{strategy_id}/backtest")
+async def qbot_strategy_backtest(
+    strategy_id: str,
+    since_date: str | None = Query(None, description="ISO date filter start"),
+    admin=Depends(get_admin_user),
+):
+    """Run an admin backtest equity-curve simulation for one strategy."""
+    if not ObjectId.is_valid(strategy_id):
+        raise HTTPException(status_code=400, detail="Invalid strategy id.")
+
+    strategy = await _db.db.qbot_strategies.find_one({"_id": ObjectId(strategy_id)})
+    if not strategy:
+        raise HTTPException(status_code=404, detail="Strategy not found.")
+
+    return await simulate_strategy_backtest(
+        strategy,
+        starting_bankroll=1000.0,
+        since_date=since_date,
+    )
+
+
+@router.get("/qbot/strategies/{strategy_id}/backtest/ledger")
+async def qbot_strategy_backtest_ledger(
+    strategy_id: str,
+    limit: int = Query(24, ge=0, description="0 = all ledger rows"),
+    since_date: str | None = Query(None, description="ISO date filter start"),
+    admin=Depends(get_admin_user),
+):
+    """Return detailed backtest bet ledger for one strategy."""
+    if not ObjectId.is_valid(strategy_id):
+        raise HTTPException(status_code=400, detail="Invalid strategy id.")
+
+    strategy = await _db.db.qbot_strategies.find_one({"_id": ObjectId(strategy_id)})
+    if not strategy:
+        raise HTTPException(status_code=404, detail="Strategy not found.")
+
+    result = await simulate_strategy_backtest(
+        strategy,
+        starting_bankroll=1000.0,
+        limit_ledger=(None if limit == 0 else limit),
+        since_date=since_date,
+    )
+    return {
+        "strategy_id": result["strategy_id"],
+        "sport_key": result["sport_key"],
+        "starting_bankroll": result["starting_bankroll"],
+        "ending_bankroll": result["ending_bankroll"],
+        "total_bets": result["total_bets"],
+        "wins": result["wins"],
+        "win_rate": result["win_rate"],
+        "weighted_roi": result.get("weighted_roi", 0.0),
+        "weighted_profit": result.get("weighted_profit", 0.0),
+        "weighted_staked": result.get("weighted_staked", 0.0),
+        "ledger": result["ledger"],
+        "window": result.get("window", {}),
+    }
+
+
+@router.get("/qbot/strategies/{strategy_id}")
+async def qbot_strategy_detail(strategy_id: str, admin=Depends(get_admin_user)):
+    """Return one strategy plus available league identities."""
+    if not ObjectId.is_valid(strategy_id):
+        raise HTTPException(status_code=400, detail="Invalid strategy id.")
+
+    strategy = await _db.db.qbot_strategies.find_one({"_id": ObjectId(strategy_id)})
+    if not strategy:
+        raise HTTPException(status_code=404, detail="Strategy not found.")
+
+    now = utcnow()
+
+    def classify(doc: dict) -> str:
+        val_f = doc.get("validation_fitness", {}) or {}
+        stress = doc.get("stress_test", {}) or {}
+        stage_used = ((doc.get("optimization_notes", {}) or {}).get("stage_info", {}) or {}).get("stage_used")
+        val_roi = float(val_f.get("roi", 0.0))
+        ruin_prob = float(stress.get("monte_carlo_ruin_prob", 1.0))
+        stress_passed = bool(stress.get("stress_passed", False))
+        is_active = bool(doc.get("is_active", False))
+        is_shadow = bool(doc.get("is_shadow", False))
+        if val_roi < 0 or ruin_prob > 0.20:
+            return "failed"
+        if is_active and stress_passed and val_roi > 0:
+            return "active"
+        if is_shadow or stage_used == 2:
+            return "shadow"
+        return "shadow"
+
+    def archetype_of(doc: dict) -> str:
+        raw = doc.get("archetype")
+        if isinstance(raw, str) and raw:
+            return raw
+        if bool(doc.get("is_ensemble", False)):
+            return "consensus"
+        return "standard"
+
+    def identity_row(doc: dict) -> dict:
+        val_f = doc.get("validation_fitness", {}) or {}
+        created = ensure_utc(doc.get("created_at", now))
+        return {
+            "id": str(doc["_id"]),
+            "archetype": archetype_of(doc),
+            "version": doc.get("version", "v1"),
+            "generation": doc.get("generation", 0),
+            "is_active": bool(doc.get("is_active", False)),
+            "is_shadow": bool(doc.get("is_shadow", False)),
+            "category": classify(doc),
+            "roi": float(val_f.get("roi", 0.0)),
+            "total_bets": int(val_f.get("total_bets", 0)),
+            "created_at": created.isoformat(),
+        }
+
+    sport_key = strategy.get("sport_key", "all")
+    docs = await _db.db.qbot_strategies.find({"sport_key": sport_key}).sort("created_at", -1).to_list(200)
+    identities: dict[str, dict] = {}
+    for doc in docs:
+        archetype = archetype_of(doc)
+        if archetype in {"consensus", "profit_hunter", "volume_grinder"} and archetype not in identities:
+            identities[archetype] = identity_row(doc)
+    own_archetype = archetype_of(strategy)
+    if own_archetype in {"consensus", "profit_hunter", "volume_grinder"}:
+        identities[own_archetype] = identity_row(strategy)
+    if "consensus" not in identities:
+        identities["consensus"] = identity_row(strategy)
+
+    created = ensure_utc(strategy.get("created_at", now))
+    train_f = strategy.get("training_fitness", {}) or {}
+    val_f = strategy.get("validation_fitness", {}) or {}
+    stress = strategy.get("stress_test", {}) or {}
+    return {
+        "id": str(strategy["_id"]),
+        "sport_key": sport_key,
+        "version": strategy.get("version", "v1"),
+        "generation": strategy.get("generation", 0),
+        "dna": strategy.get("dna", {}),
+        "training_fitness": train_f,
+        "validation_fitness": val_f,
+        "stress_test": stress,
+        "is_active": bool(strategy.get("is_active", False)),
+        "is_shadow": bool(strategy.get("is_shadow", False)),
+        "is_ensemble": bool(strategy.get("is_ensemble", False)),
+        "archetype": archetype_of(strategy),
+        "created_at": created.isoformat(),
+        "age_days": (now - created).days,
+        "category": classify(strategy),
+        "optimization_notes": strategy.get("optimization_notes", {}) or {},
+        "identities": identities,
+    }
+
+
+@router.post("/qbot/strategies/{strategy_id}/activate")
+async def qbot_strategy_activate(strategy_id: str, admin=Depends(get_admin_user)):
+    """Activate one strategy for its league and deactivate previous active strategy."""
+    if not ObjectId.is_valid(strategy_id):
+        raise HTTPException(status_code=400, detail="Invalid strategy id.")
+
+    strategy = await _db.db.qbot_strategies.find_one({"_id": ObjectId(strategy_id)})
+    if not strategy:
+        raise HTTPException(status_code=404, detail="Strategy not found.")
+
+    sport_key = strategy.get("sport_key", "all")
+    await _db.db.qbot_strategies.update_many(
+        {"sport_key": sport_key, "is_active": True},
+        {"$set": {"is_active": False}},
+    )
+    await _db.db.qbot_strategies.update_one(
+        {"_id": ObjectId(strategy_id)},
+        {"$set": {"is_active": True, "is_shadow": False}},
+    )
+    return {"status": "activated", "strategy_id": strategy_id, "sport_key": sport_key}

@@ -151,6 +151,18 @@ const router = createRouter({
       component: () => import("@/views/admin/QbotLabView.vue"),
       meta: { requiresAuth: true, requiresAdmin: true },
     },
+    {
+      path: "/admin/qbot-lab/:strategyId",
+      name: "admin-qbot-lab-detail",
+      component: () => import("@/views/admin/AdminQbotStrategyDetailView.vue"),
+      meta: { requiresAuth: true, requiresAdmin: true },
+    },
+    {
+      path: "/admin/qtips/:matchId",
+      name: "admin-qtip-trace",
+      component: () => import("@/views/admin/AdminQtipTraceView.vue"),
+      meta: { requiresAuth: true, requiresAdmin: true },
+    },
   ],
 });
 

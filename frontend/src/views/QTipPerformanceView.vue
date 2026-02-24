@@ -3,7 +3,9 @@ import { computed, onMounted, onUnmounted, ref } from "vue";
 import { useI18n } from "vue-i18n";
 import { useApi } from "@/composables/useApi";
 import { useQTipPerformance, type QTipSportBreakdown } from "@/composables/useQTipPerformance";
+import { useAuthStore } from "@/stores/auth";
 import { sportLabel } from "@/types/sports";
+import DecisionJourney from "@/components/admin/DecisionJourney.vue";
 import { Bar } from "vue-chartjs";
 import {
   Chart as ChartJS,
@@ -17,9 +19,13 @@ ChartJS.register(CategoryScale, LinearScale, BarElement, Tooltip);
 
 const { t } = useI18n();
 const { data, loading, error, fetch: fetchPerf } = useQTipPerformance();
+const api = useApi();
+const auth = useAuthStore();
 
 const selectedSport = ref<string | null>(null);
 const allSports = ref<QTipSportBreakdown[]>([]);
+const selectedTipDetail = ref<any | null>(null);
+const detailLoading = ref(false);
 
 async function loadPerf(sportKey?: string) {
   selectedSport.value = sportKey ?? null;
@@ -39,13 +45,26 @@ async function refreshTrackRecord() {
     const url = sportKey
       ? `/quotico-tips/public-performance?sport_key=${encodeURIComponent(sportKey)}`
       : "/quotico-tips/public-performance";
-    const fresh = await useApi().get<typeof data.value>(url);
+    const fresh = await api.get<typeof data.value>(url);
     if (fresh && data.value) {
       data.value.recent_tips = fresh.recent_tips;
       data.value.overall = fresh.overall;
       lastUpdated.value = new Date();
     }
   } catch { /* silent */ }
+}
+
+async function openTipDetail(matchId: string) {
+  detailLoading.value = true;
+  try {
+    selectedTipDetail.value = await api.get(`/quotico-tips/${encodeURIComponent(matchId)}`);
+  } finally {
+    detailLoading.value = false;
+  }
+}
+
+function closeTipDetail() {
+  selectedTipDetail.value = null;
 }
 
 let refreshTimer: ReturnType<typeof setInterval> | null = null;
@@ -428,7 +447,8 @@ function copyConfidenceTable() {
               <tr
                 v-for="tip in data.recent_tips"
                 :key="tip.match_id"
-                class="border-b border-surface-3/30 last:border-0 hover:bg-surface-2/50 transition-colors"
+                class="border-b border-surface-3/30 last:border-0 hover:bg-surface-2/50 transition-colors cursor-pointer"
+                @click="openTipDetail(tip.match_id)"
               >
                 <td class="py-2 pr-2">
                   <span
@@ -460,6 +480,54 @@ function copyConfidenceTable() {
               </tr>
             </tbody>
           </table>
+        </div>
+      </div>
+    </div>
+
+    <div
+      v-if="selectedTipDetail || detailLoading"
+      class="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4"
+      @click.self="closeTipDetail"
+    >
+      <div class="w-full max-w-2xl rounded-card bg-surface-1 border border-surface-3/50 p-4 max-h-[85vh] overflow-y-auto">
+        <div class="flex items-center justify-between mb-3">
+          <h3 class="text-sm font-semibold text-text-primary">
+            {{ t("qtipPerformance.tipDetail") }}
+          </h3>
+          <div class="flex items-center gap-3">
+            <router-link
+              v-if="auth.isAdmin && selectedTipDetail?.match_id"
+              :to="{ name: 'admin-qtip-trace', params: { matchId: selectedTipDetail.match_id } }"
+              class="text-xs text-primary hover:underline"
+            >
+              {{ t("qtipPerformance.openAdminTrace") }}
+            </router-link>
+            <button class="text-xs text-text-muted hover:text-text-secondary" @click="closeTipDetail">
+              {{ t("common.close") }}
+            </button>
+          </div>
+        </div>
+
+        <div v-if="detailLoading" class="text-sm text-text-muted py-6">
+          {{ t("qtipPerformance.loadingDetail") }}
+        </div>
+
+        <div v-else-if="selectedTipDetail" class="space-y-4">
+          <div class="text-xs text-text-muted">
+            {{ selectedTipDetail.home_team }} vs {{ selectedTipDetail.away_team }}
+          </div>
+          <div class="grid grid-cols-2 gap-3 text-xs">
+            <div class="bg-surface-2 rounded p-2">
+              <div class="text-text-muted">{{ t("qtipPerformance.pick") }}</div>
+              <div class="font-mono text-text-primary">{{ selectedTipDetail.recommended_selection }}</div>
+            </div>
+            <div class="bg-surface-2 rounded p-2">
+              <div class="text-text-muted">{{ t("qtipPerformance.confidence") }}</div>
+              <div class="font-mono text-text-primary">{{ ((selectedTipDetail.confidence ?? 0) * 100).toFixed(1) }}%</div>
+            </div>
+          </div>
+
+          <DecisionJourney :trace="selectedTipDetail.decision_trace" />
         </div>
       </div>
     </div>

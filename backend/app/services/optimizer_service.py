@@ -714,6 +714,7 @@ async def calibrate_league(
                 "baselines": baselines,
                 "reliability": None,
                 "meta": {
+                    "source": "live_worker",
                     "matches_analyzed": best_result["evaluated"],
                     "mode": mode,
                     "is_retroactive": False,

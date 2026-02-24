@@ -188,13 +188,14 @@ async def load_history_snapshots(sport_key: str | None) -> dict[str, list[tuple[
 
     cursor = _db.db.engine_config_history.find(
         query,
-        {"sport_key": 1, "snapshot_date": 1, "params": 1, "reliability": 1},
+        {"sport_key": 1, "snapshot_date": 1, "params": 1, "reliability": 1, "meta.source": 1},
     ).sort("snapshot_date", 1)
 
-    grouped: dict[str, list[tuple[datetime, dict]]] = {}
+    grouped_all: dict[str, list[tuple[datetime, dict, str]]] = {}
     async for doc in cursor:
         sk = doc["sport_key"]
         sd = ensure_utc(doc["snapshot_date"])
+        source = ((doc.get("meta") or {}).get("source")) or "legacy"
         cache_entry = {
             "_id": sk,
             "rho": doc["params"]["rho"],
@@ -202,8 +203,17 @@ async def load_history_snapshots(sport_key: str | None) -> dict[str, list[tuple[
             "alpha_weight_floor": doc["params"]["floor"],
             "reliability": doc.get("reliability"),
         }
-        grouped.setdefault(sk, []).append((sd, cache_entry))
+        grouped_all.setdefault(sk, []).append((sd, cache_entry, source))
 
+    grouped: dict[str, list[tuple[datetime, dict]]] = {}
+    for sk, snaps in grouped_all.items():
+        has_retro = any(s in {"time_machine", "time_machine_carry_forward"} for _, _, s in snaps)
+        filtered = [
+            (sd, ce)
+            for sd, ce, src in snaps
+            if (not has_retro) or src in {"time_machine", "time_machine_carry_forward", "legacy"}
+        ]
+        grouped[sk] = filtered
     return grouped
 
 

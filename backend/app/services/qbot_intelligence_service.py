@@ -285,6 +285,218 @@ def _compute_kelly_stake(tip: dict, strategy: dict) -> tuple[float, float]:
         return _compute_kelly_stake_single(tip, dna)
 
 
+def _effective_dna_from_strategy(strategy: dict) -> tuple[dict, str]:
+    """Return effective DNA dict used for trace calculations."""
+    ensemble_dna = strategy.get("ensemble_dna")
+    if ensemble_dna and len(ensemble_dna) > 0:
+        matrix = []
+        for dna_list in ensemble_dna:
+            row = [float(dna_list[i]) if i < len(dna_list) else 0.0 for i in range(len(_DNA_GENES))]
+            matrix.append(row)
+        if matrix:
+            medians = []
+            for i in range(len(_DNA_GENES)):
+                col = sorted(row[i] for row in matrix)
+                mid = len(col) // 2
+                if len(col) % 2:
+                    med = col[mid]
+                else:
+                    med = (col[mid - 1] + col[mid]) / 2
+                medians.append(med)
+            return ({_DNA_GENES[i]: round(float(medians[i]), 6) for i in range(len(_DNA_GENES))}, "ensemble_median")
+    return (strategy.get("dna", {}) or {}, "single_dna")
+
+
+def _build_decision_trace(
+    tip: dict,
+    strategy: dict | None,
+    *,
+    bayes_conf: float | None = None,
+    stake_units: float | None = None,
+    kelly_raw: float | None = None,
+) -> dict:
+    """Build a forensic decision trace for one tip."""
+    edge_pct = float(tip.get("edge_pct", 0.0))
+    raw_prob = float(tip.get("true_probability", 0.0))
+    raw_conf = float(tip.get("confidence", 0.0))
+    implied_prob = float(tip.get("implied_probability", 0.33))
+    pick = tip.get("recommended_selection", "-")
+    status = tip.get("status")
+    skip_reason = tip.get("skip_reason")
+
+    kill_point = None
+
+    if strategy is None:
+        if skip_reason:
+            kill_point = {
+                "stage": 1,
+                "code": "engine_skip",
+                "reason": skip_reason,
+            }
+        else:
+            kill_point = {
+                "stage": 2,
+                "code": "no_active_strategy",
+                "reason": "No active strategy found for sport/all fallback.",
+            }
+        return {
+            "version": 1,
+            "stage_1_engine": {
+                "raw_edge_pct": round(edge_pct, 4),
+                "raw_probability": round(raw_prob, 4),
+                "raw_confidence": round(raw_conf, 4),
+                "implied_probability": round(implied_prob, 4),
+                "recommended_selection": pick,
+                "status": status,
+                "skip_reason": skip_reason,
+            },
+            "stage_2_dna_match": {
+                "matched": False,
+                "strategy_id": None,
+                "strategy_label": None,
+                "source": "none",
+            },
+            "stage_3_filters": None,
+            "stage_4_risk": None,
+            "kill_point": kill_point,
+        }
+
+    dna, dna_source = _effective_dna_from_strategy(strategy)
+    min_edge = float(dna.get("min_edge", 0.0))
+    min_conf = float(dna.get("min_confidence", 0.0))
+    home_bias = float(dna.get("home_bias", 1.0))
+    away_bias = float(dna.get("away_bias", 1.0))
+    draw_thresh = float(dna.get("draw_threshold", 0.0))
+    bayes_trust = float(dna.get("bayes_trust_factor", 0.0))
+    vol_buffer = float(dna.get("volatility_buffer", 0.0))
+    kelly_fraction = float(dna.get("kelly_fraction", 0.0))
+    max_stake = float(dna.get("max_stake", 0.0))
+
+    # Confidence pipeline (mirror of strategy layer)
+    conf_adj = raw_conf
+    if pick == "1":
+        conf_adj *= home_bias
+    elif pick == "2":
+        conf_adj *= away_bias
+
+    conf_blended = min(conf_adj, 0.99)
+    if bayes_conf is not None and bayes_trust > 0:
+        blend = min(bayes_trust * 0.5, 0.75)
+        conf_blended = (1.0 - blend) * conf_blended + blend * float(bayes_conf)
+        conf_blended = min(conf_blended, 0.99)
+
+    min_edge_passed = edge_pct >= min_edge
+    min_conf_passed = raw_conf >= min_conf
+    is_draw = pick == "X"
+    draw_blocked = bool(is_draw and conf_blended < draw_thresh)
+    draw_gate_passed = not draw_blocked
+    filters_passed = min_edge_passed and min_conf_passed and draw_gate_passed
+
+    denom = max((1.0 / implied_prob) - 1.0, 0.01) if implied_prob > 0.01 else 9.0
+    buffered_edge = max(conf_blended - implied_prob - vol_buffer, 0.0)
+    calc_kelly_raw = kelly_fraction * buffered_edge / denom
+    calc_kelly_raw = max(calc_kelly_raw, 0.0)
+    calc_final_stake = min(calc_kelly_raw, max_stake)
+    stake_capped = calc_kelly_raw > max_stake
+
+    final_kelly = float(kelly_raw) if kelly_raw is not None else calc_kelly_raw
+    final_stake = float(stake_units) if stake_units is not None else calc_final_stake
+
+    stage_info = (strategy.get("optimization_notes", {}) or {}).get("stage_info", {}) or {}
+    stage_used = stage_info.get("stage_used")
+    if stage_used == 2:
+        stage_label = "Stage 2 (Relaxed)"
+    elif stage_used == 1:
+        stage_label = "Stage 1 (Ideal)"
+    else:
+        stage_label = f"Stage {stage_used}" if stage_used is not None else "Stage n/a"
+
+    if status == "no_signal" and skip_reason:
+        kill_point = {
+            "stage": 1,
+            "code": "engine_skip",
+            "reason": skip_reason,
+        }
+    elif not min_edge_passed:
+        kill_point = {
+            "stage": 3,
+            "code": "min_edge_failed",
+            "reason": f"edge {edge_pct:.2f}% < min_edge {min_edge:.2f}%",
+        }
+    elif not min_conf_passed:
+        kill_point = {
+            "stage": 3,
+            "code": "min_confidence_failed",
+            "reason": f"confidence {raw_conf:.3f} < min_confidence {min_conf:.3f}",
+        }
+    elif draw_blocked:
+        kill_point = {
+            "stage": 3,
+            "code": "draw_gate_blocked",
+            "reason": f"draw confidence {conf_blended:.3f} < draw_threshold {draw_thresh:.3f}",
+        }
+    elif final_stake <= 0:
+        kill_point = {
+            "stage": 4,
+            "code": "risk_zero_stake",
+            "reason": "kelly_raw produced zero stake after risk controls.",
+        }
+
+    strategy_id = strategy.get("_id")
+    strategy_id_str = str(strategy_id) if strategy_id is not None else None
+    strategy_sport = strategy.get("sport_key", "all")
+    source = "sport_key" if strategy_sport == tip.get("sport_key") else "fallback_all"
+
+    return {
+        "version": 1,
+        "stage_1_engine": {
+            "raw_edge_pct": round(edge_pct, 4),
+            "raw_probability": round(raw_prob, 4),
+            "raw_confidence": round(raw_conf, 4),
+            "implied_probability": round(implied_prob, 4),
+            "recommended_selection": pick,
+            "status": status,
+            "skip_reason": skip_reason,
+        },
+        "stage_2_dna_match": {
+            "matched": True,
+            "strategy_id": strategy_id_str,
+            "strategy_label": f"{strategy_sport} {strategy.get('version', 'v1')} - {stage_label}",
+            "strategy_version": strategy.get("version", "v1"),
+            "strategy_generation": strategy.get("generation", 0),
+            "strategy_sport_key": strategy_sport,
+            "strategy_state": "active" if strategy.get("is_active", False) else ("shadow" if strategy.get("is_shadow", False) else "inactive"),
+            "source": source,
+            "stage_used": stage_used,
+            "dna_source": dna_source,
+        },
+        "stage_3_filters": {
+            "min_edge": {"required": round(min_edge, 4), "actual": round(edge_pct, 4), "passed": min_edge_passed},
+            "min_confidence": {"required": round(min_conf, 4), "actual": round(raw_conf, 4), "passed": min_conf_passed},
+            "draw_gate": {
+                "required": bool(is_draw),
+                "actual_confidence": round(conf_blended, 4),
+                "draw_threshold": round(draw_thresh, 4),
+                "blocked": draw_blocked,
+                "passed": draw_gate_passed,
+            },
+            "overall_passed": filters_passed,
+        },
+        "stage_4_risk": {
+            "kelly_fraction": round(kelly_fraction, 4),
+            "max_stake": round(max_stake, 4),
+            "volatility_buffer": round(vol_buffer, 4),
+            "bayes_trust_factor": round(bayes_trust, 4),
+            "confidence_adjusted": round(conf_blended, 4),
+            "buffered_edge": round(buffered_edge, 4),
+            "kelly_raw": round(final_kelly, 4),
+            "final_stake": round(final_stake, 4),
+            "stake_capped": stake_capped,
+        },
+        "kill_point": kill_point,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Main enrichment function
 # ---------------------------------------------------------------------------
@@ -300,6 +512,7 @@ async def enrich_tip(tip: dict) -> dict:
     if not strategy:
         # Still consume transient field
         tip.pop("player_prediction", None)
+        tip["decision_trace"] = _build_decision_trace(tip, None)
         return tip
 
     is_no_signal = tip.get("status") == "no_signal"
@@ -309,6 +522,9 @@ async def enrich_tip(tip: dict) -> dict:
 
     # --- Investor enrichment (active tips only) ---
     investor_data = {}
+    bayes_conf: float | None = None
+    stake_units: float | None = None
+    kelly_raw: float | None = None
     if not is_no_signal:
         cluster_stats = await _get_cluster_stats()
         cluster_key = compute_cluster_key(tip)
@@ -381,6 +597,13 @@ async def enrich_tip(tip: dict) -> dict:
         qbot_logic["player"] = player_data
 
     tip["qbot_logic"] = qbot_logic
+    tip["decision_trace"] = _build_decision_trace(
+        tip,
+        strategy,
+        bayes_conf=bayes_conf,
+        stake_units=stake_units,
+        kelly_raw=kelly_raw,
+    )
     return tip
 
 

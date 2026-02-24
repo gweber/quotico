@@ -351,6 +351,12 @@ async def _ensure_indexes() -> None:
         partialFilterExpression={"is_active": True},
     )
     await db.qbot_strategies.create_index("created_at")
+    await db.qbot_strategies.create_index(
+        [("sport_key", 1), ("is_active", 1), ("is_shadow", 1), ("created_at", -1)]
+    )
+    await db.qbot_strategies.create_index(
+        [("optimization_notes.stage_info.stage_used", 1), ("created_at", -1)]
+    )
 
     await db.qbot_cluster_stats.create_index("sport_key")
     # _id = cluster_key string, no additional unique index needed

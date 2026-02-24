@@ -163,6 +163,7 @@ class QuoticoTipResponse(BaseModel):
     justification: str
     skip_reason: str | None = None
     qbot_logic: dict | None = None
+    decision_trace: dict | None = None
     generated_at: datetime
 
 
