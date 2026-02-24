@@ -27,6 +27,7 @@ SPORT_KEY_TO_UNDERSTAT: dict[str, str] = {
     "soccer_germany_bundesliga": "GER-Bundesliga",
     "soccer_spain_la_liga": "ESP-La Liga",
     "soccer_italy_serie_a": "ITA-Serie A",
+    "soccer_france_ligue_one": "FRA-Ligue 1",
 }
 
 SUPPORTED_SPORT_KEYS = list(SPORT_KEY_TO_UNDERSTAT.keys())

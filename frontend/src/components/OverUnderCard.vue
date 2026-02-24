@@ -3,14 +3,13 @@ import { ref, computed } from "vue";
 import type { MatchdayMatch } from "@/stores/matchday";
 import { useWalletStore } from "@/stores/wallet";
 import { useToast } from "@/composables/useToast";
-import { scoreUnitLabel } from "@/types/sports";
 
 const props = defineProps<{
   match: MatchdayMatch;
   sportKey?: string;
 }>();
 
-const unit = computed(() => scoreUnitLabel(props.sportKey ?? ""));
+const unit = "Tore";
 
 const walletStore = useWalletStore();
 const toast = useToast();

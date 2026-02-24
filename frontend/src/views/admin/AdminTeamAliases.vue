@@ -55,7 +55,9 @@ const sportKeys = [
   { value: "soccer_epl", label: "Premier League" },
   { value: "soccer_spain_la_liga", label: "La Liga" },
   { value: "soccer_italy_serie_a", label: "Serie A" },
-  { value: "soccer_uefa_champs_league", label: "Champions League" },
+  { value: "soccer_france_ligue_one", label: "Ligue 1" },
+  { value: "soccer_netherlands_eredivisie", label: "Eredivisie" },
+  { value: "soccer_portugal_primeira_liga", label: "Primeira Liga" },
 ];
 
 async function fetchAliases() {

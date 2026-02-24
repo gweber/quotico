@@ -36,11 +36,25 @@ MATCHDAY_SPORTS: dict[str, dict] = {
         "matchdays_per_season": 38,
         "label_template": "Giornata {n}",
     },
-    "soccer_uefa_champs_league": {
+    "soccer_france_ligue_one": {
         "provider": "football_data",
-        "competition_code": "CL",
-        "matches_per_matchday": 8,
-        "matchdays_per_season": 8,
-        "label_template": "Matchday {n}",
+        "competition_code": "FL1",
+        "matches_per_matchday": 10,
+        "matchdays_per_season": 38,
+        "label_template": "Journée {n}",
+    },
+    "soccer_netherlands_eredivisie": {
+        "provider": "football_data",
+        "competition_code": "DED",
+        "matches_per_matchday": 9,
+        "matchdays_per_season": 34,
+        "label_template": "Speelronde {n}",
+    },
+    "soccer_portugal_primeira_liga": {
+        "provider": "football_data",
+        "competition_code": "PPL",
+        "matches_per_matchday": 9,
+        "matchdays_per_season": 34,
+        "label_template": "Jornada {n}",
     },
 }

@@ -46,6 +46,8 @@ No test suite exists yet. The frontend uses TypeScript strict mode as its primar
 - **Routing:** Vue Router in `frontend/src/router/index.ts`
 - **API calls:** `frontend/src/composables/useApi.ts` — fetch wrapper with auth
 - **i18n:** vue-i18n with locale files in `frontend/src/locales/` (`de.ts`, `en.ts`). Default locale: `de`. Config in `frontend/src/i18n.ts`. Use `$t('key')` in templates, `t('key')` in script setup via `useI18n()`.
+- **Sport nav icons:** `frontend/src/components/layout/SportNav.vue` maps league keys to country flag icons (e.g. Bundesliga → 🇩🇪, EPL → 🇬🇧) instead of a shared football icon.
+- **Sport metadata:** `frontend/src/types/sports.ts` is the shared source for league labels and country flags (used by sport nav and homepage match cards).
 - **Styling:** Tailwind CSS
 - **Path alias:** `@/*` maps to `frontend/src/*`
 - **Dev proxy:** Vite proxies `/api` and `/ws` to backend at localhost:4201

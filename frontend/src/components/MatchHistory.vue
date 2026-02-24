@@ -1,8 +1,7 @@
 <script setup lang="ts">
-import { ref, computed, onMounted } from "vue";
+import { ref, onMounted } from "vue";
 import { useApi } from "@/composables/useApi";
 import { useMatchHistory, type HistoricalMatch, type MatchContext } from "@/composables/useMatchHistory";
-import { isBasketball, scoreUnitLabel } from "@/types/sports";
 
 const props = defineProps<{
   homeTeam: string;
@@ -10,9 +9,6 @@ const props = defineProps<{
   sportKey: string;
   context?: MatchContext | null;  // Pre-loaded data from parent (Matchday path)
 }>();
-
-const isBball = computed(() => isBasketball(props.sportKey));
-const unit = computed(() => scoreUnitLabel(props.sportKey));
 
 const api = useApi();
 const expanded = ref(false);
@@ -200,11 +196,9 @@ function yearGap(olderDate: string, newerDate: string): number {
 
             <!-- Stats row -->
             <div class="flex justify-between text-xs text-text-muted">
-              <span>⌀ {{ data.h2h.summary.avg_goals }} {{ unit }}</span>
-              <template v-if="!isBball">
-                <span>Über 2.5: {{ Math.round(data.h2h.summary.over_2_5_pct * 100) }}%</span>
-                <span>Beide treffen: {{ Math.round(data.h2h.summary.btts_pct * 100) }}%</span>
-              </template>
+              <span>⌀ {{ data.h2h.summary.avg_goals }} Tore</span>
+              <span>Über 2.5: {{ Math.round(data.h2h.summary.over_2_5_pct * 100) }}%</span>
+              <span>Beide treffen: {{ Math.round(data.h2h.summary.btts_pct * 100) }}%</span>
               <span
                 v-if="data.h2h.summary.avg_home_xg != null"
                 class="tabular-nums"

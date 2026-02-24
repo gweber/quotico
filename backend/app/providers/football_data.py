@@ -21,7 +21,9 @@ SPORT_TO_COMPETITION = {
     "soccer_epl": "PL",
     "soccer_spain_la_liga": "PD",
     "soccer_italy_serie_a": "SA",
-    "soccer_uefa_champs_league": "CL",
+    "soccer_france_ligue_one": "FL1",
+    "soccer_netherlands_eredivisie": "DED",
+    "soccer_portugal_primeira_liga": "PPL",
 }
 
 

@@ -83,7 +83,9 @@ CALIBRATED_LEAGUES = [
     "soccer_epl",
     "soccer_spain_la_liga",
     "soccer_italy_serie_a",
-    "soccer_uefa_champs_league",
+    "soccer_france_ligue_one",
+    "soccer_netherlands_eredivisie",
+    "soccer_portugal_primeira_liga",
 ]
 
 

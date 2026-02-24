@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { useMatchesStore } from "@/stores/matches";
-import { SPORT_LABELS } from "@/types/sports";
+import { SPORT_LABELS, sportFlag } from "@/types/sports";
 
 const props = withDefaults(defineProps<{
   variant?: "sidebar" | "bar";
@@ -21,7 +21,7 @@ const sports = [
   ...Object.entries(SPORT_LABELS).map(([key, label]) => ({
     key,
     label,
-    icon: SPORT_ICONS[key] || "⚽",
+    icon: key.startsWith("soccer_") ? sportFlag(key) : SPORT_ICONS[key] || "🎯",
   })),
 ];
 

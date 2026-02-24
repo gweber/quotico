@@ -58,7 +58,9 @@ LEAGUE_DISPLAY = {
     "soccer_epl": "Premier League",
     "soccer_spain_la_liga": "La Liga",
     "soccer_italy_serie_a": "Serie A",
-    "soccer_uefa_champs_league": "Champions League",
+    "soccer_france_ligue_one": "Ligue 1",
+    "soccer_netherlands_eredivisie": "Eredivisie",
+    "soccer_portugal_primeira_liga": "Primeira Liga",
 }
 
 

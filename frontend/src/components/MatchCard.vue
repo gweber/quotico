@@ -13,6 +13,7 @@ import QuoticoTipBadge from "./QuoticoTipBadge.vue";
 import { useQuoticoTip } from "@/composables/useQuoticoTip";
 import { getCachedUserBet } from "@/composables/useUserBets";
 import { teamSlug } from "@/composables/useTeam";
+import { sportFlag, sportLabel } from "@/types/sports";
 
 const { t, locale } = useI18n();
 const localeTag = computed(() => (locale.value === "en" ? "en-US" : "de-DE"));
@@ -151,6 +152,8 @@ const formattedDate = computed(() =>
     minute: "2-digit",
   })
 );
+const leagueLabel = computed(() => sportLabel(props.match.sport_key));
+const leagueFlag = computed(() => sportFlag(props.match.sport_key));
 
 const statusLabel = computed(() => {
   if (isLive.value && liveMinute.value) return `${liveMinute.value}'`;
@@ -170,18 +173,24 @@ const statusClass = computed(() => {
 <template>
   <article class="bg-surface-1 rounded-card p-4 border border-surface-3/50 hover:border-surface-3 transition-colors">
     <!-- Header: date, countdown, status -->
-    <div class="flex items-center justify-between mb-3">
-      <div class="flex items-center gap-2">
-        <time :datetime="match.match_date" class="text-xs text-text-muted">
-          {{ formattedDate }}
-        </time>
-        <span
-          v-if="countdown"
-          class="text-xs font-mono text-warning"
-          :aria-label="t('match.startsIn', { time: countdown })"
-        >
-          {{ countdown }}
-        </span>
+    <div class="flex items-start justify-between mb-3">
+      <div class="space-y-1">
+        <p class="text-xs text-text-secondary font-medium">
+          <span aria-hidden="true">{{ leagueFlag }}</span>
+          <span class="ml-1">{{ leagueLabel }}</span>
+        </p>
+        <div class="flex items-center gap-2">
+          <time :datetime="match.match_date" class="text-xs text-text-muted">
+            {{ formattedDate }}
+          </time>
+          <span
+            v-if="countdown"
+            class="text-xs font-mono text-warning"
+            :aria-label="t('match.startsIn', { time: countdown })"
+          >
+            {{ countdown }}
+          </span>
+        </div>
       </div>
       <span
         class="text-xs px-2 py-0.5 rounded-full font-medium"

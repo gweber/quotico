@@ -19,7 +19,6 @@ from app.providers.football_data import (
     teams_match,
 )
 from app.providers.openligadb import openligadb_provider, SPORT_TO_LEAGUE
-from app.providers.espn import espn_provider, SPORT_TO_ESPN
 from app.services.match_service import _MAX_DURATION, _DEFAULT_DURATION
 from app.services.matchday_service import calculate_points, is_match_locked
 from app.services.fantasy_service import calculate_fantasy_points
@@ -346,8 +345,6 @@ async def resolve_matches() -> None:
                 await _resolve_german_league(sport_key)
             elif sport_key in SPORT_TO_COMPETITION:
                 await _resolve_via_football_data(sport_key)
-            elif sport_key in SPORT_TO_ESPN:
-                await _resolve_via_espn(sport_key)
             else:
                 await _resolve_via_odds_api(sport_key)
             await set_synced(f"resolver:{sport_key}")
@@ -649,19 +646,6 @@ def _cross_validate(
 
 async def _resolve_via_football_data(sport_key: str) -> None:
     scores = await football_data_provider.get_finished_scores(sport_key)
-    for score in scores:
-        match = await _find_match_by_team(sport_key, score)
-        if match:
-            await _resolve_match(
-                match, score["result"],
-                score["home_score"], score["away_score"],
-            )
-
-
-# ---------- NFL/NBA: ESPN ----------
-
-async def _resolve_via_espn(sport_key: str) -> None:
-    scores = await espn_provider.get_finished_scores(sport_key)
     for score in scores:
         match = await _find_match_by_team(sport_key, score)
         if match:

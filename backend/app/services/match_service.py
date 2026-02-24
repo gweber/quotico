@@ -23,12 +23,9 @@ from app.utils import ensure_utc, parse_utc, utcnow
 
 logger = logging.getLogger("quotico.match_service")
 
-# Max match duration by sport — used for status computation and smart sleep.
-_MAX_DURATION: dict[str, timedelta] = {
-    "americanfootball_nfl": timedelta(hours=4),
-    "basketball_nba": timedelta(hours=3),
-}
-_DEFAULT_DURATION = timedelta(minutes=190)  # soccer, tennis
+# Max match duration — used for status computation and smart sleep.
+_MAX_DURATION: dict[str, timedelta] = {}
+_DEFAULT_DURATION = timedelta(minutes=190)  # soccer
 
 
 def _compute_status(

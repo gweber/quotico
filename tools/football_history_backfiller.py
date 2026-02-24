@@ -73,6 +73,24 @@ LEAGUES: dict[str, dict] = {
         "name": "Serie A",
         "first_season": 1993,
     },
+    "F1": {
+        "sport_key": "soccer_france_ligue_one",
+        "country": "France",
+        "name": "Ligue 1",
+        "first_season": 1993,
+    },
+    "N1": {
+        "sport_key": "soccer_netherlands_eredivisie",
+        "country": "Netherlands",
+        "name": "Eredivisie",
+        "first_season": 1993,
+    },
+    "P1": {
+        "sport_key": "soccer_portugal_primeira_liga",
+        "country": "Portugal",
+        "name": "Primeira Liga",
+        "first_season": 1993,
+    },
 }
 
 # Current season: 2025/26

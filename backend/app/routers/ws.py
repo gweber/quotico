@@ -17,7 +17,6 @@ from app.providers.football_data import (
     teams_match,
 )
 from app.providers.openligadb import openligadb_provider, SPORT_TO_LEAGUE
-from app.providers.espn import espn_provider, SPORT_TO_ESPN
 
 logger = logging.getLogger("quotico.ws")
 
@@ -135,8 +134,6 @@ class LiveScoreManager:
                         live_data = await football_data_provider.get_live_scores(sport_key)
                 elif sport_key in SPORT_TO_COMPETITION:
                     live_data = await football_data_provider.get_live_scores(sport_key)
-                elif sport_key in SPORT_TO_ESPN:
-                    live_data = await espn_provider.get_live_scores(sport_key)
             except Exception:
                 logger.warning("WS live score provider failed for %s", sport_key, exc_info=True)
                 continue

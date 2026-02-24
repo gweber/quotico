@@ -19,27 +19,13 @@ SUPPORTED_SPORTS = [
     "soccer_epl",
     "soccer_spain_la_liga",
     "soccer_italy_serie_a",
-    "soccer_uefa_champs_league",
-    "americanfootball_nfl",
-    "basketball_nba",
-    "tennis_atp_french_open",
+    "soccer_france_ligue_one",
+    "soccer_netherlands_eredivisie",
+    "soccer_portugal_primeira_liga",
 ]
 
-# 3-way sports (Win/Draw/Loss)
-THREE_WAY_SPORTS = {
-    "soccer_germany_bundesliga",
-    "soccer_germany_bundesliga2",
-    "soccer_epl",
-    "soccer_spain_la_liga",
-    "soccer_italy_serie_a",
-    "soccer_uefa_champs_league",
-}
-
-# Sports that carry totals (over/under) odds
-TOTALS_SPORTS = THREE_WAY_SPORTS | {"basketball_nba", "americanfootball_nfl"}
-
-# Sports that carry spread (handicap) odds
-SPREADS_SPORTS = {"basketball_nba", "americanfootball_nfl"}
+# All supported sports are 3-way (Win/Draw/Loss)
+THREE_WAY_SPORTS = set(SUPPORTED_SPORTS)
 
 
 class OddsCache:
@@ -154,13 +140,8 @@ class TheOddsAPIProvider(BaseProvider):
             try:
                 is_three_way = sport_key in THREE_WAY_SPORTS
 
-                # Build market list: h2h always, totals/spreads per sport
-                market_parts = ["h2h"]
-                if sport_key in TOTALS_SPORTS:
-                    market_parts.append("totals")
-                if sport_key in SPREADS_SPORTS:
-                    market_parts.append("spreads")
-                markets = ",".join(market_parts)
+                # All sports use h2h market only
+                markets = "h2h"
 
                 resp = await self._client.get(
                     f"{BASE_URL}/sports/{sport_key}/odds",
@@ -224,15 +205,10 @@ class TheOddsAPIProvider(BaseProvider):
     def _parse_odds_response(
         self, raw: list[dict], sport_key: str, is_three_way: bool
     ) -> list[dict[str, Any]]:
-        want_totals = sport_key in TOTALS_SPORTS
-        want_spreads = sport_key in SPREADS_SPORTS
-
         matches = []
         for event in raw:
             # Find the best bookmaker odds (first available)
             odds = {}
-            totals_odds = {}
-            spreads_odds = {}
             home_team = event.get("home_team", "")
             away_team = event.get("away_team", "")
 
@@ -240,43 +216,13 @@ class TheOddsAPIProvider(BaseProvider):
                 for market in bookmaker.get("markets", []):
                     if market["key"] == "h2h" and not odds:
                         outcomes = {o["name"]: o["price"] for o in market["outcomes"]}
-                        if is_three_way:
-                            odds = {
-                                "1": outcomes.get(home_team, 0),
-                                "X": outcomes.get("Draw", 0),
-                                "2": outcomes.get(away_team, 0),
-                            }
-                        else:
-                            odds = {
-                                "1": outcomes.get(home_team, 0),
-                                "2": outcomes.get(away_team, 0),
-                            }
+                        odds = {
+                            "1": outcomes.get(home_team, 0),
+                            "X": outcomes.get("Draw", 0),
+                            "2": outcomes.get(away_team, 0),
+                        }
 
-                    elif market["key"] == "totals" and not totals_odds:
-                        for outcome in market["outcomes"]:
-                            if outcome["name"] == "Over":
-                                totals_odds["over"] = outcome["price"]
-                                totals_odds["line"] = outcome.get("point", 2.5)
-                            elif outcome["name"] == "Under":
-                                totals_odds["under"] = outcome["price"]
-
-                    elif market["key"] == "spreads" and not spreads_odds:
-                        for outcome in market["outcomes"]:
-                            point = outcome.get("point", 0)
-                            if outcome["name"] == home_team:
-                                spreads_odds["home_line"] = point
-                                spreads_odds["home_odds"] = outcome["price"]
-                            elif outcome["name"] == away_team:
-                                spreads_odds["away_line"] = point
-                                spreads_odds["away_odds"] = outcome["price"]
-
-                # Break once we have all requested markets from one bookmaker
-                has_all = odds
-                if want_totals and not totals_odds:
-                    has_all = False
-                if want_spreads and not spreads_odds:
-                    has_all = False
-                if has_all:
+                if odds:
                     break
 
             if not odds:
@@ -292,10 +238,6 @@ class TheOddsAPIProvider(BaseProvider):
                 "commence_time": event["commence_time"],
                 "odds": odds,
             }
-            if totals_odds:
-                match_data["totals_odds"] = totals_odds
-            if spreads_odds:
-                match_data["spreads_odds"] = spreads_odds
 
             matches.append(match_data)
 

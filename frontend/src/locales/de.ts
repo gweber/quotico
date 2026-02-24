@@ -185,8 +185,6 @@ export default {
     homeWinOdds: "Heimsieg: {odds}",
     drawOdds: "Unentschieden: {odds}",
     awayWinOdds: "Auswärtssieg: {odds}",
-    spreadHint: "Spread (Handicap)",
-    overUnderHint: "Over/Under (Gesamtpunkte)",
     place: "Tippen",
   },
   betslip: {

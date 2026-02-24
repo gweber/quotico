@@ -70,7 +70,9 @@ LEAGUE_RHO: dict[str, float] = {
     "soccer_epl":                 -0.07,  # Attacking, fewer 0-0s
     "soccer_germany_bundesliga":  -0.08,  # Balanced
     "soccer_germany_bundesliga2": -0.09,  # Slightly more defensive than BL1
-    "soccer_uefa_champs_league":  -0.06,  # Open, attacking (knockout bias)
+    "soccer_france_ligue_one":    -0.09,  # Defensive mid-table, similar to BL2
+    "soccer_netherlands_eredivisie": -0.06, # Attacking, open play
+    "soccer_portugal_primeira_liga": -0.10, # Moderate defensive tendency
 }
 
 # Dixon-Coles stability — hard safety floor (not optimized)
@@ -83,19 +85,6 @@ REST_MILD_PENALTY = 0.95     # -5% lambda for mildly fatigued team
 REST_HEAVY_PENALTY = 0.90    # -10% lambda for heavily fatigued team
 REST_DEFAULT_DAYS = 7        # Default when no prior match found (season start)
 REST_CONFIDENCE_BOOST = 0.04 # Confidence boost when rest aligns with pick
-
-# Margin model for 2-way sports (NBA/NFL)
-MARGIN_N_MATCHES = 10           # Last N home/away matches for margin average
-MARGIN_MIN_MATCHES = 5          # Minimum matches to produce a signal
-MARGIN_FATIGUE_MILD = 1.5       # Point reduction for mild fatigue
-MARGIN_FATIGUE_HEAVY = 3.0      # Point reduction for heavy fatigue
-
-# Historical league standard deviation of game margins
-LEAGUE_MARGIN_SIGMA: dict[str, float] = {
-    "americanfootball_nfl": 13.5,   # NFL game margins σ ≈ 13-14 points
-    "basketball_nba": 12.0,         # NBA game margins σ ≈ 11-13 points
-}
-MARGIN_SIGMA_DEFAULT = 13.0         # Fallback for unknown 2-way sports
 
 # xG hybrid blending — blend actual goals with Expected Goals when available
 XG_BLEND_WEIGHT = 0.6  # 60% xG + 40% actual
@@ -240,11 +229,6 @@ def _poisson_pmf(k: int, lam: float) -> float:
     if lam <= 0:
         return 1.0 if k == 0 else 0.0
     return (lam ** k * math.exp(-lam)) / math.factorial(k)
-
-
-def _normal_cdf(x: float) -> float:
-    """Standard normal CDF: P(Z ≤ x). Uses erfc for numerical stability."""
-    return 0.5 * math.erfc(-x / math.sqrt(2))
 
 
 def _weighted_average(values: list[float], decay: float) -> float:
@@ -620,111 +604,6 @@ async def compute_poisson_probabilities(
         "away_rest_days": away_rest,
         "rho": rho,
         "xg_performance": xg_performance,
-    }
-
-
-async def compute_margin_probabilities(
-    home_team_key: str,
-    away_team_key: str,
-    sport_key: str,
-    related_keys: list[str],
-    *,
-    match_date: datetime,
-    before_date: datetime | None = None,
-) -> dict | None:
-    """Compute win probabilities for 2-way sports using a Gaussian margin model.
-
-    Computes moving average of point differentials for each team,
-    derives an expected margin, and uses a normal distribution with
-    league-specific historical variance to estimate P(home_win).
-    """
-    params = await _get_engine_params(sport_key)
-
-    # Fetch team-specific data (last MARGIN_N_MATCHES)
-    home_matches = await _get_team_home_matches(
-        home_team_key, related_keys, limit=MARGIN_N_MATCHES, before_date=before_date
-    )
-    away_matches = await _get_team_away_matches(
-        away_team_key, related_keys, limit=MARGIN_N_MATCHES, before_date=before_date
-    )
-
-    if len(home_matches) < MARGIN_MIN_MATCHES or len(away_matches) < MARGIN_MIN_MATCHES:
-        return None
-
-    reference_date = before_date or utcnow()
-    cal_alpha = params["alpha_time_decay"]
-    cal_floor = params["alpha_weight_floor"]
-
-    # Calculate time-weighted average margin
-    # Home team at home: home_score - away_score
-    home_margins = [
-        m["result"]["home_score"] - m["result"]["away_score"]
-        for m in home_matches if m.get("result", {}).get("home_score") is not None
-    ]
-    home_dates = [m["match_date"] for m in home_matches]
-
-    # Away team on road: away_score - home_score
-    away_margins = [
-        m["result"]["away_score"] - m["result"]["home_score"]
-        for m in away_matches if m.get("result", {}).get("away_score") is not None
-    ]
-    away_dates = [m["match_date"] for m in away_matches]
-
-    home_avg_margin = _time_weighted_average(
-        home_margins, home_dates, reference_date, alpha=cal_alpha, floor=cal_floor
-    )
-    away_avg_margin = _time_weighted_average(
-        away_margins, away_dates, reference_date, alpha=cal_alpha, floor=cal_floor
-    )
-
-    # Expected margin: Home Advantage + Relative Strength
-    # home_avg_margin includes HCA implicitly (data from home games)
-    # away_avg_margin includes "Road Ability" implicitly
-    # Expected margin = Home's Home Strength - (-Away's Road Strength)
-    # Logic: If Home usually wins by +5, and Away usually loses by -3 (wins by -3),
-    # then Expected = 5 - (-3) is wrong.
-    # Let's align:
-    # Home's exp perf = +5. Away's exp perf = -3.
-    # Differential = 5 - (-3) = +8? No.
-    # Standard logic: Expected Home Margin = (HomeAvg + AwayAvgInv) / 2?
-    # Simple relative strength: HomeAvgMargin - AwayAvgMargin?
-    # HomeAvg (+5) means they are +5 better than average opponent at home.
-    # AwayAvg (-3) means they are 3 pts worse than average opponent on road.
-    # Diff = +5 - (-3) = +8. Yes.
-    expected_margin = home_avg_margin - away_avg_margin
-
-    # Rest advantage correction (Fatigue Penalty in POINTS)
-    home_rest = await _get_rest_days(home_team_key, ensure_utc(match_date))
-    away_rest = await _get_rest_days(away_team_key, ensure_utc(match_date))
-    rest_diff = home_rest - away_rest
-
-    # Apply penalty to expected margin (subtract if home tired, add if away tired)
-    # Home tired (negative diff): reduce margin
-    if rest_diff <= -REST_EXTREME_DAYS:
-        expected_margin -= MARGIN_FATIGUE_HEAVY
-    elif rest_diff <= -REST_ADVANTAGE_DAYS:
-        expected_margin -= MARGIN_FATIGUE_MILD
-
-    # Away tired (positive diff): increase margin
-    if rest_diff >= REST_EXTREME_DAYS:
-        expected_margin += MARGIN_FATIGUE_HEAVY
-    elif rest_diff >= REST_ADVANTAGE_DAYS:
-        expected_margin += MARGIN_FATIGUE_MILD
-
-    # Probability Calculation via Gaussian
-    sigma = LEAGUE_MARGIN_SIGMA.get(sport_key, MARGIN_SIGMA_DEFAULT)
-    prob_home = _normal_cdf(expected_margin / sigma)
-    prob_away = 1.0 - prob_home
-
-    return {
-        "expected_margin": expected_margin,
-        "sigma": sigma,
-        "prob_home": prob_home,
-        "prob_away": prob_away,
-        "home_avg_margin": home_avg_margin,
-        "away_avg_margin": away_avg_margin,
-        "home_rest_days": home_rest,
-        "away_rest_days": away_rest,
     }
 
 
@@ -1416,11 +1295,6 @@ async def generate_quotico_tip(match: dict, *, before_date: datetime | None = No
     """Generate a QuoticoTip for a single match."""
     sport_key = match["sport_key"]
     current_odds = match.get("odds", {}).get("h2h", {})
-    is_three_way = "X" in current_odds
-
-    if not is_three_way:
-        # 2-way sports (NBA/NFL): Try Gaussian Margin Model first
-        return await _generate_two_way_bet(match, before_date=before_date)
 
     # Load engine params (includes reliability if analyzed)
     engine_params = await _get_engine_params(sport_key)
@@ -1579,193 +1453,6 @@ async def generate_quotico_tip(match: dict, *, before_date: datetime | None = No
         },
         "justification": justification,
         "player_prediction": compute_player_prediction(poisson),
-        "status": "active",
-        "actual_result": None,
-        "was_correct": None,
-        "generated_at": utcnow(),
-    }
-
-
-async def _generate_two_way_bet(match: dict, *, before_date: datetime | None = None) -> dict:
-    """Generate a tip for 2-way sports (NFL, NBA).
-
-    Prioritizes the Gaussian Margin Model. If insufficient data, falls back to
-    Tier 2+3 (Momentum/Sharp) only logic.
-    """
-    sport_key = match["sport_key"]
-    current_odds = match.get("odds", {}).get("h2h", {})
-    match_id = str(match["_id"])
-    related_keys = sport_keys_for(sport_key)
-
-    # Load engine params (includes reliability if analyzed)
-    engine_params = await _get_engine_params(sport_key)
-    reliability = engine_params.get("reliability") if before_date is None else None
-    home_team = match["home_team"]
-    away_team = match["away_team"]
-
-    home_key = await resolve_team_key(home_team, related_keys)
-    away_key = await resolve_team_key(away_team, related_keys)
-    if not home_key or not away_key:
-        missing = []
-        if not home_key:
-            missing.append(home_team)
-        if not away_key:
-            missing.append(away_team)
-        return _no_signal_bet(match, f"Team not resolved: {', '.join(missing)}")
-
-    # Tier 2: Momentum (Always needed for confidence/form check)
-    context = await build_match_context(home_team, away_team, sport_key, h2h_limit=5, form_limit=5, before_date=before_date)
-    home_form = context.get("home_form") or []
-    away_form = context.get("away_form") or []
-
-    home_momentum = await compute_momentum_score(home_key, home_form, related_keys, before_date=before_date)
-    away_momentum = await compute_momentum_score(away_key, away_form, related_keys, before_date=before_date)
-    momentum_gap = abs(home_momentum["momentum_score"] - away_momentum["momentum_score"])
-
-    # Tier 3: Sharp Movement
-    sharp = await detect_sharp_movement(match_id, match.get("match_date"), before_date=before_date)
-
-    # EVD: Beat the Books
-    evd_home = await compute_team_evd(home_key, related_keys, before_date=before_date)
-    evd_away = await compute_team_evd(away_key, related_keys, before_date=before_date)
-
-    # King's Choice
-    kings = await compute_kings_choice(match_id, before_date=before_date)
-
-    # --- Attempt Margin Model (Tier 1 for 2-way) ---
-    margin = await compute_margin_probabilities(
-        home_key, away_key, sport_key, related_keys,
-        match_date=match["match_date"], before_date=before_date
-    )
-
-    best_outcome = None
-    true_prob = 0.0
-    edge_pct = 0.0
-    confidence = 0.0
-    margin_signals = None
-    rest_signals = None
-    justification = ""
-
-    implied = normalize_implied_probabilities(current_odds)
-
-    if margin:
-        # Gaussian Margin Model Succeeded
-        prob_map = {"1": "prob_home", "2": "prob_away"}
-        edges = {}
-        for outcome in ["1", "2"]:
-            tp = margin[prob_map[outcome]]
-            ip = implied.get(outcome, 0)
-            edges[outcome] = compute_edge(tp, ip)
-
-        best_outcome = max(edges, key=lambda k: edges[k])
-        edge_pct = edges[best_outcome]
-        true_prob = margin[prob_map[best_outcome]]
-
-        if edge_pct < EDGE_THRESHOLD_PCT:
-             return _no_signal_bet(match, f"No value bet found (best edge: {edge_pct:.1f}% < {EDGE_THRESHOLD_PCT}%)")
-
-        # Rest signal from margin model
-        rest_diff = margin["home_rest_days"] - margin["away_rest_days"]
-        rest_signals = {
-            "home_rest_days": margin["home_rest_days"],
-            "away_rest_days": margin["away_rest_days"],
-            "diff": rest_diff,
-            "contributes": abs(rest_diff) >= REST_ADVANTAGE_DAYS,
-        }
-
-        # Confidence using full suite
-        raw_confidence = _calculate_confidence(
-            edge_pct, momentum_gap, home_momentum, away_momentum, sharp, kings, best_outcome,
-            evd_home=evd_home, evd_away=evd_away, rest_advantage=rest_signals,
-        )
-        confidence = _apply_reliability(raw_confidence, reliability) if reliability else raw_confidence
-
-        margin_signals = {
-            "expected_margin": round(margin["expected_margin"], 1),
-            "sigma": margin["sigma"],
-            "home_avg_margin": round(margin["home_avg_margin"], 1),
-            "away_avg_margin": round(margin["away_avg_margin"], 1),
-            "prob_home": round(margin["prob_home"], 4),
-            "prob_away": round(margin["prob_away"], 4),
-        }
-
-        # Build specific justification for margin model
-        pick_team = match["home_team"] if best_outcome == "1" else match["away_team"]
-        imp_prob = implied.get(best_outcome, 0)
-        exp_margin_abs = abs(margin["expected_margin"])
-        favored_team = match["home_team"] if margin["expected_margin"] > 0 else match["away_team"]
-
-        justification = (
-            f"Recommendation: {pick_team} ({best_outcome}). "
-            f"Model sees {true_prob*100:.0f}% probability vs {imp_prob*100:.0f}% implied ({edge_pct:.1f}% edge). "
-            f"Expected margin: {favored_team} by {exp_margin_abs:.1f} points (σ={margin['sigma']}). "
-        )
-        if abs(rest_diff) >= REST_ADVANTAGE_DAYS:
-            rested = match["home_team"] if rest_diff > 0 else match["away_team"]
-            fatigued = match["away_team"] if rest_diff > 0 else match["home_team"]
-            justification += f"Rest advantage: {rested} ({margin['home_rest_days']}d vs {margin['away_rest_days']}d). "
-
-    else:
-        # Fallback: Momentum + Sharp Only (Legacy Logic)
-        if momentum_gap < 0.15:
-            return _no_signal_bet(match, f"Insufficient form gap ({momentum_gap:.0%} < 15%)")
-
-        if home_momentum["momentum_score"] > away_momentum["momentum_score"]:
-            best_outcome = "1"
-        else:
-            best_outcome = "2"
-
-        # Sharp disagreement flip
-        if sharp["has_sharp_movement"] and sharp["direction"] and sharp["direction"] != best_outcome:
-            if sharp["max_drop_pct"] > 15:
-                best_outcome = sharp["direction"]
-
-        # Confidence ceiling 0.70
-        base = 0.40 + (momentum_gap * 0.5)
-        sharp_boost = 0.10 if (sharp["has_sharp_movement"] and sharp["direction"] == best_outcome) else 0.0
-        raw_confidence = min(base + sharp_boost, 0.70)
-        confidence = _apply_reliability(raw_confidence, reliability) if reliability else raw_confidence
-        justification = (
-            f"Recommendation: {match.get('home_team' if best_outcome == '1' else 'away_team', '?')} ({best_outcome}). "
-            f"Based on form analysis (momentum gap: {momentum_gap:.0%})."
-        )
-        # No edge/true_prob for fallback
-
-    imp_prob = implied.get(best_outcome, 0.5)
-
-    return {
-        "match_id": match_id,
-        "sport_key": sport_key,
-        "home_team": match["home_team"],
-        "away_team": match["away_team"],
-        "match_date": match["match_date"],
-        "recommended_selection": best_outcome,
-        "confidence": round(confidence, 3),
-        "raw_confidence": round(raw_confidence, 3),
-        "edge_pct": round(edge_pct, 2),
-        "true_probability": round(true_prob, 4),
-        "implied_probability": round(imp_prob, 4),
-        "expected_goals_home": 0.0,
-        "expected_goals_away": 0.0,
-        "tier_signals": {
-            "poisson": None,
-            "margin_model": margin_signals,  # New signal key
-            "momentum": {
-                "home": home_momentum,
-                "away": away_momentum,
-                "gap": round(momentum_gap, 3),
-                "contributes": momentum_gap > 0.20,
-            },
-            "sharp_movement": sharp,
-            "kings_choice": kings,
-            "btb": {
-                "home": evd_home,
-                "away": evd_away,
-            },
-            "rest_advantage": rest_signals,
-            "xg_performance": None,
-        },
-        "justification": justification,
         "status": "active",
         "actual_result": None,
         "was_correct": None,
