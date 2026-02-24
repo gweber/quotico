@@ -205,6 +205,11 @@ function yearGap(olderDate: string, newerDate: string): number {
                 <span>Über 2.5: {{ Math.round(data.h2h.summary.over_2_5_pct * 100) }}%</span>
                 <span>Beide treffen: {{ Math.round(data.h2h.summary.btts_pct * 100) }}%</span>
               </template>
+              <span
+                v-if="data.h2h.summary.avg_home_xg != null"
+                class="tabular-nums"
+                title="Durchschnittliche Expected Goals pro Spiel"
+              >⌀ xG {{ data.h2h.summary.avg_home_xg }} – {{ data.h2h.summary.avg_away_xg }}</span>
             </div>
 
             <!-- Recent meetings -->
@@ -241,8 +246,13 @@ function yearGap(olderDate: string, newerDate: string): number {
                     <span class="text-right truncate" :class="h2hWinnerClass(m, 'home')">
                       {{ m.home_team }}
                     </span>
-                    <span class="font-mono font-bold text-text-primary text-center tabular-nums">
-                      {{ m.result.home_score }}:{{ m.result.away_score }}
+                    <span class="font-mono text-center tabular-nums">
+                      <span class="font-bold text-text-primary">{{ m.result.home_score }}:{{ m.result.away_score }}</span>
+                      <span
+                        v-if="m.result.home_xg != null"
+                        class="block text-[9px] font-normal text-text-muted/50 leading-tight"
+                        :title="`xG: ${m.result.home_xg} – ${m.result.away_xg}`"
+                      >{{ m.result.home_xg.toFixed(1) }}–{{ m.result.away_xg!.toFixed(1) }}</span>
                     </span>
                     <span class="truncate" :class="h2hWinnerClass(m, 'away')">
                       {{ m.away_team }}

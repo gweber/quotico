@@ -60,11 +60,14 @@ export function useQTipPerformance() {
   const loading = ref(false);
   const error = ref(false);
 
-  async function fetch() {
+  async function fetch(sportKey?: string) {
     loading.value = true;
     error.value = false;
     try {
-      data.value = await api.get<QTipPerformanceData>("/quotico-tips/public-performance");
+      const url = sportKey
+        ? `/quotico-tips/public-performance?sport_key=${encodeURIComponent(sportKey)}`
+        : "/quotico-tips/public-performance";
+      data.value = await api.get<QTipPerformanceData>(url);
     } catch {
       error.value = true;
       data.value = null;

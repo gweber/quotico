@@ -1,7 +1,8 @@
 <script setup lang="ts">
-import { computed, onMounted } from "vue";
+import { computed, onMounted, onUnmounted, ref } from "vue";
 import { useI18n } from "vue-i18n";
-import { useQTipPerformance } from "@/composables/useQTipPerformance";
+import { useApi } from "@/composables/useApi";
+import { useQTipPerformance, type QTipSportBreakdown } from "@/composables/useQTipPerformance";
 import { sportLabel } from "@/types/sports";
 import { Bar } from "vue-chartjs";
 import {
@@ -17,7 +18,46 @@ ChartJS.register(CategoryScale, LinearScale, BarElement, Tooltip);
 const { t } = useI18n();
 const { data, loading, error, fetch: fetchPerf } = useQTipPerformance();
 
-onMounted(() => fetchPerf());
+const selectedSport = ref<string | null>(null);
+const allSports = ref<QTipSportBreakdown[]>([]);
+
+async function loadPerf(sportKey?: string) {
+  selectedSport.value = sportKey ?? null;
+  await fetchPerf(sportKey);
+  // Persist global sport list on first (unfiltered) load
+  if (!sportKey && data.value) {
+    allSports.value = data.value.by_sport;
+  }
+}
+
+const lastUpdated = ref<Date | null>(null);
+
+// Silent refresh — only updates recent_tips without loading spinner
+async function refreshTrackRecord() {
+  try {
+    const sportKey = selectedSport.value ?? undefined;
+    const url = sportKey
+      ? `/quotico-tips/public-performance?sport_key=${encodeURIComponent(sportKey)}`
+      : "/quotico-tips/public-performance";
+    const fresh = await useApi().get<typeof data.value>(url);
+    if (fresh && data.value) {
+      data.value.recent_tips = fresh.recent_tips;
+      data.value.overall = fresh.overall;
+      lastUpdated.value = new Date();
+    }
+  } catch { /* silent */ }
+}
+
+let refreshTimer: ReturnType<typeof setInterval> | null = null;
+
+onMounted(() => {
+  loadPerf();
+  refreshTimer = setInterval(refreshTrackRecord, 15_000);
+});
+
+onUnmounted(() => {
+  if (refreshTimer) clearInterval(refreshTimer);
+});
 
 const hasData = computed(() => data.value && data.value.overall.total_resolved > 0);
 
@@ -97,6 +137,20 @@ function pickLabel(sel: string, home: string, away: string): string {
   if (sel === "2") return away;
   return t("match.draw");
 }
+
+const copied = ref(false);
+function copyConfidenceTable() {
+  if (!data.value) return;
+  const header = `${t("qtipPerformance.band")}\t${t("qtipPerformance.tips")}\t${t("qtipPerformance.correctCol")}\t${t("qtipPerformance.rate")}\t${t("qtipPerformance.avgConfidence")}`;
+  const rows = data.value.by_confidence.map(
+    (b) => `${b.bucket}\t${b.total}\t${b.correct}\t${(b.win_rate * 100).toFixed(1)}%\t${(b.avg_confidence * 100).toFixed(0)}%`,
+  );
+  const label = selectedSport.value ? sportLabel(selectedSport.value) : t("qtipPerformance.allLeagues");
+  const text = `${t("qtipPerformance.byConfidence")} — ${label}\n${header}\n${rows.join("\n")}`;
+  navigator.clipboard.writeText(text);
+  copied.value = true;
+  setTimeout(() => { copied.value = false; }, 2000);
+}
 </script>
 
 <template>
@@ -115,7 +169,7 @@ function pickLabel(sel: string, home: string, away: string): string {
     <!-- Error -->
     <div v-else-if="error" class="text-center py-12">
       <p class="text-text-muted mb-3">{{ $t("qtipPerformance.loadError") }}</p>
-      <button class="text-sm text-primary hover:underline" @click="fetchPerf">
+      <button class="text-sm text-primary hover:underline" @click="loadPerf()">
         {{ $t("common.retry") }}
       </button>
     </div>
@@ -180,12 +234,36 @@ function pickLabel(sel: string, home: string, away: string): string {
         </div>
       </div>
 
-      <!-- Section 3: By sport -->
-      <div v-if="data.by_sport.length > 0" class="bg-surface-1 rounded-card p-4">
+      <!-- Section 3: League filter + By sport -->
+      <div v-if="allSports.length > 0" class="bg-surface-1 rounded-card p-4">
         <h2 class="text-sm font-semibold text-text-primary mb-3">
           {{ $t("qtipPerformance.bySport") }}
         </h2>
-        <div class="overflow-x-auto">
+        <!-- League pills -->
+        <div class="flex flex-wrap gap-2 mb-4">
+          <button
+            class="px-3 py-1 rounded-full text-xs font-medium transition-colors"
+            :class="selectedSport === null
+              ? 'bg-indigo-500 text-white'
+              : 'bg-surface-2 text-text-muted hover:text-text-secondary'"
+            @click="loadPerf()"
+          >
+            {{ $t("qtipPerformance.allLeagues") }}
+          </button>
+          <button
+            v-for="sp in allSports"
+            :key="sp.sport_key"
+            class="px-3 py-1 rounded-full text-xs font-medium transition-colors"
+            :class="selectedSport === sp.sport_key
+              ? 'bg-indigo-500 text-white'
+              : 'bg-surface-2 text-text-muted hover:text-text-secondary'"
+            @click="loadPerf(sp.sport_key)"
+          >
+            {{ sportLabel(sp.sport_key) }}
+          </button>
+        </div>
+        <!-- Sport table (only when showing all) -->
+        <div v-if="!selectedSport && data.by_sport.length > 0" class="overflow-x-auto">
           <table class="w-full text-xs">
             <thead>
               <tr class="text-text-muted border-b border-surface-3/50">
@@ -200,7 +278,8 @@ function pickLabel(sel: string, home: string, away: string): string {
               <tr
                 v-for="sp in data.by_sport"
                 :key="sp.sport_key"
-                class="border-b border-surface-3/30 last:border-0 hover:bg-surface-2/50 transition-colors"
+                class="border-b border-surface-3/30 last:border-0 hover:bg-surface-2/50 transition-colors cursor-pointer"
+                @click="loadPerf(sp.sport_key)"
               >
                 <td class="py-2 pr-3 text-text-secondary">{{ sportLabel(sp.sport_key) }}</td>
                 <td class="py-2 px-2 text-right tabular-nums text-text-muted">{{ sp.total }}</td>
@@ -217,10 +296,13 @@ function pickLabel(sel: string, home: string, away: string): string {
         </div>
       </div>
 
-      <!-- Section 4: By confidence band (chart) -->
+      <!-- Section 4: By confidence band (chart + table) -->
       <div v-if="confidenceChartData && data.by_confidence.length > 0" class="bg-surface-1 rounded-card p-4">
         <h2 class="text-sm font-semibold text-text-primary mb-1">
           {{ $t("qtipPerformance.byConfidence") }}
+          <span v-if="selectedSport" class="text-xs font-normal text-text-muted ml-2">
+            — {{ sportLabel(selectedSport) }}
+          </span>
         </h2>
         <div class="flex items-center gap-4 mb-3 text-[10px] text-text-muted">
           <span class="flex items-center gap-1">
@@ -234,6 +316,54 @@ function pickLabel(sel: string, home: string, away: string): string {
         </div>
         <div class="h-48">
           <Bar :data="confidenceChartData" :options="chartOptions" />
+        </div>
+        <!-- Confidence band data table -->
+        <div class="mt-4 border-t border-surface-3/30 pt-3">
+          <div class="flex items-center justify-end mb-2">
+            <button
+              class="text-[10px] text-text-muted hover:text-text-secondary transition-colors flex items-center gap-1"
+              @click="copyConfidenceTable"
+            >
+              <svg v-if="!copied" xmlns="http://www.w3.org/2000/svg" class="w-3 h-3" viewBox="0 0 20 20" fill="currentColor">
+                <path d="M8 3a1 1 0 011-1h2a1 1 0 110 2H9a1 1 0 01-1-1z" />
+                <path d="M6 3a2 2 0 00-2 2v11a2 2 0 002 2h8a2 2 0 002-2V5a2 2 0 00-2-2 3 3 0 01-3 3H9a3 3 0 01-3-3z" />
+              </svg>
+              <svg v-else xmlns="http://www.w3.org/2000/svg" class="w-3 h-3 text-emerald-400" viewBox="0 0 20 20" fill="currentColor">
+                <path fill-rule="evenodd" d="M16.707 5.293a1 1 0 010 1.414l-8 8a1 1 0 01-1.414 0l-4-4a1 1 0 011.414-1.414L8 12.586l7.293-7.293a1 1 0 011.414 0z" clip-rule="evenodd" />
+              </svg>
+              {{ copied ? $t("qtipPerformance.copied") : $t("qtipPerformance.copyTable") }}
+            </button>
+          </div>
+          <div class="overflow-x-auto">
+          <table class="w-full text-xs">
+            <thead>
+              <tr class="text-text-muted border-b border-surface-3/50">
+                <th class="text-left py-2 pr-3 font-medium">{{ $t("qtipPerformance.band") }}</th>
+                <th class="text-right py-2 px-2 font-medium">{{ $t("qtipPerformance.tips") }}</th>
+                <th class="text-right py-2 px-2 font-medium">{{ $t("qtipPerformance.correctCol") }}</th>
+                <th class="text-right py-2 px-2 font-medium">{{ $t("qtipPerformance.rate") }}</th>
+                <th class="text-right py-2 pl-2 font-medium">{{ $t("qtipPerformance.avgConfidence") }}</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr
+                v-for="band in data.by_confidence"
+                :key="band.bucket"
+                class="border-b border-surface-3/30 last:border-0"
+              >
+                <td class="py-2 pr-3 text-text-secondary">{{ band.bucket }}</td>
+                <td class="py-2 px-2 text-right tabular-nums text-text-muted">{{ band.total }}</td>
+                <td class="py-2 px-2 text-right tabular-nums text-text-muted">{{ band.correct }}</td>
+                <td class="py-2 px-2 text-right tabular-nums font-medium" :class="band.win_rate >= 0.5 ? 'text-emerald-400' : 'text-red-400'">
+                  {{ (band.win_rate * 100).toFixed(1) }}%
+                </td>
+                <td class="py-2 pl-2 text-right tabular-nums text-text-muted">
+                  {{ (band.avg_confidence * 100).toFixed(0) }}%
+                </td>
+              </tr>
+            </tbody>
+          </table>
+          </div>
         </div>
       </div>
 
@@ -270,9 +400,14 @@ function pickLabel(sel: string, home: string, away: string): string {
 
       <!-- Section 6: Track record -->
       <div class="bg-surface-1 rounded-card p-4">
-        <h2 class="text-sm font-semibold text-text-primary mb-3">
-          {{ $t("qtipPerformance.trackRecord") }}
-        </h2>
+        <div class="flex items-center justify-between mb-3">
+          <h2 class="text-sm font-semibold text-text-primary">
+            {{ $t("qtipPerformance.trackRecord") }}
+          </h2>
+          <span v-if="lastUpdated" class="text-[10px] text-text-muted/50 tabular-nums">
+            {{ lastUpdated.toLocaleTimeString("de-DE", { hour: "2-digit", minute: "2-digit", second: "2-digit" }) }}
+          </span>
+        </div>
         <div v-if="data.recent_tips.length === 0" class="text-center py-6 text-text-muted text-sm">
           {{ $t("qtipPerformance.noData") }}
         </div>

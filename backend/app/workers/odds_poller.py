@@ -16,8 +16,10 @@ logger = logging.getLogger("quotico.odds_poller")
 async def poll_odds() -> None:
     """Schedule-aware odds polling.
 
-    Only polls sports that have matches in the next 48 hours,
-    avoiding unnecessary API calls at 3 AM for matches at 3 PM.
+    Two-tier frequency:
+    - Matches within 48h: poll every ~15 min (12-min dedup)
+    - Matches scheduled but >48h away: poll hourly (baseline for odds timeline)
+    - No scheduled matches at all: skip entirely
     """
     now = utcnow()
     window = now + timedelta(hours=48)
@@ -26,19 +28,25 @@ async def poll_odds() -> None:
     total_odds_changed = 0
 
     for sport_key in SUPPORTED_SPORTS:
-        has_upcoming = await _db.db.matches.find_one({
+        has_imminent = await _db.db.matches.find_one({
             "sport_key": sport_key,
             "status": {"$in": ["scheduled", "live"]},
             "match_date": {"$lte": window},
         })
 
-        should_poll = has_upcoming is not None or await _is_initial_load(sport_key)
+        if not has_imminent:
+            # No matches within 48h — check if any scheduled at all (hourly baseline)
+            has_any_scheduled = await _db.db.matches.find_one({
+                "sport_key": sport_key,
+                "status": "scheduled",
+            })
+            if not has_any_scheduled and not await _is_initial_load(sport_key):
+                continue
 
-        if not should_poll:
-            continue
-
+        # Two-tier dedup: 12 min for imminent matches, 55 min for baseline
+        dedup = timedelta(minutes=12) if has_imminent else timedelta(minutes=55)
         state_key = f"odds:{sport_key}"
-        if await recently_synced(state_key, timedelta(minutes=12)):
+        if await recently_synced(state_key, dedup):
             logger.debug("Smart sleep: %s odds polled recently, skipping", sport_key)
             continue
 

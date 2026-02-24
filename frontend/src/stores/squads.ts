@@ -102,34 +102,58 @@ export const useSquadsStore = defineStore("squads", () => {
   }
 
   async function fetchLeaderboard(squadId: string) {
-    leaderboard.value = await api.get<SquadLeaderboardEntry[]>(
-      `/squads/${squadId}/leaderboard`
-    );
+    try {
+      leaderboard.value = await api.get<SquadLeaderboardEntry[]>(
+        `/squads/${squadId}/leaderboard`
+      );
+    } catch {
+      leaderboard.value = [];
+    }
   }
 
   async function leaveSquad(squadId: string) {
-    await api.post(`/squads/${squadId}/leave`);
-    squads.value = squads.value.filter((s) => s.id !== squadId);
-    toast.success("Squad verlassen.");
+    try {
+      await api.post(`/squads/${squadId}/leave`);
+      squads.value = squads.value.filter((s) => s.id !== squadId);
+      toast.success("Squad verlassen.");
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : "Fehler beim Verlassen.");
+      throw e;
+    }
   }
 
   async function kickMember(squadId: string, memberId: string) {
-    await api.del(`/squads/${squadId}/members/${memberId}`);
-    toast.success("Mitglied entfernt.");
+    try {
+      await api.del(`/squads/${squadId}/members/${memberId}`);
+      toast.success("Mitglied entfernt.");
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : "Fehler beim Entfernen.");
+      throw e;
+    }
   }
 
   async function deleteSquad(squadId: string) {
-    await api.del(`/squads/${squadId}`);
-    squads.value = squads.value.filter((s) => s.id !== squadId);
-    toast.success("Squad gelöscht.");
+    try {
+      await api.del(`/squads/${squadId}`);
+      squads.value = squads.value.filter((s) => s.id !== squadId);
+      toast.success("Squad gelöscht.");
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : "Fehler beim Löschen.");
+      throw e;
+    }
   }
 
   async function updateSquad(squadId: string, description: string | null) {
-    const updated = await api.patch<Squad>(`/squads/${squadId}`, {
-      description,
-    });
-    const idx = squads.value.findIndex((s) => s.id === squadId);
-    if (idx !== -1) squads.value[idx] = updated;
+    try {
+      const updated = await api.patch<Squad>(`/squads/${squadId}`, {
+        description,
+      });
+      const idx = squads.value.findIndex((s) => s.id === squadId);
+      if (idx !== -1) squads.value[idx] = updated;
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : "Fehler beim Speichern.");
+      throw e;
+    }
   }
 
   function setCurrentSquad(squad: Squad | null) {
@@ -168,73 +192,122 @@ export const useSquadsStore = defineStore("squads", () => {
     gameMode: GameModeType,
     config?: Record<string, unknown>
   ) {
-    await api.put(`/squads/${squadId}/league-config`, {
-      sport_key: sportKey,
-      game_mode: gameMode,
-      config: config ?? {},
-    });
-    await fetchMySquads();
+    try {
+      await api.put(`/squads/${squadId}/league-config`, {
+        sport_key: sportKey,
+        game_mode: gameMode,
+        config: config ?? {},
+      });
+      await fetchMySquads();
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : "Fehler beim Speichern.");
+      throw e;
+    }
   }
 
   async function removeLeagueConfig(squadId: string, sportKey: string) {
-    await api.del(`/squads/${squadId}/league-config/${sportKey}`);
-    await fetchMySquads();
+    try {
+      await api.del(`/squads/${squadId}/league-config/${sportKey}`);
+      await fetchMySquads();
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : "Fehler beim Entfernen.");
+      throw e;
+    }
   }
 
   async function toggleAutoBet(squadId: string, blocked: boolean) {
-    await api.patch(`/squads/${squadId}/auto-bet`, { blocked });
-    const idx = squads.value.findIndex((s) => s.id === squadId);
-    if (idx !== -1) squads.value[idx].auto_bet_blocked = blocked;
+    try {
+      await api.patch(`/squads/${squadId}/auto-bet`, { blocked });
+      const idx = squads.value.findIndex((s) => s.id === squadId);
+      if (idx !== -1) squads.value[idx].auto_bet_blocked = blocked;
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : "Fehler beim Speichern.");
+    }
   }
 
   async function setLockMinutes(squadId: string, minutes: number) {
-    await api.patch(`/squads/${squadId}/lock-minutes`, { minutes });
-    const idx = squads.value.findIndex((s) => s.id === squadId);
-    if (idx !== -1) squads.value[idx].lock_minutes = minutes;
+    try {
+      await api.patch(`/squads/${squadId}/lock-minutes`, { minutes });
+      const idx = squads.value.findIndex((s) => s.id === squadId);
+      if (idx !== -1) squads.value[idx].lock_minutes = minutes;
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : "Fehler beim Speichern.");
+    }
   }
 
   async function setVisibility(squadId: string, isPublic: boolean) {
-    await api.patch(`/squads/${squadId}/visibility`, { is_public: isPublic });
-    const idx = squads.value.findIndex((s) => s.id === squadId);
-    if (idx !== -1) squads.value[idx].is_public = isPublic;
+    try {
+      await api.patch(`/squads/${squadId}/visibility`, { is_public: isPublic });
+      const idx = squads.value.findIndex((s) => s.id === squadId);
+      if (idx !== -1) squads.value[idx].is_public = isPublic;
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : "Fehler beim Speichern.");
+    }
   }
 
   async function setInviteVisible(squadId: string, visible: boolean) {
-    await api.patch(`/squads/${squadId}/invite-visible`, { visible });
-    const idx = squads.value.findIndex((s) => s.id === squadId);
-    if (idx !== -1) squads.value[idx].invite_visible = visible;
-    // Refresh to get the invite_code if it was just revealed
-    if (visible) await fetchMySquads();
+    try {
+      await api.patch(`/squads/${squadId}/invite-visible`, { visible });
+      const idx = squads.value.findIndex((s) => s.id === squadId);
+      if (idx !== -1) squads.value[idx].invite_visible = visible;
+      // Refresh to get the invite_code if it was just revealed
+      if (visible) await fetchMySquads();
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : "Fehler beim Speichern.");
+    }
   }
 
   async function setOpen(squadId: string, isOpen: boolean) {
-    await api.patch(`/squads/${squadId}/open`, { is_open: isOpen });
-    const idx = squads.value.findIndex((s) => s.id === squadId);
-    if (idx !== -1) squads.value[idx].is_open = isOpen;
+    try {
+      await api.patch(`/squads/${squadId}/open`, { is_open: isOpen });
+      const idx = squads.value.findIndex((s) => s.id === squadId);
+      if (idx !== -1) squads.value[idx].is_open = isOpen;
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : "Fehler beim Speichern.");
+    }
   }
 
   async function requestJoin(squadId: string) {
-    await api.post(`/squads/${squadId}/request-join`);
-    toast.success("Beitrittsanfrage gesendet!");
+    try {
+      await api.post(`/squads/${squadId}/request-join`);
+      toast.success("Beitrittsanfrage gesendet!");
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : "Fehler beim Senden.");
+      throw e;
+    }
   }
 
   async function fetchJoinRequests(squadId: string) {
-    joinRequests.value = await api.get<JoinRequest[]>(
-      `/squads/${squadId}/join-requests`
-    );
+    try {
+      joinRequests.value = await api.get<JoinRequest[]>(
+        `/squads/${squadId}/join-requests`
+      );
+    } catch {
+      joinRequests.value = [];
+    }
   }
 
   async function approveJoinRequest(squadId: string, requestId: string) {
-    await api.post(`/squads/${squadId}/join-requests/${requestId}/approve`);
-    joinRequests.value = joinRequests.value.filter((r) => r.id !== requestId);
-    // Refresh squad to update member count + pending_requests
-    await fetchMySquads();
+    try {
+      await api.post(`/squads/${squadId}/join-requests/${requestId}/approve`);
+      joinRequests.value = joinRequests.value.filter((r) => r.id !== requestId);
+      // Refresh squad to update member count + pending_requests
+      await fetchMySquads();
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : "Fehler beim Bestätigen.");
+      throw e;
+    }
   }
 
   async function declineJoinRequest(squadId: string, requestId: string) {
-    await api.post(`/squads/${squadId}/join-requests/${requestId}/decline`);
-    joinRequests.value = joinRequests.value.filter((r) => r.id !== requestId);
-    await fetchMySquads();
+    try {
+      await api.post(`/squads/${squadId}/join-requests/${requestId}/decline`);
+      joinRequests.value = joinRequests.value.filter((r) => r.id !== requestId);
+      await fetchMySquads();
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : "Fehler beim Ablehnen.");
+      throw e;
+    }
   }
 
   return {

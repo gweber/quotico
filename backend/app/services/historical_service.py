@@ -103,6 +103,7 @@ async def build_match_context(
         "match_date": 1, "home_team": 1, "away_team": 1,
         "home_team_key": 1, "away_team_key": 1,
         "result.home_score": 1, "result.away_score": 1, "result.outcome": 1,
+        "result.home_xg": 1, "result.away_xg": 1,
         "season_label": 1, "sport_key": 1,
     }
 
@@ -127,7 +128,8 @@ async def build_match_context(
     h2h_summary = None
     h2h_all = await _db.db.matches.find(
         h2h_query,
-        {"_id": 0, "home_team_key": 1, "result.home_score": 1, "result.away_score": 1},
+        {"_id": 0, "home_team_key": 1, "result.home_score": 1, "result.away_score": 1,
+         "result.home_xg": 1, "result.away_xg": 1},
     ).to_list(length=500)
 
     if h2h_all:
@@ -138,6 +140,9 @@ async def build_match_context(
         total_goals = 0
         over_2_5 = 0
         btts = 0
+        sum_home_xg = 0.0
+        sum_away_xg = 0.0
+        xg_count = 0
 
         for m in h2h_all:
             r = m.get("result", {})
@@ -148,6 +153,18 @@ async def build_match_context(
                 over_2_5 += 1
             if hg > 0 and ag > 0:
                 btts += 1
+
+            # Accumulate xG (perspective-corrected to current home/away)
+            h_xg = r.get("home_xg")
+            a_xg = r.get("away_xg")
+            if h_xg is not None and a_xg is not None:
+                if m["home_team_key"] == home_key:
+                    sum_home_xg += h_xg
+                    sum_away_xg += a_xg
+                else:
+                    sum_home_xg += a_xg
+                    sum_away_xg += h_xg
+                xg_count += 1
 
             if m["home_team_key"] == home_key:
                 if hg > ag:
@@ -164,7 +181,7 @@ async def build_match_context(
                 else:
                     draws += 1
 
-        h2h_summary = {
+        h2h_summary: dict = {
             "total": total,
             "home_wins": home_wins,
             "away_wins": away_wins,
@@ -173,6 +190,9 @@ async def build_match_context(
             "over_2_5_pct": round(over_2_5 / total, 2),
             "btts_pct": round(btts / total, 2),
         }
+        if xg_count > 0:
+            h2h_summary["avg_home_xg"] = round(sum_home_xg / xg_count, 2)
+            h2h_summary["avg_away_xg"] = round(sum_away_xg / xg_count, 2)
 
     # Form: last N finalized matches for each team
     async def get_form(t_key: str) -> list[dict]:

@@ -72,10 +72,13 @@ async def lifespan(app: FastAPI):
     # Self-calibration: daily eval, weekly refinement, monthly exploration
     from app.workers.calibration_worker import (
         run_daily_evaluation, run_weekly_refinement, run_monthly_exploration,
+        run_reliability_check,
     )
     scheduler.add_job(run_daily_evaluation, "cron", hour=3, minute=0, id="calibration_eval")
     scheduler.add_job(run_weekly_refinement, "cron", day_of_week="mon", hour=4, minute=0, id="calibration_refine")
     scheduler.add_job(run_monthly_exploration, "cron", day=1, hour=5, minute=0, id="calibration_explore")
+    # Reliability: meta-learning confidence calibration (Sunday 23:00)
+    scheduler.add_job(run_reliability_check, "cron", day_of_week="sun", hour=23, minute=0, id="reliability_check")
 
     # Initial sync on startup (delayed 5s to let app fully start)
     async def initial_sync():

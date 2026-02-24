@@ -95,7 +95,7 @@ async def _inject_auto_bets(matchday: dict) -> None:
     if has_qbot and match_id_strs:
         _qbets = await _db.db.quotico_tips.find(
             {"match_id": {"$in": match_id_strs}},
-            {"match_id": 1, "recommended_selection": 1, "confidence": 1},
+            {"match_id": 1, "recommended_selection": 1, "confidence": 1, "qbot_logic": 1},
         ).to_list(length=len(match_id_strs))
         qbets_by_match = {t["match_id"]: t for t in _qbets}
 

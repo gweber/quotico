@@ -449,7 +449,7 @@ _CANONICAL_SEED: dict[str, list[str]] = {
     "Bochum": ["vfl bochum", "vfl bochum 1848"],
     "Heidenheim": ["1. fc heidenheim 1846", "1. fc heidenheim"],
     "Darmstadt": ["sv darmstadt 98", "darmstadt 98"],
-    "Koln": ["1. fc koln", "fc koln"],
+    "Koln": ["1. fc koln", "fc koln", "fc cologne"],
     "Stuttgart": ["vfb stuttgart"],
     "St Pauli": ["fc st. pauli", "fc st pauli", "st. pauli"],
     "Holstein Kiel": ["holstein kiel"],
@@ -478,10 +478,16 @@ _CANONICAL_SEED: dict[str, list[str]] = {
     "Vallecano": ["rayo vallecano", "rayo vallecano de madrid"],
     "Sociedad": ["real sociedad", "real sociedad de futbol"],
     "Alaves": ["deportivo alaves"],
+    "Deportivo La Coruna": ["deportivo la coruna", "deportivo", "rc deportivo"],
     "Espanyol": ["rcd espanyol", "rcd espanyol de barcelona"],
     "Leganes": ["cd leganes"],
     "Valladolid": ["real valladolid"],
     "Oviedo": ["real oviedo"],
+    # --- Premier League (historical) ---
+    "Queens Park Rangers": ["queens park rangers", "qpr"],
+    "West Bromwich Albion": ["west bromwich albion", "west brom"],
+    # --- Bundesliga (historical) ---
+    "Nurnberg": ["nuernberg", "1. fc nurnberg", "fc nurnberg"],
     # --- Serie A ---
     "Inter": ["inter milan", "fc internazionale milano", "internazionale"],
     "AC Milan": ["ac milan"],

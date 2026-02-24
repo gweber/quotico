@@ -9,6 +9,8 @@ export interface H2HSummary {
   avg_goals: number;
   over_2_5_pct: number;
   btts_pct: number;
+  avg_home_xg?: number;
+  avg_away_xg?: number;
 }
 
 export interface HistoricalMatch {
@@ -21,6 +23,8 @@ export interface HistoricalMatch {
     home_score: number;
     away_score: number;
     outcome: string;
+    home_xg?: number;
+    away_xg?: number;
   };
   season_label: string;
 }

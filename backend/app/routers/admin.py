@@ -926,3 +926,89 @@ async def reseed_team_mappings(
         request=request,
     )
     return {"message": f"Seed completed. {upserted} new entries inserted."}
+
+
+# ---------------------------------------------------------------------------
+# Qbot Lab — Strategy Dashboard
+# ---------------------------------------------------------------------------
+
+@router.get("/qbot/strategies")
+async def qbot_strategies(admin=Depends(get_admin_user)):
+    """Active Qbot strategies with fitness metrics, stress test results, and DNA."""
+    strategies = await _db.db.qbot_strategies.find(
+        {"is_active": True},
+    ).sort("created_at", -1).to_list(100)
+
+    now = utcnow()
+    gene_ranges = {
+        "min_edge": [3.0, 15.0],
+        "min_confidence": [0.30, 0.80],
+        "sharp_weight": [0.5, 2.0],
+        "momentum_weight": [0.5, 2.0],
+        "rest_weight": [0.0, 1.5],
+        "kelly_fraction": [0.05, 0.50],
+        "max_stake": [10.0, 100.0],
+        "home_bias": [0.80, 1.20],
+        "away_bias": [0.80, 1.20],
+        "h2h_weight": [0.0, 2.0],
+        "draw_threshold": [0.0, 1.0],
+        "volatility_buffer": [0.0, 0.20],
+        "bayes_trust_factor": [0.0, 1.5],
+    }
+
+    results = []
+    total_val_roi = 0.0
+    worst_league = None
+    worst_roi = 999.0
+    oldest_days = 0
+    all_stress_passed = True
+
+    for doc in strategies:
+        created = ensure_utc(doc.get("created_at", now))
+        age_days = (now - created).days
+
+        train_f = doc.get("training_fitness", {})
+        val_f = doc.get("validation_fitness", {})
+        stress = doc.get("stress_test", {})
+
+        train_roi = train_f.get("roi", 0.0)
+        val_roi = val_f.get("roi", 0.0)
+        overfit_warning = (train_roi - val_roi) > 0.15
+
+        if not stress.get("stress_passed", True):
+            all_stress_passed = False
+
+        total_val_roi += val_roi
+        if val_roi < worst_roi:
+            worst_roi = val_roi
+            worst_league = doc.get("sport_key", "all")
+        oldest_days = max(oldest_days, age_days)
+
+        results.append({
+            "id": str(doc["_id"]),
+            "sport_key": doc.get("sport_key", "all"),
+            "version": doc.get("version", "v1"),
+            "generation": doc.get("generation", 0),
+            "dna": doc.get("dna", {}),
+            "training_fitness": train_f,
+            "validation_fitness": val_f,
+            "stress_test": stress if stress else None,
+            "is_active": True,
+            "created_at": created.isoformat(),
+            "age_days": age_days,
+            "overfit_warning": overfit_warning,
+        })
+
+    n = len(results)
+    return {
+        "strategies": results,
+        "gene_ranges": gene_ranges,
+        "summary": {
+            "total_active": n,
+            "avg_val_roi": round(total_val_roi / n, 4) if n else 0.0,
+            "worst_league": worst_league,
+            "worst_roi": round(worst_roi, 4) if worst_league else 0.0,
+            "oldest_strategy_days": oldest_days,
+            "all_stress_passed": all_stress_passed,
+        },
+    }

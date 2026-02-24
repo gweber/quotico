@@ -569,12 +569,20 @@ async def upsert_league_config(
             break
 
     if existing_idx is not None:
-        # Update existing config (reactivate if deactivated)
+        existing = league_configs[existing_idx]
+        if existing.get("deactivated_at") is None:
+            # Active config exists — mode is locked
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                "Game mode is locked while the league is active. "
+                "Deactivate the league first to change the mode.",
+            )
+        # Reactivate a deactivated config (fresh start, new mode allowed)
         league_configs[existing_idx] = {
             "sport_key": body.sport_key,
             "game_mode": mode,
             "config": config,
-            "activated_at": league_configs[existing_idx].get("activated_at", now),
+            "activated_at": now,
             "deactivated_at": None,
         }
     else:

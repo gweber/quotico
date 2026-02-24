@@ -32,6 +32,8 @@ const hasDrawOdds = computed(() =>
 
 const chartData = computed(() => {
   const labels = props.snapshots.map((s) => s.snapshot_at);
+  const singlePoint = props.snapshots.length === 1;
+  const ptRadius = singlePoint ? 4 : props.compact ? 0 : 2;
 
   const datasets = [
     {
@@ -40,7 +42,7 @@ const chartData = computed(() => {
       borderColor: "#22c55e",
       backgroundColor: "rgba(34, 197, 94, 0.1)",
       borderWidth: props.compact ? 1.5 : 2,
-      pointRadius: props.compact ? 0 : 2,
+      pointRadius: ptRadius,
       pointHoverRadius: 4,
       tension: 0.3,
       fill: false,
@@ -53,7 +55,7 @@ const chartData = computed(() => {
             borderColor: "#f59e0b",
             backgroundColor: "rgba(245, 158, 11, 0.1)",
             borderWidth: props.compact ? 1.5 : 2,
-            pointRadius: props.compact ? 0 : 2,
+            pointRadius: ptRadius,
             pointHoverRadius: 4,
             tension: 0.3,
             fill: false,
@@ -66,7 +68,7 @@ const chartData = computed(() => {
       borderColor: "#ef4444",
       backgroundColor: "rgba(239, 68, 68, 0.1)",
       borderWidth: props.compact ? 1.5 : 2,
-      pointRadius: props.compact ? 0 : 2,
+      pointRadius: ptRadius,
       pointHoverRadius: 4,
       tension: 0.3,
       fill: false,
@@ -147,7 +149,7 @@ const chartHeight = computed(() => (props.compact ? "120px" : "240px"));
 </script>
 
 <template>
-  <div v-if="snapshots.length >= 2" :style="{ height: chartHeight }">
+  <div v-if="snapshots.length >= 1" :style="{ height: chartHeight }">
     <Line :data="chartData" :options="chartOptions" />
   </div>
   <div v-else class="text-xs text-text-muted py-2 text-center">

@@ -1,8 +1,16 @@
 /**
  * Fetch wrapper with cookie auth, error handling, and typed responses.
  */
-interface ApiError {
+interface ApiErrorBody {
   detail: string;
+}
+
+export class HttpError extends Error {
+  status: number;
+  constructor(message: string, status: number) {
+    super(message);
+    this.status = status;
+  }
 }
 
 interface ApiOptions {
@@ -52,13 +60,13 @@ export function useApi() {
 
       let errorMessage = "Ein Fehler ist aufgetreten.";
       try {
-        const errorData: ApiError = await response.json();
+        const errorData: ApiErrorBody = await response.json();
         errorMessage = errorData.detail || errorMessage;
       } catch {
         // Response wasn't JSON
       }
 
-      throw new Error(errorMessage);
+      throw new HttpError(errorMessage, response.status);
     }
 
     if (response.status === 204) {

@@ -173,8 +173,13 @@ export const useWalletStore = defineStore("wallet", () => {
   }
 
   async function acceptDisclaimer() {
-    await api.post("/wallet/accept-disclaimer");
-    disclaimerAccepted.value = true;
+    try {
+      await api.post("/wallet/accept-disclaimer");
+      disclaimerAccepted.value = true;
+    } catch {
+      // Best effort — let user proceed anyway
+      disclaimerAccepted.value = true;
+    }
   }
 
   async function fetchParlay(squadId: string, matchdayId: string) {

@@ -145,6 +145,12 @@ const router = createRouter({
       component: () => import("@/views/admin/AdminTeamAliases.vue"),
       meta: { requiresAuth: true, requiresAdmin: true },
     },
+    {
+      path: "/admin/qbot-lab",
+      name: "admin-qbot-lab",
+      component: () => import("@/views/admin/QbotLabView.vue"),
+      meta: { requiresAuth: true, requiresAdmin: true },
+    },
   ],
 });
 

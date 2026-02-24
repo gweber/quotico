@@ -79,6 +79,12 @@ async def generate_quotico_tips() -> None:
 
         try:
             bet = await generate_quotico_tip(match)
+            # Enrich with Qbot intelligence (graceful — skips if no strategy)
+            try:
+                from app.services.qbot_intelligence_service import enrich_tip
+                bet = await enrich_tip(bet)
+            except Exception:
+                logger.warning("Qbot enrichment failed for %s", match_id, exc_info=True)
             await _db.db.quotico_tips.update_one(
                 {"match_id": match_id},
                 {"$set": bet},

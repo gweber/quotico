@@ -1,6 +1,6 @@
 import { defineStore } from "pinia";
 import { ref, computed, onUnmounted } from "vue";
-import { useApi } from "@/composables/useApi";
+import { useApi, HttpError } from "@/composables/useApi";
 import type { Match } from "./matches";
 
 export interface BetSlipItem {
@@ -108,6 +108,16 @@ export const useBetSlipStore = defineStore("betslip", () => {
     return draft.id;
   }
 
+  /** Clear cached draft ID (e.g. when the server says it's no longer a draft). */
+  function invalidateDraft() {
+    draftSlipId.value = null;
+    localStorage.removeItem(DRAFT_KEY);
+  }
+
+  function isStaleSlipError(e: unknown): boolean {
+    return e instanceof HttpError && (e.status === 400 || e.status === 404);
+  }
+
   function persistItems() {
     localStorage.setItem(ITEMS_KEY, JSON.stringify(items.value));
   }
@@ -143,18 +153,30 @@ export const useBetSlipStore = defineStore("betslip", () => {
   }
 
   async function syncAddSelection(matchId: string, pick: string, displayedOdds: number) {
+    const payload = {
+      action: "add",
+      match_id: matchId,
+      market: "h2h",
+      pick,
+      displayed_odds: displayedOdds,
+    };
     try {
       syncing.value = true;
       const id = await ensureDraft();
-      await api.patch(`/betting-slips/${id}/selections`, {
-        action: "add",
-        match_id: matchId,
-        market: "h2h",
-        pick,
-        displayed_odds: displayedOdds,
-      });
-    } catch {
-      // Server rejection — remove from local state
+      await api.patch(`/betting-slips/${id}/selections`, payload);
+    } catch (e) {
+      // Stale draft (already submitted / deleted) — clear and retry once
+      if (draftSlipId.value && isStaleSlipError(e)) {
+        invalidateDraft();
+        try {
+          const newId = await ensureDraft();
+          await api.patch(`/betting-slips/${newId}/selections`, payload);
+          return;
+        } catch {
+          // Retry also failed
+        }
+      }
+      // Unrecoverable — remove from local state
       items.value = items.value.filter((i) => i.matchId !== matchId);
       persistItems();
     } finally {
@@ -305,7 +327,7 @@ export const useBetSlipStore = defineStore("betslip", () => {
 
     try {
       // Ensure server draft exists with all selections
-      const slipId = await ensureDraft();
+      let slipId = await ensureDraft();
 
       // Sync any items that might not be on the server yet
       for (const item of validItems.value) {
@@ -317,8 +339,20 @@ export const useBetSlipStore = defineStore("betslip", () => {
             pick: item.prediction,
             displayed_odds: item.odds,
           });
-        } catch {
-          // Already exists — that's fine
+        } catch (e) {
+          // Stale draft — get a fresh one and re-sync remaining items
+          if (isStaleSlipError(e)) {
+            invalidateDraft();
+            slipId = await ensureDraft();
+            await api.patch(`/betting-slips/${slipId}/selections`, {
+              action: "add",
+              match_id: item.matchId,
+              market: "h2h",
+              pick: item.prediction,
+              displayed_odds: item.odds,
+            });
+          }
+          // 409 (already exists) is fine — ignore
         }
       }
 

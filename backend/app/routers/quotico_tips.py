@@ -4,11 +4,13 @@ import asyncio
 import logging
 import time
 
-from fastapi import APIRouter, Depends, Query
+from bson import ObjectId
+from fastapi import APIRouter, Depends, HTTPException, Query
 
 import app.database as _db
 from app.services.auth_service import get_admin_user
 from app.utils import ensure_utc
+from app.services.qbot_intelligence_service import enrich_tip
 from app.services.quotico_tip_service import (
     QuoticoTipResponse,
     compute_team_evd,
@@ -23,8 +25,8 @@ from app.services.team_mapping_service import resolve_team_key
 logger = logging.getLogger("quotico.quotico_tips_router")
 router = APIRouter(prefix="/api/quotico-tips", tags=["quotico-tips"])
 
-# In-memory cache for public performance endpoint (60s TTL)
-_perf_cache: dict = {"data": None, "expires": 0.0}
+# In-memory cache for public performance endpoint (60s TTL), keyed by sport_key
+_perf_cache: dict[str, dict] = {}
 _PERF_CACHE_TTL = 60
 
 
@@ -68,6 +70,7 @@ async def list_tips(
             match_date=ensure_utc(tip["match_date"]),
             recommended_selection=tip["recommended_selection"],
             confidence=tip["confidence"],
+            raw_confidence=tip.get("raw_confidence"),
             edge_pct=tip["edge_pct"],
             true_probability=tip["true_probability"],
             implied_probability=tip["implied_probability"],
@@ -76,19 +79,26 @@ async def list_tips(
             tier_signals=tip["tier_signals"],
             justification=tip["justification"],
             skip_reason=tip.get("skip_reason"),
+            qbot_logic=tip.get("qbot_logic"),
             generated_at=ensure_utc(tip["generated_at"]),
         ))
     return results
 
 
 @router.get("/public-performance")
-async def public_performance():
+async def public_performance(
+    sport_key: str | None = Query(None, description="Filter by sport key"),
+):
     """Public Q-Tip track record — aggregated stats, no auth required."""
     now = time.time()
-    if _perf_cache["data"] and _perf_cache["expires"] > now:
-        return _perf_cache["data"]
+    cache_key = sport_key or "_all"
+    cached = _perf_cache.get(cache_key)
+    if cached and cached["expires"] > now:
+        return cached["data"]
 
-    base_match = {"status": "resolved", "was_correct": {"$ne": None}}
+    base_match: dict = {"status": "resolved", "was_correct": {"$ne": None}}
+    if sport_key:
+        base_match["sport_key"] = sport_key
 
     async def _overall():
         results = await _db.db.quotico_tips.aggregate([
@@ -228,16 +238,13 @@ async def public_performance():
         "by_signal": by_signal,
         "recent_tips": recent,
     }
-    _perf_cache["data"] = data
-    _perf_cache["expires"] = now + _PERF_CACHE_TTL
+    _perf_cache[cache_key] = {"data": data, "expires": now + _PERF_CACHE_TTL}
     return data
 
 
 @router.get("/{match_id}", response_model=QuoticoTipResponse)
 async def get_tip(match_id: str):
     """Get the QuoticoTip for a specific match."""
-    from fastapi import HTTPException
-
     tip = await _db.db.quotico_tips.find_one(
         {"match_id": match_id},
         {"_id": 0, "actual_result": 0, "was_correct": 0},
@@ -253,6 +260,7 @@ async def get_tip(match_id: str):
         match_date=ensure_utc(tip["match_date"]),
         recommended_selection=tip["recommended_selection"],
         confidence=tip["confidence"],
+        raw_confidence=tip.get("raw_confidence"),
         edge_pct=tip["edge_pct"],
         true_probability=tip["true_probability"],
         implied_probability=tip["implied_probability"],
@@ -261,6 +269,7 @@ async def get_tip(match_id: str):
         tier_signals=tip["tier_signals"],
         justification=tip["justification"],
         skip_reason=tip.get("skip_reason"),
+        qbot_logic=tip.get("qbot_logic"),
         generated_at=ensure_utc(tip["generated_at"]),
     )
 
@@ -268,6 +277,38 @@ async def get_tip(match_id: str):
 # ---------------------------------------------------------------------------
 # Admin endpoints
 # ---------------------------------------------------------------------------
+
+@router.post("/{match_id}/refresh")
+async def refresh_single_tip(match_id: str, admin=Depends(get_admin_user)):
+    """Recalculate Q-Tip for a single match and return full metrics (admin only)."""
+    match = await _db.db.matches.find_one({"_id": ObjectId(match_id)})
+    if not match:
+        raise HTTPException(status_code=404, detail="Match not found.")
+
+    tip = await generate_quotico_tip(match)
+
+    if match.get("status") == "final" and match.get("result", {}).get("outcome"):
+        tip = resolve_tip(tip, match)
+
+    # Enrich with Qbot intelligence (graceful — skips if no strategy)
+    try:
+        tip = await enrich_tip(tip)
+    except Exception:
+        logger.warning("Qbot enrichment failed for %s", match_id, exc_info=True)
+
+    # Upsert into DB
+    await _db.db.quotico_tips.replace_one(
+        {"match_id": match_id}, tip, upsert=True,
+    )
+
+    # Serialise for JSON (ObjectId / datetime)
+    tip.pop("_id", None)
+    for key in ("match_date", "generated_at", "resolved_at"):
+        if key in tip and tip[key] is not None:
+            tip[key] = ensure_utc(tip[key]).isoformat()
+
+    return tip
+
 
 @router.post("/scan")
 async def scan_tips(admin=Depends(get_admin_user)):

@@ -68,14 +68,23 @@ export const useBattlesStore = defineStore("battles", () => {
   }
 
   async function fetchBattle(battleId: string) {
-    currentBattle.value = await api.get<Battle>(`/battles/${battleId}`);
+    try {
+      currentBattle.value = await api.get<Battle>(`/battles/${battleId}`);
+    } catch {
+      currentBattle.value = null;
+    }
   }
 
   async function commitToBattle(battleId: string, squadId: string) {
-    await api.post(`/battles/${battleId}/commit`, { squad_id: squadId });
-    toast.success("Commitment bestätigt!");
-    await fetchBattle(battleId);
-    await fetchMyBattles();
+    try {
+      await api.post(`/battles/${battleId}/commit`, { squad_id: squadId });
+      toast.success("Commitment bestätigt!");
+      await fetchBattle(battleId);
+      await fetchMyBattles();
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : "Fehler beim Commitment.");
+      throw e;
+    }
   }
 
   async function createChallenge(

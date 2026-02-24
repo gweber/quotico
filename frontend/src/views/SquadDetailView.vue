@@ -155,13 +155,21 @@ async function nativeShare() {
 }
 
 async function handleLeave() {
-  await squads.leaveSquad(squadId.value);
-  router.push("/squads");
+  try {
+    await squads.leaveSquad(squadId.value);
+    router.push("/squads");
+  } catch {
+    // Toast shown by store
+  }
 }
 
 async function handleDelete() {
-  await squads.deleteSquad(squadId.value);
-  router.push("/squads");
+  try {
+    await squads.deleteSquad(squadId.value);
+    router.push("/squads");
+  } catch {
+    // Toast shown by store
+  }
 }
 
 function startEditDescription() {
@@ -170,10 +178,14 @@ function startEditDescription() {
 }
 
 async function saveDescription() {
-  const desc = descriptionDraft.value.trim() || null;
-  await squads.updateSquad(squadId.value, desc);
-  editingDescription.value = false;
-  toast.success(t('squadDetail.descriptionUpdated'));
+  try {
+    const desc = descriptionDraft.value.trim() || null;
+    await squads.updateSquad(squadId.value, desc);
+    editingDescription.value = false;
+    toast.success(t('squadDetail.descriptionUpdated'));
+  } catch {
+    // Toast shown by store
+  }
 }
 </script>
 

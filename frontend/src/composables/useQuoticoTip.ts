@@ -39,6 +39,37 @@ export interface TierSignals {
     diff: number;
     contributes: boolean;
   };
+  xg_performance?: {
+    home: { avg_goals: number; avg_xg: number | null; delta: number | null; matches_with_xg: number; matches_total: number; label: string };
+    away: { avg_goals: number; avg_xg: number | null; delta: number | null; matches_with_xg: number; matches_total: number; label: string };
+  } | null;
+}
+
+export interface PlayerPrediction {
+  archetype: string;
+  reasoning_key: string;
+  reasoning_params: Record<string, string | number>;
+  predicted_outcome: string;
+  predicted_score: { home: number; away: number };
+  score_probability: number;
+  outcome_probability: number;
+  is_mandatory_tip: boolean;
+}
+
+export interface QbotLogic {
+  strategy_version: string;
+  // Investor mode fields (absent for no_signal tips)
+  archetype?: string;
+  reasoning_key?: string;
+  reasoning_params?: Record<string, string | number>;
+  stake_units?: number;
+  kelly_raw?: number;
+  bayesian_confidence?: number;
+  cluster_key?: string;
+  cluster_sample_size?: number;
+  // Player mode (always present when Poisson data available)
+  player?: PlayerPrediction;
+  applied_at: string;
 }
 
 export interface QuoticoTip {
@@ -49,6 +80,7 @@ export interface QuoticoTip {
   match_date: string;
   recommended_selection: string;
   confidence: number;
+  raw_confidence?: number;
   edge_pct: number;
   true_probability: number;
   implied_probability: number;
@@ -58,10 +90,17 @@ export interface QuoticoTip {
   justification: string;
   skip_reason: string | null;
   generated_at: string;
+  // Present on resolved tips (admin refresh)
+  actual_result?: string;
+  was_correct?: boolean;
+  status?: string;
+  // Qbot Intelligence enrichment (present when active strategy exists)
+  qbot_logic?: QbotLogic;
 }
 
 // Shared reactive cache keyed by match_id (reactive so computed() tracks changes)
-const tipCache = reactive(new Map<string, QuoticoTip>());
+// A null value means "we checked and no tip exists" (negative cache).
+const tipCache = reactive(new Map<string, QuoticoTip | null>());
 
 /**
  * Prefetch QuoticoTips for the given match IDs (or all active tips if no IDs given).
@@ -83,8 +122,15 @@ export async function prefetchQuoticoTips(
     if (sportKey) params.sport_key = sportKey;
 
     const tips = await api.get<QuoticoTip[]>("/quotico-tips/", params);
+    const returned = new Set(tips.map((t) => t.match_id));
     for (const tip of tips) {
       tipCache.set(tip.match_id, tip);
+    }
+    // Negative cache: mark requested IDs that had no tip
+    if (matchIds) {
+      for (const id of matchIds) {
+        if (!returned.has(id)) tipCache.set(id, null);
+      }
     }
   } catch {
     // Prefetch failed — individual fetches will try as fallback
@@ -97,7 +143,7 @@ export async function prefetchQuoticoTips(
 export async function refreshQuoticoTips(sportKey?: string): Promise<void> {
   if (sportKey) {
     for (const [key, tip] of tipCache) {
-      if (tip.sport_key === sportKey) tipCache.delete(key);
+      if (tip?.sport_key === sportKey) tipCache.delete(key);
     }
   } else {
     tipCache.clear();
@@ -120,7 +166,18 @@ export function populateTipCache(tips: QuoticoTip[]): void {
  * Returns undefined if no tip is cached for this match.
  */
 export function getCachedTip(matchId: string): QuoticoTip | undefined {
-  return tipCache.get(matchId);
+  return tipCache.get(matchId) ?? undefined;
+}
+
+/**
+ * Admin-only: recalculate a single Q-Tip and return full metrics.
+ * Updates the shared cache with the fresh tip.
+ */
+export async function refreshSingleTip(matchId: string): Promise<QuoticoTip> {
+  const api = useApi();
+  const tip = await api.post<QuoticoTip>(`/quotico-tips/${matchId}/refresh`);
+  tipCache.set(matchId, tip);
+  return tip;
 }
 
 export function useQuoticoTip() {
@@ -130,10 +187,9 @@ export function useQuoticoTip() {
   const error = ref(false);
 
   async function fetch(matchId: string) {
-    // Check cache first
-    const cached = tipCache.get(matchId);
-    if (cached) {
-      data.value = cached;
+    // Check cache first (null = known absent, undefined = unknown)
+    if (tipCache.has(matchId)) {
+      data.value = tipCache.get(matchId) ?? null;
       return;
     }
 
@@ -147,6 +203,7 @@ export function useQuoticoTip() {
     } catch {
       error.value = true;
       data.value = null;
+      tipCache.set(matchId, null); // Negative cache on 404
     } finally {
       loading.value = false;
     }

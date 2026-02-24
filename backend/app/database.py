@@ -343,5 +343,23 @@ async def _ensure_indexes() -> None:
         [("status", 1), ("was_correct", 1), ("match_date", -1)]
     )
 
+    # ---- Qbot Intelligence ----
+
+    await db.qbot_strategies.create_index(
+        [("is_active", 1), ("sport_key", 1)],
+        unique=True,
+        partialFilterExpression={"is_active": True},
+    )
+    await db.qbot_strategies.create_index("created_at")
+
+    await db.qbot_cluster_stats.create_index("sport_key")
+    # _id = cluster_key string, no additional unique index needed
+
     # ---- Engine Config (calibration) ----
     # _id = sport_key, no indexes needed (6 docs max, all lookups by _id)
+
+    # ---- Engine Config History (time machine snapshots) ----
+    await db.engine_config_history.create_index(
+        [("sport_key", 1), ("snapshot_date", 1)],
+        unique=True,
+    )

@@ -11,6 +11,8 @@ import time as _time
 from datetime import datetime, timedelta
 from typing import Optional
 
+import numpy as np
+
 from pydantic import BaseModel
 
 import app.database as _db
@@ -95,6 +97,20 @@ LEAGUE_MARGIN_SIGMA: dict[str, float] = {
 }
 MARGIN_SIGMA_DEFAULT = 13.0         # Fallback for unknown 2-way sports
 
+# xG hybrid blending — blend actual goals with Expected Goals when available
+XG_BLEND_WEIGHT = 0.6  # 60% xG + 40% actual
+
+
+def blend_goals(actual: float, xg: float | None, weight: float = XG_BLEND_WEIGHT) -> float:
+    """Blend actual goals with xG when available.
+
+    Returns ``actual * (1 - weight) + xg * weight`` if xG is present,
+    otherwise falls back to the raw actual value.
+    """
+    if xg is None:
+        return actual
+    return actual * (1.0 - weight) + xg * weight
+
 
 # ---------------------------------------------------------------------------
 # Engine config cache — calibrated params from optimizer (DB-backed)
@@ -108,7 +124,8 @@ _ENGINE_CONFIG_TTL = 3600  # 1 hour
 async def _get_engine_params(sport_key: str) -> dict:
     """Load calibrated parameters from DB, with in-memory cache + fallback.
 
-    Returns dict with keys: rho, alpha_time_decay, alpha_weight_floor.
+    Returns dict with keys: rho, alpha_time_decay, alpha_weight_floor,
+    reliability (None if not yet analyzed).
     Falls back to hardcoded defaults when no engine_config doc exists.
     """
     global _engine_config_cache, _engine_config_expires
@@ -118,6 +135,7 @@ async def _get_engine_params(sport_key: str) -> dict:
         try:
             docs = await _db.db.engine_config.find({}, {
                 "rho": 1, "alpha_time_decay": 1, "alpha_weight_floor": 1,
+                "reliability": 1,
             }).to_list(length=20)
             _engine_config_cache = {d["_id"]: d for d in docs}
         except Exception:
@@ -130,6 +148,7 @@ async def _get_engine_params(sport_key: str) -> dict:
         "rho": cfg.get("rho", LEAGUE_RHO.get(sport_key, DIXON_COLES_RHO_DEFAULT)),
         "alpha_time_decay": cfg.get("alpha_time_decay", ALPHA_TIME_DECAY),
         "alpha_weight_floor": cfg.get("alpha_weight_floor", ALPHA_WEIGHT_FLOOR),
+        "reliability": cfg.get("reliability"),
     }
 
 
@@ -145,6 +164,7 @@ class QuoticoTipResponse(BaseModel):
     match_date: datetime
     recommended_selection: str
     confidence: float
+    raw_confidence: float | None = None
     edge_pct: float
     true_probability: float
     implied_probability: float
@@ -153,12 +173,37 @@ class QuoticoTipResponse(BaseModel):
     tier_signals: dict
     justification: str
     skip_reason: str | None = None
+    qbot_logic: dict | None = None
     generated_at: datetime
 
 
-def _no_signal_bet(match: dict, reason: str) -> dict:
+def _no_signal_bet(
+    match: dict,
+    reason: str,
+    *,
+    poisson_data: dict | None = None,
+    player_prediction: dict | None = None,
+) -> dict:
     """Build a stored tip with status 'no_signal' and skip_reason."""
-    return {
+    tier_signals: dict = {}
+    eg_home = 0.0
+    eg_away = 0.0
+
+    if poisson_data:
+        eg_home = poisson_data.get("lambda_home", 0.0)
+        eg_away = poisson_data.get("lambda_away", 0.0)
+        tier_signals["poisson"] = {
+            "lambda_home": round(eg_home, 2),
+            "lambda_away": round(eg_away, 2),
+            "h2h_weight": round(poisson_data.get("h2h_weight", 0.0), 2),
+            "true_probs": {
+                "1": round(poisson_data.get("prob_home", 0.33), 4),
+                "X": round(poisson_data.get("prob_draw", 0.33), 4),
+                "2": round(poisson_data.get("prob_away", 0.33), 4),
+            },
+        }
+
+    tip = {
         "match_id": str(match["_id"]),
         "sport_key": match["sport_key"],
         "home_team": match["home_team"],
@@ -169,9 +214,9 @@ def _no_signal_bet(match: dict, reason: str) -> dict:
         "edge_pct": 0.0,
         "true_probability": 0.0,
         "implied_probability": 0.0,
-        "expected_goals_home": 0.0,
-        "expected_goals_away": 0.0,
-        "tier_signals": {},
+        "expected_goals_home": round(eg_home, 2),
+        "expected_goals_away": round(eg_away, 2),
+        "tier_signals": tier_signals,
         "justification": "",
         "skip_reason": reason,
         "status": "no_signal",
@@ -179,6 +224,11 @@ def _no_signal_bet(match: dict, reason: str) -> dict:
         "was_correct": None,
         "generated_at": utcnow(),
     }
+
+    if player_prediction:
+        tip["player_prediction"] = player_prediction
+
+    return tip
 
 
 # ---------------------------------------------------------------------------
@@ -254,6 +304,58 @@ def _dixon_coles_adjustment(
     return max(adj, DIXON_COLES_ADJ_FLOOR)
 
 
+# ---------------------------------------------------------------------------
+# Score matrix + Player Mode prediction
+# ---------------------------------------------------------------------------
+
+_FACTORIAL_LUT = np.array([math.factorial(k) for k in range(20)], dtype=np.float64)
+
+
+def generate_score_matrix(
+    lambda_home: float,
+    lambda_away: float,
+    rho: float = DIXON_COLES_RHO_DEFAULT,
+    max_goals: int = 6,
+) -> np.ndarray:
+    """Dixon-Coles corrected Poisson score probability matrix (max_goals x max_goals)."""
+    goals = np.arange(max_goals)
+    home_pmf = np.exp(-lambda_home) * (lambda_home ** goals) / _FACTORIAL_LUT[:max_goals]
+    away_pmf = np.exp(-lambda_away) * (lambda_away ** goals) / _FACTORIAL_LUT[:max_goals]
+    matrix = np.outer(home_pmf, away_pmf)
+
+    # Dixon-Coles correction on low scorelines
+    matrix[0, 0] *= max(1 - lambda_home * lambda_away * rho, DIXON_COLES_ADJ_FLOOR)
+    matrix[1, 0] *= max(1 + lambda_away * rho, DIXON_COLES_ADJ_FLOOR)
+    matrix[0, 1] *= max(1 + lambda_home * rho, DIXON_COLES_ADJ_FLOOR)
+    matrix[1, 1] *= max(1 - rho, DIXON_COLES_ADJ_FLOOR)
+
+    matrix = np.maximum(matrix, 0.0)
+    total = matrix.sum()
+    if total > 0:
+        matrix /= total
+    return matrix
+
+
+def compute_player_prediction(poisson: dict) -> dict:
+    """Compute Player Mode prediction: highest-probability outcome + peak exact score."""
+    matrix = generate_score_matrix(
+        poisson["lambda_home"], poisson["lambda_away"], poisson.get("rho", DIXON_COLES_RHO_DEFAULT),
+    )
+    idx = np.argmax(matrix)
+    h, a = np.unravel_index(idx, matrix.shape)
+
+    true_probs = {"1": poisson["prob_home"], "X": poisson["prob_draw"], "2": poisson["prob_away"]}
+    best_outcome = max(true_probs, key=true_probs.get)
+
+    return {
+        "predicted_outcome": best_outcome,
+        "predicted_score": {"home": int(h), "away": int(a)},
+        "score_probability": round(float(matrix[h, a]), 4),
+        "outcome_probability": round(true_probs[best_outcome], 4),
+        "is_mandatory_tip": True,
+    }
+
+
 async def _get_rest_days(team_key: str, match_date: datetime) -> int:
     """Compute days since last competitive match (across ALL competitions)."""
     last_match = await _db.db.matches.find_one(
@@ -294,34 +396,40 @@ def _calculate_fatigue_penalty(home_rest: int, away_rest: int) -> tuple[float, f
 
 
 async def _get_league_averages(
+    sport_key: str,
     related_keys: list[str],
     *,
     before_date: datetime | None = None,
 ) -> tuple[float, float] | None:
-    """Compute league average home/away goals from last 2 seasons of historical data."""
-    match_filter: dict = {"sport_key": {"$in": related_keys}, "status": "final"}
-    if before_date:
-        match_filter["match_date"] = {"$lt": before_date}
-    pipeline = [
-        {"$match": match_filter},
-        {"$sort": {"match_date": -1}},
-        {"$limit": 1000},  # ~2 seasons of top-flight football
-        {"$group": {
-            "_id": None,
-            "total_home": {"$sum": "$result.home_score"},
-            "total_away": {"$sum": "$result.away_score"},
-            "count": {"$sum": 1},
-        }},
-    ]
-    results = await _db.db.matches.aggregate(pipeline).to_list(length=1)
-    if not results or results[0]["count"] < 50:
-        return None
+    """Compute league average home/away goals from last 2 seasons of historical data.
 
-    count = results[0]["count"]
-    return (
-        results[0]["total_home"] / count,
-        results[0]["total_away"] / count,
-    )
+    Uses exact sport_key first (each league has different scoring patterns).
+    Falls back to related_keys if the single league has < 50 matches.
+    """
+    for filter_keys in ([sport_key], related_keys):
+        match_filter: dict = {"sport_key": {"$in": filter_keys}, "status": "final"}
+        if before_date:
+            match_filter["match_date"] = {"$lt": before_date}
+        pipeline = [
+            {"$match": match_filter},
+            {"$sort": {"match_date": -1}},
+            {"$limit": 1000},  # ~2 seasons of top-flight football
+            {"$group": {
+                "_id": None,
+                "total_home": {"$sum": "$result.home_score"},
+                "total_away": {"$sum": "$result.away_score"},
+                "count": {"$sum": 1},
+            }},
+        ]
+        results = await _db.db.matches.aggregate(pipeline).to_list(length=1)
+        if results and results[0]["count"] >= 50:
+            count = results[0]["count"]
+            return (
+                results[0]["total_home"] / count,
+                results[0]["total_away"] / count,
+            )
+
+    return None
 
 
 async def _get_team_home_matches(
@@ -334,7 +442,8 @@ async def _get_team_home_matches(
         query["match_date"] = {"$lt": before_date}
     return await _db.db.matches.find(
         query,
-        {"_id": 0, "result.home_score": 1, "result.away_score": 1, "match_date": 1},
+        {"_id": 0, "result.home_score": 1, "result.away_score": 1,
+         "result.home_xg": 1, "result.away_xg": 1, "match_date": 1},
     ).sort("match_date", -1).to_list(length=limit)
 
 
@@ -348,7 +457,8 @@ async def _get_team_away_matches(
         query["match_date"] = {"$lt": before_date}
     return await _db.db.matches.find(
         query,
-        {"_id": 0, "result.home_score": 1, "result.away_score": 1, "match_date": 1},
+        {"_id": 0, "result.home_score": 1, "result.away_score": 1,
+         "result.home_xg": 1, "result.away_xg": 1, "match_date": 1},
     ).sort("match_date", -1).to_list(length=limit)
 
 
@@ -370,7 +480,7 @@ async def compute_poisson_probabilities(
     # Load calibrated (or default) parameters for this league
     params = await _get_engine_params(sport_key)
 
-    league_avgs = await _get_league_averages(related_keys, before_date=before_date)
+    league_avgs = await _get_league_averages(sport_key, related_keys, before_date=before_date)
     if not league_avgs:
         return None
 
@@ -391,14 +501,14 @@ async def compute_poisson_probabilities(
     cal_alpha = params["alpha_time_decay"]
     cal_floor = params["alpha_weight_floor"]
 
-    # Home team attack/defense (from their home matches) — time-weighted
-    home_goals_scored = [m["result"]["home_score"] for m in home_home_matches]
-    home_goals_conceded = [m["result"]["away_score"] for m in home_home_matches]
+    # Home team attack/defense (from their home matches) — time-weighted, xG-blended
+    home_goals_scored = [blend_goals(m["result"]["home_score"], m["result"].get("home_xg")) for m in home_home_matches]
+    home_goals_conceded = [blend_goals(m["result"]["away_score"], m["result"].get("away_xg")) for m in home_home_matches]
     home_match_dates = [m["match_date"] for m in home_home_matches]
 
-    # Away team attack/defense (from their away matches) — time-weighted
-    away_goals_scored = [m["result"]["away_score"] for m in away_away_matches]
-    away_goals_conceded = [m["result"]["home_score"] for m in away_away_matches]
+    # Away team attack/defense (from their away matches) — time-weighted, xG-blended
+    away_goals_scored = [blend_goals(m["result"]["away_score"], m["result"].get("away_xg")) for m in away_away_matches]
+    away_goals_conceded = [blend_goals(m["result"]["home_score"], m["result"].get("home_xg")) for m in away_away_matches]
     away_match_dates = [m["match_date"] for m in away_away_matches]
 
     home_attack = _time_weighted_average(
@@ -457,6 +567,48 @@ async def compute_poisson_probabilities(
     prob_draw = sum(matrix[i][i] for i in range(SCORELINE_MAX))
     prob_away = sum(matrix[i][j] for i in range(SCORELINE_MAX) for j in range(SCORELINE_MAX) if i < j)
 
+    # xG performance: actual goals vs xG across recent matches per team
+    def _xg_perf(matches: list[dict], is_home: bool) -> dict:
+        goals_key = "home_score" if is_home else "away_score"
+        xg_key = "home_xg" if is_home else "away_xg"
+        total_goals = 0.0
+        total_xg = 0.0
+        xg_count = 0
+        for m in matches:
+            r = m.get("result", {})
+            total_goals += r.get(goals_key, 0)
+            xg = r.get(xg_key)
+            if xg is not None:
+                total_xg += xg
+                xg_count += 1
+        n = len(matches)
+        avg_goals = total_goals / n if n else 0.0
+        avg_xg = total_xg / xg_count if xg_count else None
+        if avg_xg is not None:
+            delta = round(avg_goals - avg_xg, 2)
+            if delta > 0.3:
+                label = "overperformer"
+            elif delta < -0.3:
+                label = "underperformer"
+            else:
+                label = "neutral"
+        else:
+            delta = None
+            label = "no_data"
+        return {
+            "avg_goals": round(avg_goals, 2),
+            "avg_xg": round(avg_xg, 2) if avg_xg is not None else None,
+            "delta": delta,
+            "matches_with_xg": xg_count,
+            "matches_total": n,
+            "label": label,
+        }
+
+    xg_performance = {
+        "home": _xg_perf(home_home_matches, is_home=True),
+        "away": _xg_perf(away_away_matches, is_home=False),
+    }
+
     return {
         "lambda_home": lambda_home,
         "lambda_away": lambda_away,
@@ -467,6 +619,7 @@ async def compute_poisson_probabilities(
         "home_rest_days": home_rest,
         "away_rest_days": away_rest,
         "rho": rho,
+        "xg_performance": xg_performance,
     }
 
 
@@ -592,11 +745,11 @@ def _compute_h2h_lambdas(
         # Adjust perspective: match home_team may be current away_team
         m_result = m.get("result", {})
         if m.get("home_team_key") == home_key:
-            sum_home_goals += m_result.get("home_score", 0) * weight
-            sum_away_goals += m_result.get("away_score", 0) * weight
+            sum_home_goals += blend_goals(m_result.get("home_score", 0), m_result.get("home_xg")) * weight
+            sum_away_goals += blend_goals(m_result.get("away_score", 0), m_result.get("away_xg")) * weight
         else:
-            sum_home_goals += m_result.get("away_score", 0) * weight
-            sum_away_goals += m_result.get("home_score", 0) * weight
+            sum_home_goals += blend_goals(m_result.get("away_score", 0), m_result.get("away_xg")) * weight
+            sum_away_goals += blend_goals(m_result.get("home_score", 0), m_result.get("home_xg")) * weight
 
         total_weight += weight
 
@@ -1138,6 +1291,22 @@ def _calculate_confidence(
     return max(confidence, 0.10)
 
 
+def _apply_reliability(raw_confidence: float, reliability: dict) -> float:
+    """Apply meta-learned reliability calibration to a raw confidence score.
+
+    Transforms: raw → scaled → regressed → capped.
+    """
+    adjusted = raw_confidence * reliability.get("multiplier", 1.0)
+
+    reg = reliability.get("regression_factor", 0.0)
+    if reg > 0:
+        avg_wr = reliability.get("avg_win_rate", 0.333)
+        adjusted = (1 - reg) * adjusted + reg * avg_wr
+
+    adjusted = min(adjusted, reliability.get("cap", 0.95))
+    return max(adjusted, 0.10)
+
+
 # ---------------------------------------------------------------------------
 # Justification builder
 # ---------------------------------------------------------------------------
@@ -1253,6 +1422,11 @@ async def generate_quotico_tip(match: dict, *, before_date: datetime | None = No
         # 2-way sports (NBA/NFL): Try Gaussian Margin Model first
         return await _generate_two_way_bet(match, before_date=before_date)
 
+    # Load engine params (includes reliability if analyzed)
+    engine_params = await _get_engine_params(sport_key)
+    # Reliability only for live tips, not backfill (prevents circular dependency)
+    reliability = engine_params.get("reliability") if before_date is None else None
+
     related_keys = sport_keys_for(sport_key)
     home_team = match["home_team"]
     away_team = match["away_team"]
@@ -1302,7 +1476,11 @@ async def generate_quotico_tip(match: dict, *, before_date: datetime | None = No
     best_edge = edges[best_outcome]
 
     if best_edge < EDGE_THRESHOLD_PCT:
-        return _no_signal_bet(match, f"No value bet found (best edge: {best_edge:.1f}% < {EDGE_THRESHOLD_PCT}%)")
+        player_pred = compute_player_prediction(poisson)
+        return _no_signal_bet(
+            match, f"No value bet found (best edge: {best_edge:.1f}% < {EDGE_THRESHOLD_PCT}%)",
+            poisson_data=poisson, player_prediction=player_pred,
+        )
 
     # Tier 2: Form & Momentum
     home_form = context.get("home_form") or []
@@ -1333,11 +1511,12 @@ async def generate_quotico_tip(match: dict, *, before_date: datetime | None = No
     }
 
     # Confidence
-    confidence = _calculate_confidence(
+    raw_confidence = _calculate_confidence(
         best_edge, momentum_gap, home_momentum, away_momentum, sharp, kings, best_outcome,
         h2h_summary=h2h_summary, evd_home=evd_home, evd_away=evd_away,
         rest_advantage=rest_advantage,
     )
+    confidence = _apply_reliability(raw_confidence, reliability) if reliability else raw_confidence
 
     # Justification
     justification = _build_justification(
@@ -1357,6 +1536,7 @@ async def generate_quotico_tip(match: dict, *, before_date: datetime | None = No
         "match_date": match["match_date"],
         "recommended_selection": best_outcome,
         "confidence": round(confidence, 3),
+        "raw_confidence": round(raw_confidence, 3),
         "edge_pct": round(best_edge, 2),
         "true_probability": round(true_prob, 4),
         "implied_probability": round(imp_prob, 4),
@@ -1395,8 +1575,10 @@ async def generate_quotico_tip(match: dict, *, before_date: datetime | None = No
                 "away": evd_away,
             },
             "rest_advantage": rest_advantage,
+            "xg_performance": poisson.get("xg_performance"),
         },
         "justification": justification,
+        "player_prediction": compute_player_prediction(poisson),
         "status": "active",
         "actual_result": None,
         "was_correct": None,
@@ -1414,6 +1596,10 @@ async def _generate_two_way_bet(match: dict, *, before_date: datetime | None = N
     current_odds = match.get("odds", {}).get("h2h", {})
     match_id = str(match["_id"])
     related_keys = sport_keys_for(sport_key)
+
+    # Load engine params (includes reliability if analyzed)
+    engine_params = await _get_engine_params(sport_key)
+    reliability = engine_params.get("reliability") if before_date is None else None
     home_team = match["home_team"]
     away_team = match["away_team"]
 
@@ -1488,10 +1674,11 @@ async def _generate_two_way_bet(match: dict, *, before_date: datetime | None = N
         }
 
         # Confidence using full suite
-        confidence = _calculate_confidence(
+        raw_confidence = _calculate_confidence(
             edge_pct, momentum_gap, home_momentum, away_momentum, sharp, kings, best_outcome,
             evd_home=evd_home, evd_away=evd_away, rest_advantage=rest_signals,
         )
+        confidence = _apply_reliability(raw_confidence, reliability) if reliability else raw_confidence
 
         margin_signals = {
             "expected_margin": round(margin["expected_margin"], 1),
@@ -1536,7 +1723,8 @@ async def _generate_two_way_bet(match: dict, *, before_date: datetime | None = N
         # Confidence ceiling 0.70
         base = 0.40 + (momentum_gap * 0.5)
         sharp_boost = 0.10 if (sharp["has_sharp_movement"] and sharp["direction"] == best_outcome) else 0.0
-        confidence = min(base + sharp_boost, 0.70)
+        raw_confidence = min(base + sharp_boost, 0.70)
+        confidence = _apply_reliability(raw_confidence, reliability) if reliability else raw_confidence
         justification = (
             f"Recommendation: {match.get('home_team' if best_outcome == '1' else 'away_team', '?')} ({best_outcome}). "
             f"Based on form analysis (momentum gap: {momentum_gap:.0%})."
@@ -1553,6 +1741,7 @@ async def _generate_two_way_bet(match: dict, *, before_date: datetime | None = N
         "match_date": match["match_date"],
         "recommended_selection": best_outcome,
         "confidence": round(confidence, 3),
+        "raw_confidence": round(raw_confidence, 3),
         "edge_pct": round(edge_pct, 2),
         "true_probability": round(true_prob, 4),
         "implied_probability": round(imp_prob, 4),
@@ -1574,6 +1763,7 @@ async def _generate_two_way_bet(match: dict, *, before_date: datetime | None = N
                 "away": evd_away,
             },
             "rest_advantage": rest_signals,
+            "xg_performance": None,
         },
         "justification": justification,
         "status": "active",

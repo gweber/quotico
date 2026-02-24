@@ -16,6 +16,7 @@ when accuracy degrades relative to the rolling history average.
 
 import logging
 import math
+import time as _time
 from bisect import bisect_left
 from datetime import datetime, timedelta
 from typing import TypedDict
@@ -39,6 +40,7 @@ from app.services.quotico_tip_service import (
     _dixon_coles_adjustment,
     _poisson_pmf,
     _time_weighted_average,
+    blend_goals,
 )
 from app.services.team_mapping_service import resolve_team_key
 from app.utils import ensure_utc, utcnow
@@ -112,16 +114,24 @@ class MatchCalibrationData(TypedDict):
 
 async def _fetch_calibration_matches(
     sport_key: str, window_days: int = CALIBRATION_WINDOW_DAYS,
+    before_date: datetime | None = None,
 ) -> list[dict]:
-    """Fetch resolved matches with odds + scores for calibration."""
-    cutoff = utcnow() - timedelta(days=window_days)
-    related_keys = sport_keys_for(sport_key)
+    """Fetch resolved matches with odds + scores for calibration.
+
+    Uses exact sport_key (not related_keys) so each league is calibrated
+    on its own population — different leagues have different dynamics.
+
+    When *before_date* is set, only matches played before that date are
+    considered (point-in-time calibration for the time machine).
+    """
+    reference = before_date or utcnow()
+    cutoff = reference - timedelta(days=window_days)
 
     matches = await _db.db.matches.find(
         {
-            "sport_key": {"$in": related_keys},
+            "sport_key": sport_key,
             "status": "final",
-            "match_date": {"$gte": cutoff},
+            "match_date": {"$gte": cutoff, "$lt": reference},
             "result.home_score": {"$exists": True},
             "result.away_score": {"$exists": True},
             "odds.h2h.1": {"$gt": 0},
@@ -154,6 +164,7 @@ def _determine_actual_result(match: dict) -> str | None:
 
 async def _prefetch_match_data(
     matches: list[dict], sport_key: str,
+    before_date: datetime | None = None,
 ) -> list[MatchCalibrationData]:
     """Fetch-once, slice-per-match strategy for temporal-leak-free calibration data.
 
@@ -161,6 +172,9 @@ async def _prefetch_match_data(
     2. For each calibration match: bisect the pre-fetched arrays at match_date
        to get only prior entries (temporal leakage boundary)
     3. League averages computed once (stable across calibration window)
+
+    When *before_date* is set, team histories and league averages are capped
+    at that date (point-in-time calibration).
     """
     related_keys = sport_keys_for(sport_key)
 
@@ -188,36 +202,51 @@ async def _prefetch_match_data(
     team_away: dict[str, list[dict]] = {}
     team_all: dict[str, list[dict]] = {}  # For rest-day lookup
 
-    projection = {"result.home_score": 1, "result.away_score": 1, "match_date": 1,
-                  "home_team_key": 1, "away_team_key": 1}
+    projection = {"result.home_score": 1, "result.away_score": 1,
+                  "result.home_xg": 1, "result.away_xg": 1,
+                  "match_date": 1, "home_team_key": 1, "away_team_key": 1}
 
-    for tk in team_keys:
+    # When before_date is set, cap team history to avoid loading future data
+    date_cap: dict = {}
+    if before_date:
+        date_cap = {"match_date": {"$lt": before_date}}
+
+    total_teams = len(team_keys)
+    for ti, tk in enumerate(team_keys, 1):
         # Home matches
         home_docs = await _db.db.matches.find(
-            {"home_team_key": tk, "sport_key": {"$in": related_keys}, "status": "final"},
+            {"home_team_key": tk, "sport_key": {"$in": related_keys}, "status": "final",
+             **date_cap},
             projection,
         ).sort("match_date", 1).to_list(length=200)
         team_home[tk] = home_docs
 
         # Away matches
         away_docs = await _db.db.matches.find(
-            {"away_team_key": tk, "sport_key": {"$in": related_keys}, "status": "final"},
+            {"away_team_key": tk, "sport_key": {"$in": related_keys}, "status": "final",
+             **date_cap},
             projection,
         ).sort("match_date", 1).to_list(length=200)
         team_away[tk] = away_docs
 
-        # All matches for rest days (cross-competition)
+        # All matches for rest days (cross-competition but within soccer)
         all_docs = await _db.db.matches.find(
-            {"$or": [{"home_team_key": tk}, {"away_team_key": tk}], "status": "final"},
+            {"$or": [{"home_team_key": tk}, {"away_team_key": tk}],
+             "sport_key": {"$in": related_keys}, "status": "final",
+             **date_cap},
             {"match_date": 1},
         ).sort("match_date", 1).to_list(length=500)
         team_all[tk] = all_docs
 
-    # --- 3. League averages (compute once from full window) ---
-    cutoff = utcnow() - timedelta(days=CALIBRATION_WINDOW_DAYS)
+        if ti % 10 == 0 or ti == total_teams:
+            logger.info("  Prefetch: %d/%d teams fetched", ti, total_teams)
+
+    # --- 3. League averages (exact sport_key — each league has different scoring patterns) ---
+    reference = before_date or utcnow()
+    cutoff = reference - timedelta(days=CALIBRATION_WINDOW_DAYS)
     avg_pipeline = [
-        {"$match": {"sport_key": {"$in": related_keys}, "status": "final",
-                     "match_date": {"$gte": cutoff}}},
+        {"$match": {"sport_key": sport_key, "status": "final",
+                     "match_date": {"$gte": cutoff, "$lt": reference}}},
         {"$sort": {"match_date": -1}},
         {"$limit": 1000},
         {"$group": {
@@ -274,13 +303,13 @@ async def _prefetch_match_data(
         if len(h_home_slice) < MIN_MATCHES_REQUIRED or len(a_away_slice) < MIN_MATCHES_REQUIRED:
             continue
 
-        # Extract goals + dates for time-weighted averaging
-        home_scored = [d["result"]["home_score"] for d in h_home_slice]
-        home_conceded = [d["result"]["away_score"] for d in h_home_slice]
+        # Extract goals + dates for time-weighted averaging (xG-blended when available)
+        home_scored = [blend_goals(d["result"]["home_score"], d["result"].get("home_xg")) for d in h_home_slice]
+        home_conceded = [blend_goals(d["result"]["away_score"], d["result"].get("away_xg")) for d in h_home_slice]
         home_dates = [d["match_date"] for d in h_home_slice]
 
-        away_scored = [d["result"]["away_score"] for d in a_away_slice]
-        away_conceded = [d["result"]["home_score"] for d in a_away_slice]
+        away_scored = [blend_goals(d["result"]["away_score"], d["result"].get("away_xg")) for d in a_away_slice]
+        away_conceded = [blend_goals(d["result"]["home_score"], d["result"].get("home_xg")) for d in a_away_slice]
         away_dates = [d["match_date"] for d in a_away_slice]
 
         # Rest days: find last final match before match_date (cross-competition)
@@ -290,7 +319,7 @@ async def _prefetch_match_data(
             idx = bisect_left(all_dates_, match_dt)
             if idx > 0:
                 delta = (match_dt - all_dates_[idx - 1]).days
-                return max(delta, 0)
+                return min(max(delta, 0), 14)  # Cap at 14d — longer gaps are data issues
             return 7  # REST_DEFAULT_DAYS
 
         home_rest = _rest_from_all(hk)
@@ -524,10 +553,17 @@ def _build_grid(
 # Calibration
 # ---------------------------------------------------------------------------
 
-async def calibrate_league(sport_key: str, mode: str = "refinement") -> dict:
+async def calibrate_league(
+    sport_key: str, mode: str = "refinement",
+    before_date: datetime | None = None,
+) -> dict:
     """Run grid search calibration for a single league.
 
     Returns summary dict with best params, scores, and landscape analysis.
+
+    When *before_date* is set the calibration is retroactive (point-in-time)
+    and the live ``engine_config`` document is **not** modified — the caller
+    is responsible for storing results (e.g. in ``engine_config_history``).
     """
     # Load current config (or defaults)
     existing = await _db.db.engine_config.find_one({"_id": sport_key})
@@ -544,13 +580,13 @@ async def calibrate_league(sport_key: str, mode: str = "refinement") -> dict:
     defaults = _get_defaults(sport_key)
 
     # Fetch and prefetch calibration data
-    matches = await _fetch_calibration_matches(sport_key)
+    matches = await _fetch_calibration_matches(sport_key, before_date=before_date)
     if len(matches) < MIN_CALIBRATION_MATCHES:
         logger.warning("Skipping %s: only %d matches (need %d)",
                        sport_key, len(matches), MIN_CALIBRATION_MATCHES)
         return {"sport_key": sport_key, "status": "skipped", "matches": len(matches)}
 
-    all_data = await _prefetch_match_data(matches, sport_key)
+    all_data = await _prefetch_match_data(matches, sport_key, before_date=before_date)
     if len(all_data) < MIN_CALIBRATION_MATCHES:
         logger.warning("Skipping %s: only %d usable data points after prefetch",
                        sport_key, len(all_data))
@@ -566,8 +602,10 @@ async def calibrate_league(sport_key: str, mode: str = "refinement") -> dict:
     best_params: tuple[float, float, float] | None = None
     best_rbs = float("inf")
     worst_rbs = float("-inf")
+    grid_size = len(grid)
+    grid_t0 = _time.monotonic()
 
-    for rho, alpha, floor in grid:
+    for gi, (rho, alpha, floor) in enumerate(grid, 1):
         result = _evaluate_params(all_data, rho, alpha, floor, defaults)
         rbs = result["regularized_brier"]
 
@@ -577,6 +615,10 @@ async def calibrate_league(sport_key: str, mode: str = "refinement") -> dict:
             best_params = (rho, alpha, floor)
         if rbs > worst_rbs:
             worst_rbs = rbs
+
+        if gi % 100 == 0 or gi == grid_size:
+            elapsed = _time.monotonic() - grid_t0
+            logger.info("  Grid search: %d/%d combos evaluated (%.1fs)", gi, grid_size, elapsed)
 
     if not best_params or not best_result:
         return {"sport_key": sport_key, "status": "error", "reason": "no valid grid point"}
@@ -598,54 +640,92 @@ async def calibrate_league(sport_key: str, mode: str = "refinement") -> dict:
 
     rho_best, alpha_best, floor_best = best_params
 
-    # Upsert to engine_config
-    now = utcnow()
-    history_entry = {
-        "date": now,
-        "pure_brier": best_result["pure_brier"],
-        "regularized_brier": best_result["regularized_brier"],
-        "calibration_error": best_result["calibration_error"],
-        "matches": best_result["evaluated"],
-        "rho": rho_best,
-        "alpha": alpha_best,
-        "floor": floor_best,
-        "mode": mode,
-    }
+    # Extract league baselines from prefetched data
+    baselines = None
+    if all_data:
+        baselines = {
+            "avg_home": round(all_data[0]["league_avg_home"], 3),
+            "avg_away": round(all_data[0]["league_avg_away"], 3),
+        }
 
-    await _db.db.engine_config.update_one(
-        {"_id": sport_key},
-        {
-            "$set": {
-                "rho": rho_best,
-                "alpha_time_decay": alpha_best,
-                "alpha_weight_floor": floor_best,
-                "last_calibrated": now,
-                "calibration_mode": mode,
-                "calibration_matches": best_result["evaluated"],
-                "pure_brier": best_result["pure_brier"],
-                "regularized_brier": best_result["regularized_brier"],
-                "calibration_error": best_result["calibration_error"],
-                "log_likelihood": best_result["log_likelihood"],
-                "grid_landscape": {
-                    "best_rbs": round(best_rbs, 6),
-                    "worst_rbs": round(worst_rbs, 6),
-                    "range": round(worst_rbs - best_rbs, 6),
+    # Upsert to engine_config (only for live calibration, not retroactive)
+    if before_date is None:
+        now = utcnow()
+        history_entry = {
+            "date": now,
+            "pure_brier": best_result["pure_brier"],
+            "regularized_brier": best_result["regularized_brier"],
+            "calibration_error": best_result["calibration_error"],
+            "matches": best_result["evaluated"],
+            "rho": rho_best,
+            "alpha": alpha_best,
+            "floor": floor_best,
+            "mode": mode,
+        }
+
+        await _db.db.engine_config.update_one(
+            {"_id": sport_key},
+            {
+                "$set": {
+                    "rho": rho_best,
+                    "alpha_time_decay": alpha_best,
+                    "alpha_weight_floor": floor_best,
+                    "last_calibrated": now,
+                    "calibration_mode": mode,
+                    "calibration_matches": best_result["evaluated"],
+                    "pure_brier": best_result["pure_brier"],
+                    "regularized_brier": best_result["regularized_brier"],
+                    "calibration_error": best_result["calibration_error"],
+                    "log_likelihood": best_result["log_likelihood"],
+                    "grid_landscape": {
+                        "best_rbs": round(best_rbs, 6),
+                        "worst_rbs": round(worst_rbs, 6),
+                        "range": round(worst_rbs - best_rbs, 6),
+                    },
+                },
+                "$push": {
+                    "brier_history": {
+                        "$each": [history_entry],
+                        "$slice": -BRIER_HISTORY_MAX,
+                    },
                 },
             },
-            "$push": {
-                "brier_history": {
-                    "$each": [history_entry],
-                    "$slice": -BRIER_HISTORY_MAX,
+            upsert=True,
+        )
+
+        # Append snapshot to engine_config_history for future backfills
+        await _db.db.engine_config_history.update_one(
+            {"sport_key": sport_key, "snapshot_date": now},
+            {"$set": {
+                "sport_key": sport_key,
+                "snapshot_date": now,
+                "params": {
+                    "rho": rho_best,
+                    "alpha": alpha_best,
+                    "floor": floor_best,
                 },
-            },
-        },
-        upsert=True,
-    )
+                "scores": {
+                    "pure_brier": best_result["pure_brier"],
+                    "regularized_brier": best_result["regularized_brier"],
+                    "calibration_error": best_result["calibration_error"],
+                },
+                "baselines": baselines,
+                "reliability": None,
+                "meta": {
+                    "matches_analyzed": best_result["evaluated"],
+                    "mode": mode,
+                    "is_retroactive": False,
+                    "landscape_range": round(worst_rbs - best_rbs, 6),
+                },
+            }},
+            upsert=True,
+        )
 
     logger.info(
-        "Calibrated %s (%s): ρ=%.2f, α=%.3f, floor=%.2f, "
+        "Calibrated %s (%s%s): ρ=%.2f, α=%.3f, floor=%.2f, "
         "BS=%.4f, RBS=%.4f, CE=%s, landscape=[%.4f..%.4f] (N=%d)",
-        sport_key, mode, rho_best, alpha_best, floor_best,
+        sport_key, mode, f", as-of {before_date:%Y-%m-%d}" if before_date else "",
+        rho_best, alpha_best, floor_best,
         best_result["pure_brier"], best_result["regularized_brier"],
         best_result["calibration_error"],
         best_rbs, worst_rbs, best_result["evaluated"],
@@ -659,6 +739,7 @@ async def calibrate_league(sport_key: str, mode: str = "refinement") -> dict:
         "calibration_error": best_result["calibration_error"],
         "evaluated": best_result["evaluated"],
         "landscape_range": round(worst_rbs - best_rbs, 6),
+        "baselines": baselines,
     }
 
 
@@ -679,13 +760,12 @@ async def evaluate_engine_performance() -> dict:
         if not config:
             continue
 
-        # Fetch recent resolved matches (same criteria as calibration)
+        # Fetch recent resolved matches (same criteria as calibration — exact sport_key)
         cutoff = utcnow() - timedelta(days=EVAL_WINDOW_DAYS)
-        related_keys = sport_keys_for(sport_key)
 
         eval_matches = await _db.db.matches.find(
             {
-                "sport_key": {"$in": related_keys},
+                "sport_key": sport_key,
                 "status": "final",
                 "match_date": {"$gte": cutoff},
                 "result.home_score": {"$exists": True},

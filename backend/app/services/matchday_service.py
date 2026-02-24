@@ -72,10 +72,21 @@ def _favorite_prediction(match: dict) -> tuple[int, int]:
 
 
 def _qbot_prediction(quotico_tip: dict | None) -> tuple[int, int] | None:
-    """Convert a QuoticoTip recommendation to a score prediction."""
+    """Convert a QuoticoTip recommendation to a score prediction.
+
+    Prefers Player Mode exact score from qbot_logic.player if available.
+    Falls back to outcome-based default mapping.
+    """
     if not quotico_tip:
         return None
 
+    # Prefer Player Mode exact score
+    player = (quotico_tip.get("qbot_logic") or {}).get("player")
+    if player and player.get("predicted_score"):
+        s = player["predicted_score"]
+        return (s.get("home", 1), s.get("away", 1))
+
+    # Fallback to outcome-based mapping
     sel = quotico_tip.get("recommended_selection")
     if sel == "1":
         return (2, 1)  # Home win

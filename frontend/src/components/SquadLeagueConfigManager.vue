@@ -19,17 +19,18 @@ const matchday = useMatchdayStore();
 const toast = useToast();
 const saving = ref(false);
 const showAddMenu = ref(false);
+const addModePick = ref<GameModeType>("classic");
 
 const sportLabels = SPORT_LABELS;
 
-const modes = computed<{ value: GameModeType; label: string }[]>(() => [
-  { value: "classic", label: t("gameModes.classic") },
-  { value: "moneyline", label: t("gameModes.moneyline") },
-  { value: "bankroll", label: t("gameModes.bankroll") },
-  { value: "survivor", label: t("gameModes.survivor") },
-  { value: "over_under", label: t("gameModes.overUnder") },
-  { value: "fantasy", label: t("gameModes.fantasy") },
-]);
+const modes: { value: GameModeType; label: string }[] = [
+  { value: "classic", label: "Classic" },
+  { value: "moneyline", label: "Moneyline" },
+  { value: "bankroll", label: "Bankroll" },
+  { value: "survivor", label: "Survivor" },
+  { value: "over_under", label: "Over/Under" },
+  { value: "fantasy", label: "Fantasy" },
+];
 
 const activeConfigs = computed(() =>
   squadsStore.getActiveLeagueConfigs(props.squadId)
@@ -46,23 +47,12 @@ const availableToAdd = computed(() =>
 async function addLeague(sportKey: string) {
   saving.value = true;
   try {
-    await squadsStore.setLeagueConfig(props.squadId, sportKey, "classic");
+    await squadsStore.setLeagueConfig(props.squadId, sportKey, addModePick.value);
     toast.success(
       `${sportLabels[sportKey] || sportKey} ${t("common.added")}`
     );
     showAddMenu.value = false;
-  } catch (e: unknown) {
-    toast.error(e instanceof Error ? e.message : t("common.error"));
-  } finally {
-    saving.value = false;
-  }
-}
-
-async function changeMode(sportKey: string, newMode: GameModeType) {
-  saving.value = true;
-  try {
-    await squadsStore.setLeagueConfig(props.squadId, sportKey, newMode);
-    toast.success(t("squadDetail.modeChanged"));
+    addModePick.value = "classic";
   } catch (e: unknown) {
     toast.error(e instanceof Error ? e.message : t("common.error"));
   } finally {
@@ -119,19 +109,7 @@ async function removeLeague(sportKey: string) {
         </div>
 
         <div class="flex items-center gap-2 ml-3">
-          <select
-            v-if="isAdmin"
-            :value="config.game_mode"
-            class="text-xs bg-surface-2 border border-surface-3 rounded px-2 py-1 text-text-primary"
-            :disabled="saving"
-            @change="changeMode(config.sport_key, ($event.target as HTMLSelectElement).value as GameModeType)"
-          >
-            <option v-for="m in modes" :key="m.value" :value="m.value">
-              {{ m.label }}
-            </option>
-          </select>
           <span
-            v-else
             class="text-xs px-2 py-1 rounded bg-primary/10 text-primary font-medium"
           >
             {{ $t(GAME_MODE_I18N_KEYS[config.game_mode]) }}
@@ -172,17 +150,30 @@ async function removeLeague(sportKey: string) {
     <!-- Add league menu -->
     <div
       v-if="showAddMenu && isAdmin"
-      class="bg-surface-1 border border-surface-3 rounded-lg p-2 space-y-1"
+      class="bg-surface-1 border border-surface-3 rounded-lg p-3 space-y-2"
     >
-      <button
-        v-for="sport in availableToAdd"
-        :key="sport.sport_key"
-        class="w-full text-left px-3 py-2 rounded text-sm text-text-primary hover:bg-surface-2 transition-colors"
-        :disabled="saving"
-        @click="addLeague(sport.sport_key)"
-      >
-        {{ sportLabels[sport.sport_key] || sport.sport_key }}
-      </button>
+      <div class="flex items-center gap-2">
+        <span class="text-xs text-text-muted">{{ $t('squadDetail.gameMode') }}:</span>
+        <select
+          v-model="addModePick"
+          class="text-xs bg-surface-2 border border-surface-3 rounded px-2 py-1 text-text-primary"
+        >
+          <option v-for="m in modes" :key="m.value" :value="m.value">
+            {{ m.label }}
+          </option>
+        </select>
+      </div>
+      <div class="space-y-1">
+        <button
+          v-for="sport in availableToAdd"
+          :key="sport.sport_key"
+          class="w-full text-left px-3 py-2 rounded text-sm text-text-primary hover:bg-surface-2 transition-colors"
+          :disabled="saving"
+          @click="addLeague(sport.sport_key)"
+        >
+          {{ sportLabels[sport.sport_key] || sport.sport_key }}
+        </button>
+      </div>
     </div>
   </div>
 </template>
