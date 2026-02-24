@@ -13,7 +13,7 @@ export interface Squad {
   member_count: number;
   is_admin: boolean;
   league_configs: LeagueConfig[];
-  auto_tipp_blocked: boolean;
+  auto_bet_blocked: boolean;
   lock_minutes: number;
   is_public: boolean;
   is_open: boolean;
@@ -181,10 +181,10 @@ export const useSquadsStore = defineStore("squads", () => {
     await fetchMySquads();
   }
 
-  async function toggleAutoTipp(squadId: string, blocked: boolean) {
-    await api.patch(`/squads/${squadId}/auto-tipp`, { blocked });
+  async function toggleAutoBet(squadId: string, blocked: boolean) {
+    await api.patch(`/squads/${squadId}/auto-bet`, { blocked });
     const idx = squads.value.findIndex((s) => s.id === squadId);
-    if (idx !== -1) squads.value[idx].auto_tipp_blocked = blocked;
+    if (idx !== -1) squads.value[idx].auto_bet_blocked = blocked;
   }
 
   async function setLockMinutes(squadId: string, minutes: number) {
@@ -259,7 +259,7 @@ export const useSquadsStore = defineStore("squads", () => {
     getActiveLeagueConfigs,
     setLeagueConfig,
     removeLeagueConfig,
-    toggleAutoTipp,
+    toggleAutoBet,
     setLockMinutes,
     setVisibility,
     setInviteVisible,

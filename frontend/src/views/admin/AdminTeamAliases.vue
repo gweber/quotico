@@ -28,6 +28,7 @@ const canonicalEntries = ref<CanonicalEntry[]>([]);
 const aliasTotal = ref(0);
 const canonicalTotal = ref(0);
 const loading = ref(true);
+const error = ref(false);
 const search = ref("");
 const sportKeyFilter = ref("");
 const sourceFilter = ref("");
@@ -59,6 +60,7 @@ const sportKeys = [
 
 async function fetchAliases() {
   loading.value = true;
+  error.value = false;
   try {
     const params = new URLSearchParams();
     if (search.value) params.set("search", search.value);
@@ -70,6 +72,8 @@ async function fetchAliases() {
     );
     aliases.value = result.items;
     aliasTotal.value = result.total;
+  } catch {
+    error.value = true;
   } finally {
     loading.value = false;
   }
@@ -77,6 +81,7 @@ async function fetchAliases() {
 
 async function fetchCanonical() {
   loading.value = true;
+  error.value = false;
   try {
     const params = new URLSearchParams();
     if (search.value) params.set("search", search.value);
@@ -88,6 +93,8 @@ async function fetchCanonical() {
     );
     canonicalEntries.value = result.items;
     canonicalTotal.value = result.total;
+  } catch {
+    error.value = true;
   } finally {
     loading.value = false;
   }
@@ -390,8 +397,14 @@ onMounted(() => {
       </button>
     </div>
 
+    <!-- Error -->
+    <div v-if="error" class="text-center py-12">
+      <p class="text-text-muted mb-3">Error loading.</p>
+      <button class="text-sm text-primary hover:underline" @click="fetchCurrent">Try again</button>
+    </div>
+
     <!-- Filters -->
-    <div class="flex gap-3 mb-4">
+    <div v-if="!error" class="flex gap-3 mb-4">
       <input
         v-model="search"
         placeholder="Suche (Name oder Key)..."
@@ -419,7 +432,7 @@ onMounted(() => {
 
     <!-- Canonical Map Table -->
     <div
-      v-if="tab === 'canonical'"
+      v-if="tab === 'canonical' && !error"
       class="bg-surface-1 rounded-card border border-surface-3/50 overflow-hidden"
     >
       <div class="px-4 py-3 border-b border-surface-3/30">
@@ -542,7 +555,7 @@ onMounted(() => {
 
     <!-- DB Aliases Table -->
     <div
-      v-if="tab === 'db'"
+      v-if="tab === 'db' && !error"
       class="bg-surface-1 rounded-card border border-surface-3/50 overflow-hidden"
     >
       <div class="px-4 py-3 border-b border-surface-3/30">

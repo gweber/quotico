@@ -1,12 +1,14 @@
 <script setup lang="ts">
 import { ref, onMounted } from "vue";
 import { useRouter } from "vue-router";
+import { useI18n } from "vue-i18n";
 import { useAuthStore } from "@/stores/auth";
 import { useApi } from "@/composables/useApi";
 import { useToast } from "@/composables/useToast";
 import TwoFaSetup from "@/components/TwoFaSetup.vue";
 import AliasEditor from "@/components/AliasEditor.vue";
 
+const { t } = useI18n();
 const router = useRouter();
 const auth = useAuthStore();
 const api = useApi();
@@ -45,18 +47,6 @@ interface SecurityEvent {
 const securityLog = ref<SecurityEvent[]>([]);
 const securityLogLoading = ref(true);
 
-const actionLabels: Record<string, string> = {
-  LOGIN_SUCCESS: "Anmeldung",
-  LOGIN_FAILED: "Fehlgeschlagene Anmeldung",
-  REGISTER: "Registrierung",
-  AGE_VERIFIED: "Altersverifikation",
-  "2FA_ENABLED": "2FA aktiviert",
-  "2FA_DISABLED": "2FA deaktiviert",
-  ALIAS_CHANGED: "Spielername geändert",
-  DATA_EXPORTED: "Datenexport",
-  ACCOUNT_DELETED: "Konto gelöscht",
-  TERMS_ACCEPTED: "AGB akzeptiert",
-};
 
 async function fetchSecurityLog() {
   try {
@@ -84,9 +74,9 @@ async function exportData() {
     a.download = "quotico-datenexport.json";
     a.click();
     URL.revokeObjectURL(url);
-    toast.success("Datenexport heruntergeladen.");
+    toast.success(t('settings.exportSuccess'));
   } catch (e: unknown) {
-    const msg = e instanceof Error ? e.message : "Export fehlgeschlagen.";
+    const msg = e instanceof Error ? e.message : t('settings.exportFailed');
     toast.error(msg);
   } finally {
     exporting.value = false;
@@ -103,11 +93,11 @@ async function deleteAccount() {
   deleting.value = true;
   try {
     await api.del("/gdpr/account");
-    toast.success("Dein Konto wurde gelöscht.");
+    toast.success(t('deleteAccount.success'));
     auth.user = null;
     router.push("/");
   } catch (e: unknown) {
-    const msg = e instanceof Error ? e.message : "Löschen fehlgeschlagen.";
+    const msg = e instanceof Error ? e.message : t('deleteAccount.error');
     toast.error(msg);
   } finally {
     deleting.value = false;
@@ -118,26 +108,26 @@ async function deleteAccount() {
 <template>
   <div class="max-w-2xl mx-auto px-4 py-8 space-y-6">
     <div>
-      <h1 class="text-2xl font-bold text-text-primary">Einstellungen</h1>
+      <h1 class="text-2xl font-bold text-text-primary">{{ $t('settings.heading') }}</h1>
       <p class="text-sm text-text-secondary mt-1">
-        Konto und Sicherheit verwalten.
+        {{ $t('settings.description') }}
       </p>
     </div>
 
     <!-- Account info -->
     <div class="bg-surface-1 rounded-card p-6">
-      <h2 class="text-lg font-semibold text-text-primary mb-4">Konto</h2>
+      <h2 class="text-lg font-semibold text-text-primary mb-4">{{ $t('settings.account') }}</h2>
       <dl class="space-y-3">
         <div class="flex items-center justify-between">
-          <dt class="text-sm text-text-secondary">E-Mail</dt>
+          <dt class="text-sm text-text-secondary">{{ $t('settings.email') }}</dt>
           <dd class="text-sm font-medium text-text-primary">{{ auth.user?.email }}</dd>
         </div>
         <div class="flex items-center justify-between">
-          <dt class="text-sm text-text-secondary">Punkte</dt>
+          <dt class="text-sm text-text-secondary">{{ $t('settings.points') }}</dt>
           <dd class="text-sm font-mono font-bold text-primary">{{ auth.user?.points?.toFixed(1) ?? "0.0" }}</dd>
         </div>
         <div class="flex items-center justify-between">
-          <dt class="text-sm text-text-secondary">Mitglied seit</dt>
+          <dt class="text-sm text-text-secondary">{{ $t('settings.memberSince') }}</dt>
           <dd class="text-sm text-text-primary">
             {{ auth.user?.created_at
               ? new Date(auth.user.created_at).toLocaleDateString("de-DE", { day: "numeric", month: "long", year: "numeric" })
@@ -170,7 +160,7 @@ async function deleteAccount() {
         </div>
       </div>
       <p v-if="!badgesLoading && badges.filter(b => b.awarded_at).length === 0" class="text-sm text-text-muted mt-3">
-        Noch keine Badges verdient. Gib Tipps ab, um Badges freizuschalten!
+        {{ $t('settings.noBadges') }}
       </p>
     </div>
 
@@ -182,9 +172,9 @@ async function deleteAccount() {
 
     <!-- Security Log -->
     <div class="bg-surface-1 rounded-card p-6">
-      <h2 class="text-lg font-semibold text-text-primary mb-1">Sicherheitsprotokoll</h2>
+      <h2 class="text-lg font-semibold text-text-primary mb-1">{{ $t('settings.securityLog') }}</h2>
       <p class="text-sm text-text-secondary mb-4">
-        Deine letzten Anmeldungen und Sicherheitsänderungen.
+        {{ $t('settings.securityLogDescription') }}
       </p>
 
       <div v-if="securityLogLoading" class="space-y-2">
@@ -192,16 +182,16 @@ async function deleteAccount() {
       </div>
 
       <div v-else-if="securityLog.length === 0" class="text-sm text-text-muted">
-        Keine Einträge vorhanden.
+        {{ $t('settings.noEntries') }}
       </div>
 
       <div v-else class="overflow-x-auto -mx-6 px-6">
         <table class="w-full text-sm">
           <thead>
             <tr class="text-left text-text-muted border-b border-surface-3">
-              <th class="pb-2 pr-4 font-medium">Datum</th>
-              <th class="pb-2 pr-4 font-medium">Aktion</th>
-              <th class="pb-2 font-medium">IP</th>
+              <th class="pb-2 pr-4 font-medium">{{ $t('settings.date') }}</th>
+              <th class="pb-2 pr-4 font-medium">{{ $t('settings.action') }}</th>
+              <th class="pb-2 font-medium">{{ $t('settings.ip') }}</th>
             </tr>
           </thead>
           <tbody>
@@ -214,7 +204,7 @@ async function deleteAccount() {
                 {{ new Date(entry.timestamp).toLocaleString("de-DE", { day: "2-digit", month: "2-digit", year: "numeric", hour: "2-digit", minute: "2-digit" }) }}
               </td>
               <td class="py-2 pr-4 text-text-primary">
-                {{ actionLabels[entry.action] || entry.action }}
+                {{ $t(`settings.securityActions.${entry.action}`) }}
               </td>
               <td class="py-2 text-text-muted font-mono text-xs">
                 {{ entry.ip_truncated || "-" }}
@@ -227,9 +217,9 @@ async function deleteAccount() {
 
     <!-- GDPR Export -->
     <div class="bg-surface-1 rounded-card p-6">
-      <h2 class="text-lg font-semibold text-text-primary mb-1">Datenexport (DSGVO)</h2>
+      <h2 class="text-lg font-semibold text-text-primary mb-1">{{ $t('settings.gdprHeading') }}</h2>
       <p class="text-sm text-text-secondary mb-4">
-        Lade alle deine gespeicherten Daten als JSON-Datei herunter.
+        {{ $t('settings.gdprDescription') }}
       </p>
       <button
         :disabled="exporting"
@@ -242,21 +232,20 @@ async function deleteAccount() {
               <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4" fill="none" />
               <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
             </svg>
-            Wird exportiert...
+            {{ $t('settings.exporting') }}
           </span>
         </template>
         <template v-else>
-          Daten herunterladen
+          {{ $t('settings.download') }}
         </template>
       </button>
     </div>
 
     <!-- Danger zone: Account deletion -->
     <div class="bg-surface-1 rounded-card p-6 border border-danger/20">
-      <h2 class="text-lg font-semibold text-danger mb-1">Konto löschen</h2>
+      <h2 class="text-lg font-semibold text-danger mb-1">{{ $t('deleteAccount.heading') }}</h2>
       <p class="text-sm text-text-secondary mb-4">
-        Dein Konto wird anonymisiert. Deine Tipps bleiben anonym in der Datenbank,
-        aber deine E-Mail und persönlichen Daten werden unwiderruflich entfernt.
+        {{ $t('deleteAccount.description') }}
       </p>
 
       <button
@@ -264,13 +253,13 @@ async function deleteAccount() {
         class="px-4 py-2 rounded-lg text-sm border border-danger/30 text-danger hover:bg-danger-muted/10 transition-colors"
         @click="showDeleteConfirm = true"
       >
-        Konto löschen...
+        {{ $t('deleteAccount.deleting') }}
       </button>
 
       <Transition name="fade">
         <div v-if="showDeleteConfirm" class="mt-4 p-4 bg-danger-muted/10 rounded-lg">
           <p class="text-sm text-text-primary mb-3">
-            Gib <strong class="text-danger">LÖSCHEN</strong> ein, um dein Konto unwiderruflich zu löschen.
+            {{ $t('deleteAccount.instruction') }}
           </p>
           <div class="flex gap-3">
             <input
@@ -284,14 +273,14 @@ async function deleteAccount() {
               class="px-4 py-2 rounded-lg text-sm bg-danger text-white hover:bg-danger-hover transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
               @click="deleteAccount"
             >
-              Endgültig löschen
+              {{ $t('deleteAccount.finalDelete') }}
             </button>
           </div>
           <button
             class="mt-2 text-sm text-text-muted hover:text-text-secondary transition-colors"
             @click="showDeleteConfirm = false; deleteConfirmText = ''"
           >
-            Abbrechen
+            {{ $t('common.cancel') }}
           </button>
         </div>
       </Transition>

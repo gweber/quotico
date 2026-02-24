@@ -31,7 +31,7 @@ async def get_or_create_wallet(
     # Get squad config for initial balance
     squad = await _db.db.squads.find_one({"_id": ObjectId(squad_id)})
     if not squad:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Squad nicht gefunden.")
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Squad not found.")
 
     # Try league_configs first, fall back to legacy game_mode_config
     from app.services.squad_league_service import get_active_league_config
@@ -74,7 +74,7 @@ async def get_or_create_wallet(
         tx_type=TransactionType.INITIAL_CREDIT,
         amount=float(initial_balance),
         balance_after=float(initial_balance),
-        description=f"Startguthaben {sport_key} Saison {season}",
+        description=f"Initial balance {sport_key} season {season}",
     )
 
     logger.info(
@@ -109,7 +109,7 @@ async def deduct_stake(
     if not wallet:
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST,
-            "Nicht genug Coins oder Wallet gesperrt.",
+            "Not enough coins or wallet frozen.",
         )
 
     await _log_transaction(
@@ -243,7 +243,7 @@ async def apply_progressive_daily_bonus() -> int:
             tx_type=TransactionType.DAILY_BONUS,
             amount=bonus_amount,
             balance_after=new_balance,
-            description=f"Progressiver Tagesbonus (Tag {new_days})",
+            description=f"Progressive daily bonus (day {new_days})",
         )
         applied += 1
 

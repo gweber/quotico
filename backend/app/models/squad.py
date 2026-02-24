@@ -7,7 +7,7 @@ from pydantic import BaseModel
 class LeagueConfig(BaseModel):
     """A single league configuration within a squad."""
     sport_key: str
-    game_mode: str  # classic | bankroll | survivor | over_under | fantasy | spieltag
+    game_mode: str  # classic | bankroll | survivor | over_under | fantasy | matchday
     config: Dict[str, Any] = {}
     activated_at: datetime
     deactivated_at: Optional[datetime] = None
@@ -26,7 +26,7 @@ class SquadInDB(BaseModel):
     game_mode: str = "classic"
     game_mode_config: Dict[str, Any] = {}
     game_mode_changed_at: Optional[datetime] = None
-    auto_tipp_blocked: bool = False
+    auto_bet_blocked: bool = False
     lock_minutes: int = 15
     is_public: bool = True  # Public squads appear in search; private only via invite/ID
     is_open: bool = True  # If True, users can request to join; if False, squad is locked
@@ -65,7 +65,7 @@ class SquadResponse(BaseModel):
     member_count: int
     is_admin: bool = False
     league_configs: List[LeagueConfigResponse] = []
-    auto_tipp_blocked: bool = False
+    auto_bet_blocked: bool = False
     lock_minutes: int = 15
     is_public: bool = True
     is_open: bool = True
@@ -82,7 +82,7 @@ class SquadLeaderboardEntry(BaseModel):
     user_id: str
     email: str  # Masked for privacy
     points: float
-    tip_count: int
+    bet_count: int
     avg_odds: float
 
 
@@ -104,11 +104,11 @@ class WarRoomSelection(BaseModel):
 class WarRoomMember(BaseModel):
     user_id: str
     alias: str
-    has_tipped: bool
+    has_bet: bool
     is_self: bool = False
     selection: Optional[WarRoomSelection] = None
     locked_odds: Optional[float] = None
-    tip_status: Optional[str] = None  # pending / won / lost / void
+    bet_status: Optional[str] = None  # pending / won / lost / void
     points_earned: Optional[float] = None
     is_currently_winning: Optional[bool] = None
 
@@ -116,18 +116,17 @@ class WarRoomMember(BaseModel):
 class WarRoomMatch(BaseModel):
     id: str
     sport_key: str
-    teams: Dict[str, str]
-    commence_time: datetime
+    home_team: str
+    away_team: str
+    match_date: datetime
     status: str
-    current_odds: Dict[str, float]
-    result: Optional[str] = None
-    home_score: Optional[int] = None
-    away_score: Optional[int] = None
+    odds: Dict = {}
+    result: Dict = {}
 
 
 class WarRoomConsensus(BaseModel):
     percentages: Dict[str, float]  # e.g. {"1": 70.0, "X": 20.0, "2": 10.0}
-    total_tippers: int
+    total_bettors: int
 
 
 class WarRoomResponse(BaseModel):

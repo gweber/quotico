@@ -1,7 +1,8 @@
 <script setup lang="ts">
 import { ref, watch, onMounted, computed } from "vue";
+import { useI18n } from "vue-i18n";
 import { useRoute, useRouter } from "vue-router";
-import { useSpieltagStore } from "@/stores/spieltag";
+import { useMatchdayStore } from "@/stores/matchday";
 import { useAuthStore } from "@/stores/auth";
 import { useSquadsStore, type Squad } from "@/stores/squads";
 import { useWalletStore } from "@/stores/wallet";
@@ -9,10 +10,10 @@ import { useSurvivorStore } from "@/stores/survivor";
 import { useFantasyStore } from "@/stores/fantasy";
 import { useToast } from "@/composables/useToast";
 import { refreshQuoticoTips } from "@/composables/useQuoticoTip";
-import SpieltagMatchCard from "@/components/SpieltagMatchCard.vue";
+import MatchdayMatchCard from "@/components/MatchdayMatchCard.vue";
 import SeasonTrack from "@/components/SeasonTrack.vue";
-import AutoTippSelector from "@/components/AutoTippSelector.vue";
-import SpieltagLeaderboard from "@/components/SpieltagLeaderboard.vue";
+import AutoBetSelector from "@/components/AutoBetSelector.vue";
+import MatchdayLeaderboard from "@/components/MatchdayLeaderboard.vue";
 import WalletBar from "@/components/WalletBar.vue";
 import WalletDisclaimer from "@/components/WalletDisclaimer.vue";
 import BankrollBetCard from "@/components/BankrollBetCard.vue";
@@ -24,12 +25,13 @@ import OverUnderLeaderboard from "@/components/OverUnderLeaderboard.vue";
 import FantasyPickCard from "@/components/FantasyPickCard.vue";
 import FantasyStandings from "@/components/FantasyStandings.vue";
 import ParlayBuilder from "@/components/ParlayBuilder.vue";
-import QuotentippCard from "@/components/QuotentippCard.vue";
+import MoneylineCard from "@/components/MoneylineCard.vue";
 import AdminPredictionPanel from "@/components/AdminPredictionPanel.vue";
 
+const { t } = useI18n();
 const route = useRoute();
 const router = useRouter();
-const spieltag = useSpieltagStore();
+const matchday = useMatchdayStore();
 const auth = useAuthStore();
 const squadsStore = useSquadsStore();
 const walletStore = useWalletStore();
@@ -38,7 +40,7 @@ const fantasyStore = useFantasyStore();
 const toast = useToast();
 
 import { SPORT_LABELS } from "@/types/sports";
-import { GAME_MODE_LABELS } from "@/types/league";
+import { GAME_MODE_I18N_KEYS } from "@/types/league";
 
 const sportLabels = SPORT_LABELS;
 
@@ -59,13 +61,13 @@ const activeGameMode = computed(() => {
   );
 });
 
-const autoTippBlocked = computed(() => {
+const autoBetBlocked = computed(() => {
   if (!selectedSquad.value) return false;
-  return !!selectedSquad.value.auto_tipp_blocked;
+  return !!selectedSquad.value.auto_bet_blocked;
 });
 
 // Only show squads that have at least one active league config
-const spieltagSquads = computed(() =>
+const matchdaySquads = computed(() =>
   squadsStore.squads.filter((s) =>
     s.league_configs?.some((lc) => !lc.deactivated_at)
   )
@@ -73,23 +75,24 @@ const spieltagSquads = computed(() =>
 
 // Filter sports to only those configured in the selected squad
 const availableSports = computed(() => {
-  if (!selectedSquad.value?.league_configs?.length) return spieltag.sports;
+  if (!selectedSquad.value?.league_configs?.length) return matchday.sports;
   const configured = new Set(
     selectedSquad.value.league_configs
       .filter((lc) => !lc.deactivated_at)
       .map((lc) => lc.sport_key)
   );
-  if (configured.size === 0) return spieltag.sports;
-  return spieltag.sports.filter((s) => configured.has(s.sport_key));
+  if (configured.size === 0) return matchday.sports;
+  return matchday.sports.filter((s) => configured.has(s.sport_key));
 });
 
 // Determine which matchday is selected
 const selectedMatchdayId = ref<string | null>(null);
 
 const currentMatchdayLabel = computed(
-  () => spieltag.currentMatchday?.label || "Spieltag"
+  () => matchday.currentMatchday?.label || t("matchday.title")
 );
 
+const error = ref(false);
 const refreshingTips = ref(false);
 
 async function handleRefreshTips() {
@@ -103,20 +106,20 @@ async function handleRefreshTips() {
 
 const hasUnsavedChanges = computed(() => {
   if (activeGameMode.value !== "classic") return false;
-  if (!spieltag.predictions) return spieltag.draftPredictions.size > 0;
+  if (!matchday.predictions) return matchday.draftPredictions.size > 0;
   const saved = new Map(
-    spieltag.predictions.predictions.map((p) => [
+    matchday.predictions.predictions.map((p) => [
       p.match_id,
       { home: p.home_score, away: p.away_score },
     ])
   );
-  for (const [matchId, draft] of spieltag.draftPredictions) {
+  for (const [matchId, draft] of matchday.draftPredictions) {
     const s = saved.get(matchId);
     if (!s || s.home !== draft.home || s.away !== draft.away) return true;
   }
   return (
-    spieltag.draftAutoStrategy !==
-    (spieltag.predictions.auto_tipp_strategy || "none")
+    matchday.draftAutoStrategy !==
+    (matchday.predictions.auto_bet_strategy || "none")
   );
 });
 
@@ -126,18 +129,18 @@ const parlayAvailable = computed(() =>
 );
 
 const totalMatchdays = computed(() => {
-  const sport = spieltag.sports.find((s) => s.sport_key === selectedSport.value);
-  return sport?.matchdays_per_season ?? spieltag.matchdays.length;
+  const sport = matchday.sports.find((s) => s.sport_key === selectedSport.value);
+  return sport?.matchdays_per_season ?? matchday.matchdays.length;
 });
 
 async function loadSport(sport: string, fromRoute = false) {
   selectedSport.value = sport;
-  spieltag.setSport(sport);
-  await spieltag.fetchMatchdays(sport);
+  matchday.setSport(sport);
+  await matchday.fetchMatchdays(sport);
 
-  if (fromRoute && route.params.matchday && spieltag.matchdays.length > 0) {
+  if (fromRoute && route.params.matchday && matchday.matchdays.length > 0) {
     const mdNum = parseInt(route.params.matchday as string);
-    const md = spieltag.matchdays.find((m) => m.matchday_number === mdNum);
+    const md = matchday.matchdays.find((m) => m.matchday_number === mdNum);
     if (md) {
       await selectMatchday(md.id);
       return;
@@ -147,34 +150,38 @@ async function loadSport(sport: string, fromRoute = false) {
   // Prefer the next fully tippable matchday (upcoming), then fall back
   // to in_progress (partially tippable), then the last completed one.
   const current =
-    spieltag.matchdays.find((md) => md.status === "upcoming") ||
-    spieltag.matchdays.find((md) => md.status === "in_progress") ||
-    spieltag.matchdays[spieltag.matchdays.length - 1];
+    matchday.matchdays.find((md) => md.status === "upcoming") ||
+    matchday.matchdays.find((md) => md.status === "in_progress") ||
+    matchday.matchdays[matchday.matchdays.length - 1];
   if (current) {
     await selectMatchday(current.id);
   }
 }
 
 function handleDragPreview(matchdayId: string | null) {
-  if (matchdayId) spieltag.previewCached(matchdayId);
+  if (matchdayId) matchday.previewCached(matchdayId);
 }
 
 async function selectMatchday(id: string) {
-  selectedMatchdayId.value = id;
-  await spieltag.fetchMatchdayDetail(id, selectedSquad.value?.id);
+  try {
+    selectedMatchdayId.value = id;
+    await matchday.fetchMatchdayDetail(id, selectedSquad.value?.id);
 
-  if (auth.isLoggedIn) {
-    await spieltag.fetchPredictions(id);
-    await loadGameModeData(id);
-  }
-  const md = spieltag.currentMatchday;
-  if (md) {
-    router.replace({
-      params: {
-        sport: selectedSport.value,
-        matchday: String(md.matchday_number),
-      },
-    });
+    if (auth.isLoggedIn) {
+      await matchday.fetchPredictions(id);
+      await loadGameModeData(id);
+    }
+    const md = matchday.currentMatchday;
+    if (md) {
+      router.replace({
+        params: {
+          sport: selectedSport.value,
+          matchday: String(md.matchday_number),
+        },
+      });
+    }
+  } catch {
+    error.value = true;
   }
 }
 
@@ -194,7 +201,7 @@ async function loadGameModeData(matchdayId: string) {
   } else if (mode === "survivor") {
     await survivorStore.fetchStatus(squad.id, selectedSport.value);
   } else if (mode === "fantasy") {
-    const md = spieltag.currentMatchday;
+    const md = matchday.currentMatchday;
     if (md) {
       await fantasyStore.fetchPick(
         squad.id,
@@ -204,8 +211,8 @@ async function loadGameModeData(matchdayId: string) {
       );
     }
   } else if (mode === "moneyline") {
-    const matchIds = spieltag.matches.map((m) => m.id);
-    await spieltag.fetchMoneylineTips(matchIds);
+    const matchIds = matchday.matches.map((m) => m.id);
+    await matchday.fetchMoneylineBets(matchIds);
   }
 
   // Classic + bankroll can also have parlays
@@ -216,24 +223,24 @@ async function loadGameModeData(matchdayId: string) {
 
 async function selectSquad(squad: Squad | null) {
   selectedSquad.value = squad;
-  spieltag.setSquadContext(squad?.id ?? null);
+  matchday.setSquadContext(squad?.id ?? null);
   walletStore.reset();
   survivorStore.reset();
   fantasyStore.reset();
 
   // Reset auto-tipp strategy if blocked in new squad
-  if (squad?.auto_tipp_blocked) {
-    spieltag.draftAutoStrategy = "none";
+  if (squad?.auto_bet_blocked) {
+    matchday.draftAutoStrategy = "none";
   }
 
   if (selectedMatchdayId.value) {
     // Re-fetch matchday detail with new squad's lock_minutes
-    await spieltag.fetchMatchdayDetail(selectedMatchdayId.value, squad?.id);
+    await matchday.fetchMatchdayDetail(selectedMatchdayId.value, squad?.id);
   }
 
   if (squad && selectedMatchdayId.value && auth.isLoggedIn) {
     // Re-fetch predictions for new squad context
-    await spieltag.fetchPredictions(selectedMatchdayId.value);
+    await matchday.fetchPredictions(selectedMatchdayId.value);
 
     // Check disclaimer for wallet-based modes
     const mode = activeGameMode.value;
@@ -250,11 +257,11 @@ async function selectSquad(squad: Squad | null) {
 
 async function handleSave() {
   if (!selectedMatchdayId.value) return;
-  const ok = await spieltag.savePredictions(selectedMatchdayId.value);
+  const ok = await matchday.savePredictions(selectedMatchdayId.value);
   if (ok) {
-    toast.success("Tipps gespeichert!");
+    toast.success(t("matchday.tipsSaved"));
   } else {
-    toast.error("Fehler beim Speichern.");
+    toast.error(t("matchday.saveError"));
   }
 }
 
@@ -266,14 +273,21 @@ function onDisclaimerAccepted() {
 }
 
 // Init
-onMounted(async () => {
-  const sportsPromise = spieltag.fetchSports();
-  if (auth.isLoggedIn) {
-    await squadsStore.fetchMySquads();
+async function reload() {
+  error.value = false;
+  try {
+    const sportsPromise = matchday.fetchSports();
+    if (auth.isLoggedIn) {
+      await squadsStore.fetchMySquads();
+    }
+    await sportsPromise;
+    await loadSport(selectedSport.value, true);
+  } catch {
+    error.value = true;
   }
-  await sportsPromise;
-  await loadSport(selectedSport.value, true);
-});
+}
+
+onMounted(() => reload());
 
 // React to sport changes
 watch(selectedSport, (sport) => {
@@ -288,22 +302,22 @@ watch(selectedSport, (sport) => {
       <div>
         <p class="text-sm text-text-secondary">
           <template v-if="activeGameMode === 'classic'">
-            Tippe die exakten Ergebnisse aller Spiele eines Spieltags.
+            {{ $t('matchday.classicDescription') }}
           </template>
           <template v-else-if="activeGameMode === 'moneyline'">
-            Tippe 1X2 auf die Spielausgänge. Quoten werden beim Abgeben gesperrt.
+            {{ $t('matchday.moneylineDescription') }}
           </template>
           <template v-else-if="activeGameMode === 'bankroll'">
-            Setze deine Coins auf Spielausgänge.
+            {{ $t('matchday.bankrollDescription') }}
           </template>
           <template v-else-if="activeGameMode === 'survivor'">
-            Wähle ein Team pro Spieltag. Eliminiert bei Verlust.
+            {{ $t('matchday.survivorDescription') }}
           </template>
           <template v-else-if="activeGameMode === 'over_under'">
-            Tippe ob mehr oder weniger Tore als die Linie fallen.
+            {{ $t('matchday.overUnderDescription') }}
           </template>
           <template v-else-if="activeGameMode === 'fantasy'">
-            Wähle ein Team und sammle Punkte basierend auf Performance.
+            {{ $t('matchday.fantasyDescription') }}
           </template>
         </p>
       </div>
@@ -313,7 +327,7 @@ watch(selectedSport, (sport) => {
 
     <!-- Squad switcher (pill bar) -->
     <div
-      v-if="auth.isLoggedIn && spieltagSquads.length > 0"
+      v-if="auth.isLoggedIn && matchdaySquads.length > 0"
       class="flex gap-2 overflow-x-auto pb-1"
     >
       <button
@@ -325,10 +339,10 @@ watch(selectedSport, (sport) => {
         "
         @click="selectSquad(null)"
       >
-        Global
+        {{ $t('matchday.global') }}
       </button>
       <button
-        v-for="squad in spieltagSquads"
+        v-for="squad in matchdaySquads"
         :key="squad.id"
         class="shrink-0 px-3 py-1.5 rounded-full text-xs font-medium transition-colors"
         :class="
@@ -340,7 +354,7 @@ watch(selectedSport, (sport) => {
       >
         {{ squad.name }}
         <span class="opacity-60 ml-0.5"
-        >({{ GAME_MODE_LABELS[squadsStore.getGameModeForSport(squad.id, selectedSport)] }})</span>
+        >({{ $t(GAME_MODE_I18N_KEYS[squadsStore.getGameModeForSport(squad.id, selectedSport)]) }})</span>
       </button>
     </div>
 
@@ -361,7 +375,7 @@ watch(selectedSport, (sport) => {
         <span
           v-if="selectedSquad?.league_configs?.length"
           class="text-[10px] opacity-60 ml-0.5"
-        >({{ GAME_MODE_LABELS[squadsStore.getGameModeForSport(selectedSquad.id, sport.sport_key)] }})</span>
+        >({{ $t(GAME_MODE_I18N_KEYS[squadsStore.getGameModeForSport(selectedSquad.id, sport.sport_key)]) }})</span>
       </button>
     </div>
 
@@ -371,14 +385,14 @@ watch(selectedSport, (sport) => {
       class="bg-red-500/10 border border-red-500/30 rounded-card p-4 text-center"
     >
       <p class="text-sm font-semibold text-red-500">
-        Du bist ausgeschieden! Streak: {{ survivorStore.entry.streak }}
+        {{ t('matchday.survivorEliminated', { streak: survivorStore.entry.streak }) }}
       </p>
     </div>
 
     <!-- Season track -->
     <SeasonTrack
-      v-if="spieltag.matchdays.length > 0"
-      :matchdays="spieltag.matchdays"
+      v-if="matchday.matchdays.length > 0"
+      :matchdays="matchday.matchdays"
       :current-id="selectedMatchdayId"
       :total-matchdays="totalMatchdays"
       @select="selectMatchday"
@@ -386,7 +400,7 @@ watch(selectedSport, (sport) => {
     />
 
     <!-- Loading -->
-    <div v-if="spieltag.loading" class="space-y-3">
+    <div v-if="matchday.loading" class="space-y-3">
       <div
         v-for="n in 6"
         :key="n"
@@ -394,17 +408,23 @@ watch(selectedSport, (sport) => {
       />
     </div>
 
+    <!-- Error state -->
+    <div v-else-if="error" class="text-center py-12">
+      <p class="text-text-muted mb-3">{{ $t('common.loadError') }}</p>
+      <button class="text-sm text-primary hover:underline" @click="reload">{{ $t('common.retry') }}</button>
+    </div>
+
     <!-- Empty state -->
     <div
-      v-else-if="spieltag.matches.length === 0 && !spieltag.loading"
+      v-else-if="matchday.matches.length === 0 && !matchday.loading"
       class="flex flex-col items-center justify-center py-16"
     >
       <span class="text-4xl mb-4" aria-hidden="true">📋</span>
       <h2 class="text-lg font-semibold text-text-primary mb-2">
-        Keine Spieltage verfügbar
+        {{ $t('matchday.noMatchdays') }}
       </h2>
       <p class="text-sm text-text-secondary text-center max-w-xs">
-        Für diese Liga sind noch keine Spieltage geladen. Schau bald wieder vorbei.
+        {{ $t('matchday.noMatchdaysMessage') }}
       </p>
     </div>
 
@@ -418,7 +438,7 @@ watch(selectedSport, (sport) => {
           <!-- Q-Tip refresh -->
           <button
             class="text-text-muted hover:text-primary transition-colors p-1"
-            title="Q-Tips aktualisieren"
+            :title="$t('matchday.refreshTips')"
             :disabled="refreshingTips"
             @click="handleRefreshTips"
           >
@@ -434,7 +454,7 @@ watch(selectedSport, (sport) => {
             </svg>
           </button>
           <span v-if="activeGameMode === 'classic'" class="text-sm text-text-muted">
-            {{ spieltag.tippedCount }}/{{ spieltag.matches.length }} getippt
+            {{ t('matchday.tippedCount', { count: matchday.betCount, total: matchday.matches.length }) }}
           </span>
         </div>
       </div>
@@ -449,8 +469,8 @@ watch(selectedSport, (sport) => {
       <!-- ============ TIPPSPIEL MODE ============ -->
       <template v-if="activeGameMode === 'classic'">
         <div class="space-y-2">
-          <SpieltagMatchCard
-            v-for="match in spieltag.matches"
+          <MatchdayMatchCard
+            v-for="match in matchday.matches"
             :key="match.id"
             :match="match"
             :sport-key="selectedSport"
@@ -458,25 +478,25 @@ watch(selectedSport, (sport) => {
         </div>
 
         <template v-if="auth.isLoggedIn">
-          <AutoTippSelector v-if="!autoTippBlocked" />
+          <AutoBetSelector v-if="!autoBetBlocked" />
           <div
             v-else
             class="bg-surface-1 rounded-card p-4 border border-amber-500/20"
           >
             <p class="text-sm text-text-secondary">
-              Auto-Tipp wurde vom Squad-Admin deaktiviert.
+              {{ $t('matchday.autoBetDisabled') }}
             </p>
           </div>
           <div class="flex items-center justify-between pt-2">
             <span
-              v-if="spieltag.predictions?.total_points !== null && spieltag.predictions?.total_points !== undefined"
+              v-if="matchday.predictions?.total_points !== null && matchday.predictions?.total_points !== undefined"
               class="text-sm font-semibold text-text-primary"
             >
-              Gesamt: {{ spieltag.predictions.total_points }} Punkte
+              {{ t('matchday.totalPoints', { points: matchday.predictions.total_points }) }}
             </span>
             <span v-else />
             <button
-              :disabled="spieltag.saving || spieltag.editableMatches.length === 0"
+              :disabled="matchday.saving || matchday.editableMatches.length === 0"
               class="px-6 py-2.5 rounded-lg text-sm font-semibold transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
               :class="
                 hasUnsavedChanges
@@ -485,16 +505,16 @@ watch(selectedSport, (sport) => {
               "
               @click="handleSave"
             >
-              <template v-if="spieltag.saving">
+              <template v-if="matchday.saving">
                 <span class="inline-flex items-center gap-2">
                   <svg class="animate-spin h-4 w-4" viewBox="0 0 24 24">
                     <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4" fill="none" />
                     <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
                   </svg>
-                  Speichert...
+                  {{ $t('matchday.saving') }}
                 </span>
               </template>
-              <template v-else>Tipps speichern</template>
+              <template v-else>{{ $t('matchday.saveTips') }}</template>
             </button>
           </div>
         </template>
@@ -503,8 +523,8 @@ watch(selectedSport, (sport) => {
       <!-- ============ QUOTENTIPP (MONEYLINE) MODE ============ -->
       <template v-else-if="activeGameMode === 'moneyline'">
         <div class="space-y-2">
-          <QuotentippCard
-            v-for="match in spieltag.matches"
+          <MoneylineCard
+            v-for="match in matchday.matches"
             :key="match.id"
             :match="match"
             :sport-key="selectedSport"
@@ -516,7 +536,7 @@ watch(selectedSport, (sport) => {
       <template v-else-if="activeGameMode === 'bankroll'">
         <div class="space-y-2">
           <BankrollBetCard
-            v-for="match in spieltag.matches"
+            v-for="match in matchday.matches"
             :key="match.id"
             :match="match"
           />
@@ -532,7 +552,7 @@ watch(selectedSport, (sport) => {
       <template v-else-if="activeGameMode === 'survivor'">
         <div class="space-y-2">
           <SurvivorPickCard
-            v-for="match in spieltag.matches"
+            v-for="match in matchday.matches"
             :key="match.id"
             :match="match"
             :squad-id="selectedSquad!.id"
@@ -549,7 +569,7 @@ watch(selectedSport, (sport) => {
       <template v-else-if="activeGameMode === 'over_under'">
         <div class="space-y-2">
           <OverUnderCard
-            v-for="match in spieltag.matches"
+            v-for="match in matchday.matches"
             :key="match.id"
             :match="match"
             :sport-key="selectedSport"
@@ -566,7 +586,7 @@ watch(selectedSport, (sport) => {
       <template v-else-if="activeGameMode === 'fantasy'">
         <div class="space-y-2">
           <FantasyPickCard
-            v-for="match in spieltag.matches"
+            v-for="match in matchday.matches"
             :key="match.id"
             :match="match"
             :squad-id="selectedSquad!.id"
@@ -582,7 +602,7 @@ watch(selectedSport, (sport) => {
       <!-- Parlay builder (Classic + Bankroll) -->
       <ParlayBuilder
         v-if="parlayAvailable && selectedMatchdayId && auth.isLoggedIn"
-        :matches="spieltag.matches"
+        :matches="matchday.matches"
         :squad-id="selectedSquad?.id || ''"
         :matchday-id="selectedMatchdayId"
         :game-mode="activeGameMode"
@@ -595,21 +615,21 @@ watch(selectedSport, (sport) => {
       >
         <p class="text-sm text-text-secondary">
           <RouterLink to="/login" class="text-primary font-medium hover:underline">
-            Anmelden
+            {{ $t('auth.login') }}
           </RouterLink>
-          um deine Tipps zu speichern.
+          {{ $t('matchday.loginToSave') }}
         </p>
       </div>
 
       <!-- Leaderboard (Tippspiel mode) -->
       <template v-if="activeGameMode === 'classic'">
-        <SpieltagLeaderboard
-          v-if="spieltag.currentMatchday?.all_resolved && selectedMatchdayId"
+        <MatchdayLeaderboard
+          v-if="matchday.currentMatchday?.all_resolved && selectedMatchdayId"
           :sport-key="selectedSport"
           :matchday-id="selectedMatchdayId"
           mode="matchday"
         />
-        <SpieltagLeaderboard
+        <MatchdayLeaderboard
           :sport-key="selectedSport"
           mode="season"
         />

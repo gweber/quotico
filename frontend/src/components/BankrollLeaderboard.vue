@@ -25,7 +25,7 @@ const loading = ref(false);
 onMounted(async () => {
   loading.value = true;
   try {
-    // Use spieltag leaderboard endpoint with bankroll context
+    // Use matchday leaderboard endpoint with bankroll context
     const params: Record<string, string> = {
       sport: props.sportKey,
       mode: "bankroll",

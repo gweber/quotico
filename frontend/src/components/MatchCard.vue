@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted } from "vue";
+import { useI18n } from "vue-i18n";
 import type { Match } from "@/stores/matches";
 import { useMatchesStore } from "@/stores/matches";
 import { useAuthStore } from "@/stores/auth";
@@ -9,15 +10,18 @@ import OddsButton from "./OddsButton.vue";
 import MatchHistory from "./MatchHistory.vue";
 import OddsTimelineToggle from "./OddsTimelineToggle.vue";
 import QuoticoTipBadge from "./QuoticoTipBadge.vue";
-import { getCachedTip } from "@/composables/useQuoticoTip";
-import { getCachedUserTip } from "@/composables/useUserTips";
+import { useQuoticoTip } from "@/composables/useQuoticoTip";
+import { getCachedUserBet } from "@/composables/useUserBets";
 import { teamSlug } from "@/composables/useTeam";
+
+const { t, locale } = useI18n();
+const localeTag = computed(() => (locale.value === "en" ? "en-US" : "de-DE"));
 
 const props = defineProps<{
   match: Match;
 }>();
 
-const quoticoTip = computed(() => getCachedTip(props.match.id));
+const { data: quoticoTip, fetch: fetchTip } = useQuoticoTip();
 
 const auth = useAuthStore();
 const betslip = useBetSlipStore();
@@ -25,17 +29,17 @@ const matchesStore = useMatchesStore();
 
 // User's placed tip for this match (if any)
 const userTip = computed(() =>
-  auth.isLoggedIn ? getCachedUserTip(props.match.id) : undefined
+  auth.isLoggedIn ? getCachedUserBet(props.match.id) : undefined
 );
 
 // --- Countdown timer ---
 const now = ref(Date.now());
 let timer: ReturnType<typeof setInterval> | null = null;
 
-const commenceMs = computed(() => new Date(props.match.commence_time).getTime());
-const isUpcoming = computed(() => props.match.status === "upcoming");
+const commenceMs = computed(() => new Date(props.match.match_date).getTime());
+const isUpcoming = computed(() => props.match.status === "scheduled");
 const isLive = computed(() => props.match.status === "live");
-const isCompleted = computed(() => props.match.status === "completed");
+const isCompleted = computed(() => props.match.status === "final");
 const isPast = computed(() => isCompleted.value || props.match.status === "cancelled");
 const isExpired = computed(() => now.value >= commenceMs.value);
 
@@ -44,21 +48,21 @@ const liveScore = computed(() => matchesStore.liveScores.get(props.match.id));
 const hasScore = computed(
   () =>
     liveScore.value != null ||
-    props.match.home_score != null ||
-    props.match.away_score != null
+    props.match.result.home_score != null ||
+    props.match.result.away_score != null
 );
 const homeScore = computed(
-  () => liveScore.value?.home_score ?? props.match.home_score ?? 0
+  () => liveScore.value?.home_score ?? props.match.result.home_score ?? 0
 );
 const awayScore = computed(
-  () => liveScore.value?.away_score ?? props.match.away_score ?? 0
+  () => liveScore.value?.away_score ?? props.match.result.away_score ?? 0
 );
 const liveMinute = computed(() => liveScore.value?.minute);
 
 const countdown = computed(() => {
   if (!isUpcoming.value) return null;
   const diff = commenceMs.value - now.value;
-  if (diff <= 0) return "Startet gleich";
+  if (diff <= 0) return t('dashboard.startsSoon');
 
   const days = Math.floor(diff / 86400000);
   const hours = Math.floor((diff % 86400000) / 3600000);
@@ -71,6 +75,7 @@ const countdown = computed(() => {
 });
 
 onMounted(() => {
+  fetchTip(props.match.id);
   if (isUpcoming.value) {
     timer = setInterval(() => {
       now.value = Date.now();
@@ -82,38 +87,63 @@ onUnmounted(() => {
   if (timer) clearInterval(timer);
 });
 
-// --- Spread & Totals ---
-const spread = computed(() => props.match.spreads_odds);
-const totals = computed(() => props.match.totals_odds);
+// --- Spread & Totals (only truthy when data exists) ---
+const spread = computed(() => {
+  const s = props.match.odds.spreads;
+  return s && s.home_line != null ? s : null;
+});
+const totals = computed(() => {
+  const t = props.match.odds.totals;
+  return t && t.line != null ? t : null;
+});
 
 // --- Odds logic ---
-const isThreeWay = computed(() => props.match.current_odds["X"] !== undefined);
+const isThreeWay = computed(() => props.match.odds.h2h["X"] !== undefined);
 
 const oddsEntries = computed(() => {
   const m = props.match;
   if (isThreeWay.value) {
     return [
-      { key: "1", label: m.teams.home },
-      { key: "X", label: "Unentschieden" },
-      { key: "2", label: m.teams.away },
+      { key: "1", label: m.home_team },
+      { key: "X", label: t('match.draw') },
+      { key: "2", label: m.away_team },
     ];
   }
   return [
-    { key: "1", label: m.teams.home },
-    { key: "2", label: m.teams.away },
+    { key: "1", label: m.home_team },
+    { key: "2", label: m.away_team },
   ];
 });
 
-const buttonsDisabled = computed(() => !isUpcoming.value || isExpired.value || !!userTip.value);
+// Live bet projection: is the user's pending bet currently winning?
+const liveBetStatus = computed<"winning" | "losing" | null>(() => {
+  if (!userTip.value || userTip.value.status !== "pending") return null;
+  if (!isLive.value) return null;
+  const hs = liveScore.value?.home_score ?? props.match.result.home_score;
+  const as_ = liveScore.value?.away_score ?? props.match.result.away_score;
+  if (hs == null || as_ == null) return null;
+
+  const currentOutcome = hs > as_ ? "1" : as_ > hs ? "2" : "X";
+  return userTip.value.selection.value === currentOutcome ? "winning" : "losing";
+});
+
+const liveProjectedPoints = computed(() => {
+  if (liveBetStatus.value !== "winning" || !userTip.value) return null;
+  return userTip.value.locked_odds * 10;
+});
+
+const hasOdds = computed(() => Object.keys(props.match.odds.h2h || {}).length > 0);
+const buttonsDisabled = computed(() => !isUpcoming.value || isExpired.value || !!userTip.value || !hasOdds.value);
 
 function handleSelect(prediction: string) {
   if (buttonsDisabled.value) return;
+  if (props.match.odds.h2h[prediction] == null) return;
   betslip.addItem(props.match, prediction);
 }
 
 // --- Date formatting ---
 const formattedDate = computed(() =>
-  new Date(props.match.commence_time).toLocaleDateString("de-DE", {
+  new Date(props.match.match_date).toLocaleDateString(localeTag.value, {
     weekday: "short",
     day: "numeric",
     month: "short",
@@ -124,10 +154,10 @@ const formattedDate = computed(() =>
 
 const statusLabel = computed(() => {
   if (isLive.value && liveMinute.value) return `${liveMinute.value}'`;
-  if (isLive.value) return "Live";
-  if (isCompleted.value) return "Beendet";
-  if (props.match.status === "cancelled") return "Abgesagt";
-  return "Geplant";
+  if (isLive.value) return t('match.live');
+  if (isCompleted.value) return t('match.completed');
+  if (props.match.status === "cancelled") return t('match.cancelled');
+  return t('match.scheduled');
 });
 
 const statusClass = computed(() => {
@@ -142,13 +172,13 @@ const statusClass = computed(() => {
     <!-- Header: date, countdown, status -->
     <div class="flex items-center justify-between mb-3">
       <div class="flex items-center gap-2">
-        <time :datetime="match.commence_time" class="text-xs text-text-muted">
+        <time :datetime="match.match_date" class="text-xs text-text-muted">
           {{ formattedDate }}
         </time>
         <span
           v-if="countdown"
           class="text-xs font-mono text-warning"
-          :aria-label="`Startet in ${countdown}`"
+          :aria-label="t('match.startsIn', { time: countdown })"
         >
           {{ countdown }}
         </span>
@@ -167,16 +197,16 @@ const statusClass = computed(() => {
       <div class="flex-1 min-w-0 flex items-center gap-3">
         <div class="flex-1 min-w-0">
           <RouterLink
-            :to="{ name: 'team-detail', params: { teamSlug: teamSlug(match.teams.home) }, query: { sport: match.sport_key } }"
+            :to="{ name: 'team-detail', params: { teamSlug: teamSlug(match.home_team) }, query: { sport: match.sport_key } }"
             class="text-sm font-medium text-text-primary truncate block hover:text-primary transition-colors"
           >
-            {{ match.teams.home }}
+            {{ match.home_team }}
           </RouterLink>
           <RouterLink
-            :to="{ name: 'team-detail', params: { teamSlug: teamSlug(match.teams.away) }, query: { sport: match.sport_key } }"
+            :to="{ name: 'team-detail', params: { teamSlug: teamSlug(match.away_team) }, query: { sport: match.sport_key } }"
             class="text-sm font-medium text-text-primary truncate block mt-1 hover:text-primary transition-colors"
           >
-            {{ match.teams.away }}
+            {{ match.away_team }}
           </RouterLink>
         </div>
 
@@ -192,34 +222,51 @@ const statusClass = computed(() => {
       </div>
 
       <!-- Odds buttons -->
-      <div class="flex gap-2 shrink-0" role="group" aria-label="Quoten">
+      <div v-if="hasOdds" class="flex gap-2 shrink-0" role="group" :aria-label="$t('match.oddsLabel')">
         <OddsButton
           v-for="entry in oddsEntries"
           :key="entry.key"
           :match-id="match.id"
           :prediction="entry.key"
           :label="entry.label"
-          :odds="match.current_odds[entry.key]"
+          :odds="match.odds.h2h[entry.key]"
           :disabled="buttonsDisabled"
           :user-tip="userTip"
           @click="handleSelect(entry.key)"
         />
       </div>
+      <div v-else class="shrink-0 text-xs text-text-muted italic px-2">
+        {{ $t('match.oddsUnavailable') }}
+      </div>
     </div>
 
     <!-- User tip status -->
-    <div v-if="userTip" class="mt-2 flex items-center justify-end text-xs">
-      <span v-if="userTip.status === 'pending'" class="text-text-muted">
-        Getippt @ {{ userTip.locked_odds.toFixed(2) }}
-      </span>
+    <div v-if="userTip" class="mt-2 flex items-center justify-end text-xs gap-2">
+      <template v-if="liveBetStatus">
+        <span
+          class="font-semibold"
+          :class="liveBetStatus === 'winning' ? 'text-success' : 'text-danger'"
+        >
+          {{ liveBetStatus === 'winning' ? $t('match.liveWinning') : $t('match.liveLosing') }}
+        </span>
+        <span v-if="liveProjectedPoints" class="text-success/70 tabular-nums">
+          +{{ liveProjectedPoints.toFixed(1) }}
+        </span>
+        <span class="text-text-muted">@ {{ userTip.locked_odds.toFixed(2) }}</span>
+      </template>
+      <template v-else-if="userTip.status === 'pending'">
+        <span class="text-text-muted">
+          {{ t('match.betPlaced', { odds: userTip.locked_odds.toFixed(2) }) }}
+        </span>
+      </template>
       <span v-else-if="userTip.status === 'won'" class="text-success font-semibold">
-        Gewonnen +{{ userTip.points_earned?.toFixed(1) }} Pkt
+        {{ t('match.won', { points: userTip.points_earned?.toFixed(1) }) }}
       </span>
       <span v-else-if="userTip.status === 'lost'" class="text-danger font-medium">
-        Verloren
+        {{ $t('match.lost') }}
       </span>
       <span v-else-if="userTip.status === 'void'" class="text-warning font-medium">
-        Ungültig
+        {{ $t('match.void') }}
       </span>
     </div>
 
@@ -229,7 +276,7 @@ const statusClass = computed(() => {
       class="mt-2 flex items-center gap-3 text-xs text-text-muted"
     >
       <template v-if="spread">
-        <span class="flex items-center gap-1" title="Spread (Handicap)">
+        <span class="flex items-center gap-1" :title="t('match.spreadHint')">
           <span class="font-medium text-text-secondary">Spread</span>
           <span class="tabular-nums">
             {{ spread.home_line > 0 ? '+' : '' }}{{ spread.home_line }}
@@ -238,7 +285,7 @@ const statusClass = computed(() => {
         </span>
       </template>
       <template v-if="totals">
-        <span class="flex items-center gap-1" title="Over/Under (Gesamtpunkte)">
+        <span class="flex items-center gap-1" :title="t('match.overUnderHint')">
           <span class="font-medium text-text-secondary">O/U</span>
           <span class="tabular-nums">{{ totals.line }}</span>
         </span>
@@ -246,36 +293,36 @@ const statusClass = computed(() => {
     </div>
 
     <!-- Result banner (completed matches) -->
-    <div v-if="match.result" class="mt-3 pt-3 border-t border-surface-3/50 flex items-center gap-2">
-      <span class="text-xs text-text-muted">Ergebnis:</span>
+    <div v-if="match.result.outcome" class="mt-3 pt-3 border-t border-surface-3/50 flex items-center gap-2">
+      <span class="text-xs text-text-muted">{{ $t('match.result') }}</span>
       <span class="text-xs font-medium text-text-primary">
-        {{ match.result === '1' ? match.teams.home + ' gewinnt' : match.result === '2' ? match.teams.away + ' gewinnt' : 'Unentschieden' }}
+        {{ match.result.outcome === '1' ? t('match.homeWins', { team: match.home_team }) : match.result.outcome === '2' ? t('match.homeWins', { team: match.away_team }) : t('match.draw') }}
       </span>
-      <span v-if="match.home_score != null" class="text-xs text-text-muted ml-auto">
-        {{ match.home_score }} : {{ match.away_score }}
+      <span v-if="match.result.home_score != null" class="text-xs text-text-muted ml-auto">
+        {{ match.result.home_score }} : {{ match.result.away_score }}
       </span>
     </div>
 
     <!-- Historical context -->
     <MatchHistory
-      :home-team="match.teams.home"
-      :away-team="match.teams.away"
+      :home-team="match.home_team"
+      :away-team="match.away_team"
       :sport-key="match.sport_key"
     />
 
     <!-- Odds timeline -->
     <OddsTimelineToggle
       :match-id="match.id"
-      :home-team="match.teams.home"
-      :away-team="match.teams.away"
+      :home-team="match.home_team"
+      :away-team="match.away_team"
     />
 
     <!-- QuoticoTip value bet recommendation -->
     <QuoticoTipBadge
       v-if="quoticoTip"
       :tip="quoticoTip"
-      :home-team="match.teams.home"
-      :away-team="match.teams.away"
+      :home-team="match.home_team"
+      :away-team="match.away_team"
     />
   </article>
 </template>

@@ -1,11 +1,11 @@
 <script setup lang="ts">
 import { computed, ref } from "vue";
-import type { SpieltagMatch } from "@/stores/spieltag";
+import type { MatchdayMatch } from "@/stores/matchday";
 import { useSurvivorStore } from "@/stores/survivor";
 import { useToast } from "@/composables/useToast";
 
 const props = defineProps<{
-  match: SpieltagMatch;
+  match: MatchdayMatch;
   squadId: string;
 }>();
 
@@ -17,8 +17,8 @@ const isEliminated = computed(() => survivor.entry?.status === "eliminated");
 
 const usedTeams = computed(() => survivor.entry?.used_teams || []);
 
-const homeUsed = computed(() => usedTeams.value.includes(props.match.teams.home));
-const awayUsed = computed(() => usedTeams.value.includes(props.match.teams.away));
+const homeUsed = computed(() => usedTeams.value.includes(props.match.home_team));
+const awayUsed = computed(() => usedTeams.value.includes(props.match.away_team));
 
 const currentPick = computed(() => {
   if (!survivor.entry?.picks) return null;
@@ -26,7 +26,7 @@ const currentPick = computed(() => {
 });
 
 const kickoffLabel = computed(() => {
-  const d = new Date(props.match.commence_time);
+  const d = new Date(props.match.match_date);
   return d.toLocaleString("de-DE", {
     weekday: "short",
     day: "2-digit",
@@ -76,9 +76,9 @@ function pickResultClass(result: string) {
     </div>
 
     <!-- Score display if completed -->
-    <div v-if="match.home_score !== null" class="text-center mb-2">
+    <div v-if="(match.result as any)?.home_score != null" class="text-center mb-2">
       <span class="text-lg font-bold text-text-primary">
-        {{ match.home_score }} : {{ match.away_score }}
+        {{ (match.result as any)?.home_score }} : {{ (match.result as any)?.away_score }}
       </span>
     </div>
 
@@ -87,30 +87,30 @@ function pickResultClass(result: string) {
       <button
         class="py-3 rounded-lg text-sm font-medium transition-colors border"
         :class="[
-          currentPick?.team === match.teams.home
+          currentPick?.team === match.home_team
             ? 'bg-primary text-surface-0 border-primary'
             : homeUsed
               ? 'bg-surface-3/50 text-text-muted border-surface-3 cursor-not-allowed line-through'
               : 'bg-surface-2 text-text-primary border-surface-3 hover:border-primary',
         ]"
         :disabled="match.is_locked || isEliminated || homeUsed || submitting"
-        @click="pickTeam(match.teams.home)"
+        @click="pickTeam(match.home_team)"
       >
-        {{ match.teams.home }}
+        {{ match.home_team }}
       </button>
       <button
         class="py-3 rounded-lg text-sm font-medium transition-colors border"
         :class="[
-          currentPick?.team === match.teams.away
+          currentPick?.team === match.away_team
             ? 'bg-primary text-surface-0 border-primary'
             : awayUsed
               ? 'bg-surface-3/50 text-text-muted border-surface-3 cursor-not-allowed line-through'
               : 'bg-surface-2 text-text-primary border-surface-3 hover:border-primary',
         ]"
         :disabled="match.is_locked || isEliminated || awayUsed || submitting"
-        @click="pickTeam(match.teams.away)"
+        @click="pickTeam(match.away_team)"
       >
-        {{ match.teams.away }}
+        {{ match.away_team }}
       </button>
     </div>
   </div>

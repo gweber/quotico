@@ -30,12 +30,16 @@ interface StatusResponse {
 
 const data = ref<StatusResponse | null>(null);
 const loading = ref(true);
+const error = ref(false);
 const syncing = ref<string | null>(null); // worker_id currently being triggered
 
 async function fetchStatus() {
   loading.value = true;
+  error.value = false;
   try {
     data.value = await api.get<StatusResponse>("/admin/provider-status");
+  } catch {
+    error.value = true;
   } finally {
     loading.value = false;
   }
@@ -119,6 +123,11 @@ onMounted(fetchStatus);
         <div v-for="n in 4" :key="n" class="bg-surface-1 rounded-card h-24 animate-pulse" />
       </div>
       <div class="bg-surface-1 rounded-card h-64 animate-pulse" />
+    </div>
+
+    <div v-else-if="error" class="text-center py-12">
+      <p class="text-text-muted mb-3">Error loading.</p>
+      <button class="text-sm text-primary hover:underline" @click="fetchStatus">Try again</button>
     </div>
 
     <template v-if="data">

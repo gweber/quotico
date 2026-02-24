@@ -39,11 +39,11 @@ async def resolve_bankroll_bets() -> None:
 
     for bet in pending_bets:
         match = await _db.db.matches.find_one({"_id": ObjectId(bet["match_id"])})
-        if not match or match["status"] != "completed" or not match.get("result"):
+        if not match or match["status"] != "final" or not match.get("result", {}).get("outcome"):
             continue
 
         prediction = bet["prediction"]
-        result = match["result"]
+        result = match["result"]["outcome"]
         is_won = prediction == result
 
         if is_won:
@@ -55,7 +55,7 @@ async def resolve_bankroll_bets() -> None:
                 amount=win_amount,
                 reference_type="bankroll_bet",
                 reference_id=str(bet["_id"]),
-                description=f"Gewinn: {match['teams']['home']} vs {match['teams']['away']} → {prediction} ({win_amount:.0f} Coins)",
+                description=f"Win: {match['home_team']} vs {match['away_team']} -> {prediction} ({win_amount:.0f} coins)",
             )
             won_count += 1
 
@@ -86,7 +86,7 @@ async def resolve_bankroll_bets() -> None:
                 ) or {}).get("balance", 0),
                 "reference_type": "bankroll_bet",
                 "reference_id": str(bet["_id"]),
-                "description": f"Verloren: {match['teams']['home']} vs {match['teams']['away']}",
+                "description": f"Lost: {match['home_team']} vs {match['away_team']}",
                 "created_at": now,
             })
 

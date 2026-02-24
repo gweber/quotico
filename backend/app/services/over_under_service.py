@@ -22,48 +22,48 @@ async def place_bet(
 
     # Validate prediction
     if prediction not in ("over", "under"):
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Vorhersage muss 'over' oder 'under' sein.")
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Prediction must be 'over' or 'under'.")
 
     # Validate match first (need sport_key for league config check)
     match = await _db.db.matches.find_one({"_id": ObjectId(match_id)})
     if not match:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Spiel nicht gefunden.")
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Match not found.")
 
     # Validate squad
     squad = await _db.db.squads.find_one({"_id": ObjectId(squad_id)})
     if not squad:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Squad nicht gefunden.")
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Squad not found.")
     if user_id not in squad.get("members", []):
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "Du bist kein Mitglied dieser Squad.")
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "You are not a member of this squad.")
     from app.services.squad_league_service import require_active_league_config
     require_active_league_config(squad, match["sport_key"], "over_under")
 
-    commence = ensure_utc(match["commence_time"])
+    commence = ensure_utc(match["match_date"])
     if commence <= now:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Spiel hat bereits begonnen.")
-    if match["status"] != "upcoming":
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Tipps nur für kommende Spiele.")
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Match has already started.")
+    if match["status"] != "scheduled":
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Bets only for upcoming matches.")
 
     # Get totals odds
-    totals = match.get("totals_odds", {})
+    totals = match.get("odds", {}).get("totals", {})
     if not totals or "line" not in totals:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Keine Über/Unter-Quoten für dieses Spiel.")
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "No over/under odds available for this match.")
 
     line = totals["line"]
     locked_odds = totals.get(prediction, 0)
     if not locked_odds:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, f"Keine Quote für '{prediction}'.")
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, f"No odds for '{prediction}'.")
 
     # Validate displayed odds
     if abs(displayed_odds - locked_odds) / max(locked_odds, 0.01) > 0.2:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Quoten haben sich geändert.")
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Odds have changed.")
 
     # Check duplicate
     existing = await _db.db.over_under_bets.find_one({
         "user_id": user_id, "squad_id": squad_id, "match_id": match_id,
     })
     if existing:
-        raise HTTPException(status.HTTP_409_CONFLICT, "Du hast bereits einen Bet für dieses Spiel.")
+        raise HTTPException(status.HTTP_409_CONFLICT, "You have already placed a bet on this match.")
 
     # Get matchday_id
     sport_key = match["sport_key"]
@@ -91,7 +91,7 @@ async def place_bet(
             stake=stake,
             reference_type="over_under_bet",
             reference_id="",
-            description=f"O/U Bet: {prediction} {line} ({stake:.0f} Coins)",
+            description=f"O/U Bet: {prediction} {line} ({stake:.0f} coins)",
         )
 
     bet_doc = {

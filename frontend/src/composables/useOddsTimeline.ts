@@ -4,7 +4,7 @@ import { useApi } from "./useApi";
 export interface OddsSnapshot {
   snapshot_at: string;
   odds: Record<string, number>;
-  totals_odds?: Record<string, number>;
+  totals?: Record<string, number>;
 }
 
 export interface OddsTimelineResponse {

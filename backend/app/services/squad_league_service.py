@@ -23,7 +23,7 @@ def get_active_league_config(
                 label = GAME_MODE_LABELS.get(expected_mode, expected_mode)
                 raise HTTPException(
                     status.HTTP_400_BAD_REQUEST,
-                    f"Diese Liga ist nicht im {label}-Modus konfiguriert.",
+                    f"This league is not configured in {label} mode.",
                 )
             return config
     return None
@@ -38,7 +38,7 @@ def require_active_league_config(
         label = GAME_MODE_LABELS.get(expected_mode, expected_mode)
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST,
-            f"Squad hat keine aktive {label}-Konfiguration für diese Liga.",
+            f"Squad has no active {label} configuration for this league.",
         )
     return config
 

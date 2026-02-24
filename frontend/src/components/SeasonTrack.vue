@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, ref, watch } from "vue";
-import type { Matchday } from "@/stores/spieltag";
+import type { Matchday } from "@/stores/matchday";
 
 const props = defineProps<{
   matchdays: Matchday[];

@@ -1,11 +1,13 @@
 <script setup lang="ts">
 import { ref, computed } from "vue";
 import { useRouter, useRoute } from "vue-router";
+import { useI18n } from "vue-i18n";
 import { useAuthStore } from "@/stores/auth";
 import { useToast } from "@/composables/useToast";
 
 const router = useRouter();
 const route = useRoute();
+const { t } = useI18n();
 const auth = useAuthStore();
 const toast = useToast();
 
@@ -31,7 +33,7 @@ const ageError = computed(() => {
   if (monthDiff < 0 || (monthDiff === 0 && today.getDate() < birth.getDate())) {
     age--;
   }
-  if (age < 18) return "Du musst mindestens 18 Jahre alt sein (Jugendschutz).";
+  if (age < 18) return t('auth.ageError');
   return "";
 });
 
@@ -39,17 +41,17 @@ async function handleRegister() {
   errorMessage.value = "";
 
   if (!email.value || !password.value || !birthDate.value) {
-    errorMessage.value = "Bitte alle Felder ausfüllen.";
+    errorMessage.value = t('auth.fillAllFields');
     return;
   }
 
   if (password.value.length < 10) {
-    errorMessage.value = "Das Passwort muss mindestens 10 Zeichen lang sein.";
+    errorMessage.value = t('auth.passwordMinLength');
     return;
   }
 
   if (password.value !== passwordConfirm.value) {
-    errorMessage.value = "Die Passwörter stimmen nicht überein.";
+    errorMessage.value = t('auth.passwordMismatch');
     return;
   }
 
@@ -59,17 +61,17 @@ async function handleRegister() {
   }
 
   if (!disclaimerAccepted.value) {
-    errorMessage.value = "Bitte bestätige den Haftungsausschluss.";
+    errorMessage.value = t('profile.disclaimerRequired');
     return;
   }
 
   loading.value = true;
   try {
     await auth.register(email.value, password.value, birthDate.value, disclaimerAccepted.value);
-    toast.success("Registrierung erfolgreich! Willkommen bei Quotico.");
+    toast.success(t('auth.registerSuccess'));
     router.push(redirectTarget.value);
   } catch (e: unknown) {
-    const msg = e instanceof Error ? e.message : "Registrierung fehlgeschlagen.";
+    const msg = e instanceof Error ? e.message : t('auth.registerFailed');
     errorMessage.value = msg;
   } finally {
     loading.value = false;
@@ -82,9 +84,9 @@ async function handleRegister() {
     <div class="bg-surface-1 rounded-card w-full max-w-md p-8 shadow-xl">
       <!-- Header -->
       <div class="text-center mb-8">
-        <h1 class="text-2xl font-bold text-text-primary">Registrieren</h1>
+        <h1 class="text-2xl font-bold text-text-primary">{{ $t('auth.register') }}</h1>
         <p class="text-sm text-text-secondary mt-2">
-          Erstelle dein Konto und starte mit Tipps.
+          {{ $t('auth.createDescription') }}
         </p>
       </div>
 
@@ -101,7 +103,7 @@ async function handleRegister() {
         <!-- Email -->
         <div class="mb-4">
           <label for="register-email" class="block text-sm font-medium text-text-secondary mb-1.5">
-            E-Mail-Adresse
+            {{ $t('auth.emailLabel') }}
           </label>
           <input
             id="register-email"
@@ -117,7 +119,7 @@ async function handleRegister() {
         <!-- Password -->
         <div class="mb-4">
           <label for="register-password" class="block text-sm font-medium text-text-secondary mb-1.5">
-            Passwort
+            {{ $t('auth.passwordLabel') }}
           </label>
           <input
             id="register-password"
@@ -127,14 +129,14 @@ async function handleRegister() {
             required
             minlength="10"
             class="w-full px-4 py-3 bg-surface-2 border border-surface-3 rounded-lg text-text-primary placeholder-text-muted text-sm transition-colors focus:border-primary focus:ring-1 focus:ring-primary"
-            placeholder="Mind. 10 Zeichen, Großbuchstabe + Ziffer"
+            :placeholder="$t('auth.passwordPlaceholder')"
           />
         </div>
 
         <!-- Confirm Password -->
         <div class="mb-4">
           <label for="register-password-confirm" class="block text-sm font-medium text-text-secondary mb-1.5">
-            Passwort bestätigen
+            {{ $t('auth.confirmPassword') }}
           </label>
           <input
             id="register-password-confirm"
@@ -143,14 +145,14 @@ async function handleRegister() {
             autocomplete="new-password"
             required
             class="w-full px-4 py-3 bg-surface-2 border border-surface-3 rounded-lg text-text-primary placeholder-text-muted text-sm transition-colors focus:border-primary focus:ring-1 focus:ring-primary"
-            placeholder="Passwort wiederholen"
+            :placeholder="$t('auth.repeatPassword')"
           />
         </div>
 
         <!-- Birth Date (Age Gate) -->
         <div class="mb-4">
           <label for="register-birthdate" class="block text-sm font-medium text-text-secondary mb-1.5">
-            Geburtsdatum
+            {{ $t('auth.birthDate') }}
           </label>
           <input
             id="register-birthdate"
@@ -172,11 +174,11 @@ async function handleRegister() {
               class="mt-0.5 w-4 h-4 rounded border-surface-3 bg-surface-2 text-primary focus:ring-primary focus:ring-1"
             />
             <span class="text-xs text-text-secondary leading-relaxed">
-              Ich bestätige, dass ich mindestens 18 Jahre alt bin und akzeptiere die
-              <RouterLink to="/legal/agb" class="text-secondary underline">AGB</RouterLink>
+              {{ $t('profile.ageConfirm') }}
+              <RouterLink to="/legal/agb" class="text-secondary underline">{{ $t('legal.agb') }}</RouterLink>
               sowie die
-              <RouterLink to="/legal/datenschutz" class="text-secondary underline">Datenschutzerklärung</RouterLink>.
-              Quotico.de ist kein Echtgeld-Glücksspiel.
+              <RouterLink to="/legal/datenschutz" class="text-secondary underline">{{ $t('legal.datenschutz') }}</RouterLink>.
+              {{ $t('profile.noRealMoney') }}
             </span>
           </label>
         </div>
@@ -193,11 +195,11 @@ async function handleRegister() {
                 <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4" fill="none" />
                 <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
               </svg>
-              Wird registriert...
+              {{ $t('auth.registering') }}
             </span>
           </template>
           <template v-else>
-            Konto erstellen
+            {{ $t('auth.createAccount') }}
           </template>
         </button>
       </form>
@@ -205,7 +207,7 @@ async function handleRegister() {
       <!-- Divider -->
       <div class="flex items-center my-6">
         <div class="flex-1 border-t border-surface-3"></div>
-        <span class="px-3 text-xs text-text-muted">oder</span>
+        <span class="px-3 text-xs text-text-muted">{{ $t('common.or') }}</span>
         <div class="flex-1 border-t border-surface-3"></div>
       </div>
 
@@ -220,20 +222,20 @@ async function handleRegister() {
           <path fill="#FBBC05" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z" />
           <path fill="#EA4335" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z" />
         </svg>
-        Mit Google registrieren
+        {{ $t('auth.registerWithGoogle') }}
       </a>
 
       <!-- Login link -->
       <p class="text-center text-sm text-text-secondary mt-6">
-        Bereits registriert?
+        {{ $t('auth.alreadyRegistered') }}
         <RouterLink :to="{ path: '/login', query: route.query.redirect ? { redirect: route.query.redirect } : {} }" class="text-primary hover:text-primary-hover transition-colors font-medium">
-          Jetzt anmelden
+          {{ $t('auth.loginNow') }}
         </RouterLink>
       </p>
 
       <!-- Legal notice -->
       <p class="text-center text-xs text-text-muted mt-4">
-        Ab 18 Jahren. Tippspiel &mdash; kein Echtgeld. Keine Wette, keine Gewinnauszahlung.
+        {{ $t('auth.legalNotice') }}
       </p>
     </div>
   </div>

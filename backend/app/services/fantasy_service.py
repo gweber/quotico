@@ -1,4 +1,4 @@
-"""Fantasy Matchups — pick a team, score based on real performance (GGL-konform)."""
+"""Fantasy Matchups — pick a team, score based on real performance (GGL-compliant)."""
 
 import logging
 
@@ -7,7 +7,7 @@ from fastapi import HTTPException, status
 from pymongo.errors import DuplicateKeyError
 
 import app.database as _db
-from app.services.spieltag_service import is_match_locked
+from app.services.matchday_service import is_match_locked
 from app.utils import utcnow
 
 logger = logging.getLogger("quotico.fantasy_service")
@@ -18,19 +18,19 @@ def calculate_fantasy_points(
 ) -> int:
     """Calculate fantasy points for a team pick.
 
-    Default (pure_stats_only=True, GGL-konform):
+    Default (pure_stats_only=True, GGL-compliant):
       - 3 points per goal scored
       - 2 points for clean sheet (0 goals conceded)
 
     Extended (pure_stats_only=False, regulatory risk):
-      - Adds win/draw bonus (Ereigniswette territory)
+      - Adds win/draw bonus (event-bet territory)
     """
     points = goals_scored * 3
     if goals_conceded == 0:
         points += 2  # Clean sheet bonus (objective statistic)
 
     if not pure_stats_only:
-        # Win/draw bonus — may qualify as "Ereigniswette" under GGL rules
+        # Win/draw bonus — may qualify as "event bet" under GGL rules
         # Only enable if legally cleared
         if goals_scored > goals_conceded:
             points += 3  # Win bonus
@@ -49,30 +49,30 @@ async def make_pick(
     # Validate match first (need sport_key for league config check)
     match = await _db.db.matches.find_one({"_id": ObjectId(match_id)})
     if not match:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Spiel nicht gefunden.")
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Match not found.")
 
     # Validate squad
     squad = await _db.db.squads.find_one({"_id": ObjectId(squad_id)})
     if not squad:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Squad nicht gefunden.")
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Squad not found.")
     if user_id not in squad.get("members", []):
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "Du bist kein Mitglied dieser Squad.")
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "You are not a member of this squad.")
     from app.services.squad_league_service import require_active_league_config
     require_active_league_config(squad, match["sport_key"], "fantasy")
     if is_match_locked(match):
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Spiel ist gesperrt.")
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Match is locked.")
 
     # Validate team is part of this match
-    home = match["teams"]["home"]
-    away = match["teams"]["away"]
+    home = match["home_team"]
+    away = match["away_team"]
     if team not in (home, away):
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, f"Team muss '{home}' oder '{away}' sein.")
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, f"Team must be '{home}' or '{away}'.")
 
     sport_key = match["sport_key"]
     season = match.get("matchday_season") or now.year
     matchday_number = match.get("matchday_number")
     if not matchday_number:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Spiel ist keinem Spieltag zugeordnet.")
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Match is not assigned to a matchday.")
 
     pick_doc = {
         "user_id": user_id,

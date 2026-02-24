@@ -8,7 +8,7 @@ const props = defineProps<{
   homeTeam: string;
   awayTeam: string;
   sportKey: string;
-  context?: MatchContext | null;  // Pre-loaded data from parent (Spieltag path)
+  context?: MatchContext | null;  // Pre-loaded data from parent (Matchday path)
 }>();
 
 const isBball = computed(() => isBasketball(props.sportKey));
@@ -69,9 +69,9 @@ onMounted(() => {
 });
 
 function formResult(match: HistoricalMatch, teamKey: string): "W" | "D" | "L" {
-  if (match.result === "X") return "D";
+  if (match.result.outcome === "X") return "D";
   const isHome = match.home_team_key === teamKey;
-  if (match.result === "1") return isHome ? "W" : "L";
+  if (match.result.outcome === "1") return isHome ? "W" : "L";
   return isHome ? "L" : "W";
 }
 
@@ -82,8 +82,8 @@ function resultColor(r: "W" | "D" | "L") {
 }
 
 function h2hWinnerClass(match: HistoricalMatch, side: "home" | "away"): string {
-  const homeWon = match.home_goals > match.away_goals;
-  const awayWon = match.away_goals > match.home_goals;
+  const homeWon = match.result.home_score > match.result.away_score;
+  const awayWon = match.result.away_score > match.result.home_score;
   if (side === "home" && homeWon) return "text-primary font-semibold";
   if (side === "away" && awayWon) return "text-primary font-semibold";
   return "text-text-secondary";
@@ -242,7 +242,7 @@ function yearGap(olderDate: string, newerDate: string): number {
                       {{ m.home_team }}
                     </span>
                     <span class="font-mono font-bold text-text-primary text-center tabular-nums">
-                      {{ m.home_goals }}:{{ m.away_goals }}
+                      {{ m.result.home_score }}:{{ m.result.away_score }}
                     </span>
                     <span class="truncate" :class="h2hWinnerClass(m, 'away')">
                       {{ m.away_team }}
@@ -283,7 +283,7 @@ function yearGap(olderDate: string, newerDate: string): number {
                   :key="i"
                   class="w-5 h-5 rounded-full text-[10px] font-bold text-white flex items-center justify-center"
                   :class="resultColor(formResult(m, data.home_team_key))"
-                  :title="`${m.home_team} ${m.home_goals}:${m.away_goals} ${m.away_team}`"
+                  :title="`${m.home_team} ${m.result.home_score}:${m.result.away_score} ${m.away_team}`"
                 >
                   {{ formResult(m, data.home_team_key) }}
                 </span>
@@ -308,7 +308,7 @@ function yearGap(olderDate: string, newerDate: string): number {
                   :key="i"
                   class="w-5 h-5 rounded-full text-[10px] font-bold text-white flex items-center justify-center"
                   :class="resultColor(formResult(m, data.away_team_key))"
-                  :title="`${m.home_team} ${m.home_goals}:${m.away_goals} ${m.away_team}`"
+                  :title="`${m.home_team} ${m.result.home_score}:${m.result.away_score} ${m.away_team}`"
                 >
                   {{ formResult(m, data.away_team_key) }}
                 </span>

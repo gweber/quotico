@@ -6,7 +6,7 @@ const api = useApi();
 
 interface Stats {
   users: { total: number; banned: number };
-  tips: { total: number; today: number };
+  bets: { total: number; today: number };
   matches: { total: number; pending: number; completed: number };
   squads: number;
   battles: number;
@@ -16,14 +16,21 @@ interface Stats {
 
 const stats = ref<Stats | null>(null);
 const loading = ref(true);
+const error = ref(false);
 
-onMounted(async () => {
+async function fetchStats() {
+  loading.value = true;
+  error.value = false;
   try {
     stats.value = await api.get<Stats>("/admin/stats");
+  } catch {
+    error.value = true;
   } finally {
     loading.value = false;
   }
-});
+}
+
+onMounted(fetchStats);
 
 const cards = [
   { to: "/admin/users", label: "User Management", icon: "\uD83D\uDC65" },
@@ -43,6 +50,11 @@ const cards = [
       <div v-for="n in 8" :key="n" class="bg-surface-1 rounded-card h-20 animate-pulse" />
     </div>
 
+    <div v-else-if="error" class="text-center py-12">
+      <p class="text-text-muted mb-3">Error loading.</p>
+      <button class="text-sm text-primary hover:underline" @click="fetchStats">Try again</button>
+    </div>
+
     <template v-else-if="stats">
       <!-- Stats Grid -->
       <div class="grid grid-cols-2 md:grid-cols-4 gap-3 mb-6">
@@ -52,9 +64,9 @@ const cards = [
           <p v-if="stats.users.banned" class="text-xs text-danger">{{ stats.users.banned }} gesperrt</p>
         </div>
         <div class="bg-surface-1 rounded-card p-4 border border-surface-3/50">
-          <p class="text-xs text-text-muted">Tipps gesamt</p>
-          <p class="text-2xl font-bold text-text-primary tabular-nums">{{ stats.tips.total }}</p>
-          <p class="text-xs text-primary">{{ stats.tips.today }} heute</p>
+          <p class="text-xs text-text-muted">Bets</p>
+          <p class="text-2xl font-bold text-text-primary tabular-nums">{{ stats.bets.total }}</p>
+          <p class="text-xs text-primary">{{ stats.bets.today }} today</p>
         </div>
         <div class="bg-surface-1 rounded-card p-4 border border-surface-3/50">
           <p class="text-xs text-text-muted">Spiele</p>

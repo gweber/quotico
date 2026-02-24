@@ -86,7 +86,7 @@ async def accept_terms(
     if body.version != TERMS_VERSION:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Version {body.version} ist nicht aktuell. Aktuelle Version: {TERMS_VERSION}.",
+            detail=f"Version {body.version} is outdated. Current version: {TERMS_VERSION}.",
         )
 
     now = utcnow()
@@ -109,7 +109,7 @@ async def accept_terms(
         request=request,
     )
 
-    return {"message": "AGB akzeptiert.", "version": TERMS_VERSION}
+    return {"message": "Terms accepted.", "version": TERMS_VERSION}
 
 
 @router.get("/terms-status")

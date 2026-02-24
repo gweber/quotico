@@ -1,4 +1,4 @@
-"""Resolve parlay (Kombi-Joker) bets for completed matches."""
+"""Resolve parlay bets for completed matches."""
 
 import logging
 
@@ -48,7 +48,7 @@ async def resolve_parlays() -> None:
                 continue
 
             match = await _db.db.matches.find_one({"_id": ObjectId(leg["match_id"])})
-            if not match or match["status"] != "completed":
+            if not match or match["status"] != "final":
                 all_resolved = False
                 updated_legs.append(leg)
                 continue
@@ -57,13 +57,14 @@ async def resolve_parlays() -> None:
 
             if prediction in ("over", "under"):
                 # Over/Under leg
-                if match.get("home_score") is None or match.get("away_score") is None:
+                match_result = match.get("result", {})
+                if match_result.get("home_score") is None or match_result.get("away_score") is None:
                     all_resolved = False
                     updated_legs.append(leg)
                     continue
 
-                total_goals = match["home_score"] + match["away_score"]
-                totals = match.get("totals_odds", {})
+                total_goals = match_result["home_score"] + match_result["away_score"]
+                totals = match.get("odds", {}).get("totals", {})
                 line = totals.get("line", 2.5)
 
                 if total_goals > line:
@@ -81,11 +82,12 @@ async def resolve_parlays() -> None:
                 leg["result"] = "won" if prediction == actual else "lost"
             else:
                 # 1/X/2 leg
-                if not match.get("result"):
+                outcome = match.get("result", {}).get("outcome")
+                if not outcome:
                     all_resolved = False
                     updated_legs.append(leg)
                     continue
-                leg["result"] = "won" if prediction == match["result"] else "lost"
+                leg["result"] = "won" if prediction == outcome else "lost"
 
             if leg["result"] == "lost":
                 any_lost = True
@@ -120,7 +122,7 @@ async def resolve_parlays() -> None:
                         amount=parlay["potential_win"],
                         reference_type="parlay",
                         reference_id=str(parlay["_id"]),
-                        description=f"Kombi-Joker Gewinn: Quote {parlay['combined_odds']:.2f} ({parlay['potential_win']:.0f} Coins)",
+                        description=f"Parlay win: odds {parlay['combined_odds']:.2f} ({parlay['potential_win']:.0f} coins)",
                     )
 
             points_earned = parlay["potential_win"] if is_won else 0.0
@@ -170,7 +172,7 @@ async def _void_parlay(parlay: dict, updated_legs: list, now) -> None:
                 amount=parlay["stake"],
                 reference_type="parlay",
                 reference_id=str(parlay["_id"]),
-                description=f"Kombi-Joker Push (Rückerstattung): {parlay['stake']:.0f} Coins",
+                description=f"Parlay push (refund): {parlay['stake']:.0f} coins",
             )
 
     await _db.db.parlays.update_one(

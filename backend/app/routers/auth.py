@@ -50,7 +50,7 @@ async def register(body: UserCreate, request: Request, response: Response, db=De
     if existing:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail="Diese E-Mail-Adresse ist bereits registriert.",
+            detail="This email address is already registered.",
         )
 
     # Age verification (server-side)
@@ -59,7 +59,7 @@ async def register(body: UserCreate, request: Request, response: Response, db=De
     except (ValueError, TypeError):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Ungültiges Geburtsdatum. Format: JJJJ-MM-TT.",
+            detail="Invalid date of birth. Format: YYYY-MM-DD.",
         )
 
     today = utcnow().date()
@@ -67,13 +67,13 @@ async def register(body: UserCreate, request: Request, response: Response, db=De
     if age < 18:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Du musst mindestens 18 Jahre alt sein, um Quotico.de zu nutzen (Jugendschutz).",
+            detail="You must be at least 18 years old to use Quotico.de.",
         )
 
     if not body.disclaimer_accepted:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Bitte bestätige den Haftungsausschluss.",
+            detail="Please accept the disclaimer.",
         )
 
     now = utcnow()
@@ -107,7 +107,7 @@ async def register(body: UserCreate, request: Request, response: Response, db=De
 
     await log_audit(actor_id=user_id, target_id=user_id, action="REGISTER", request=request)
     logger.info("User registered: %s", user_id)
-    return {"message": "Registrierung erfolgreich."}
+    return {"message": "Registration successful."}
 
 
 @router.post("/login")
@@ -117,13 +117,13 @@ async def login(body: UserLogin, request: Request, response: Response, db=Depend
     if not user:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="E-Mail oder Passwort ist falsch.",
+            detail="Invalid email or password.",
         )
 
     if user.get("is_banned"):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Dein Konto wurde gesperrt.",
+            detail="Your account has been suspended.",
         )
 
     user_id = str(user["_id"])
@@ -134,14 +134,14 @@ async def login(body: UserLogin, request: Request, response: Response, db=Depend
         )
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="E-Mail oder Passwort ist falsch.",
+            detail="Invalid email or password.",
         )
 
     # If 2FA is enabled, require verification
     if user.get("is_2fa_enabled"):
         return {
             "requires_2fa": True,
-            "message": "Bitte 2FA-Code eingeben.",
+            "message": "Please enter your 2FA code.",
         }
 
     access = create_access_token(user_id)
@@ -150,7 +150,7 @@ async def login(body: UserLogin, request: Request, response: Response, db=Depend
 
     await log_audit(actor_id=user_id, target_id=user_id, action="LOGIN_SUCCESS", request=request)
     logger.info("User logged in: %s", user_id)
-    return {"message": "Anmeldung erfolgreich."}
+    return {"message": "Login successful."}
 
 
 @router.post("/login/2fa")
@@ -164,19 +164,19 @@ async def login_2fa(body: TwoFALogin, request: Request, response: Response, db=D
     if not user or not verify_password(body.password, user["hashed_password"]):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="E-Mail oder Passwort ist falsch.",
+            detail="Invalid email or password.",
         )
 
     if user.get("is_banned"):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Dein Konto wurde gesperrt.",
+            detail="Your account has been suspended.",
         )
 
     if not user.get("is_2fa_enabled") or not user.get("encrypted_2fa_secret"):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="2FA ist für dieses Konto nicht aktiviert.",
+            detail="2FA is not enabled for this account.",
         )
 
     # Decrypt the stored TOTP secret and verify the code
@@ -202,7 +202,7 @@ async def login_2fa(body: TwoFALogin, request: Request, response: Response, db=D
     if not totp.verify(body.code, valid_window=1):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Ungültiger 2FA-Code.",
+            detail="Invalid 2FA code.",
         )
 
     user_id = str(user["_id"])
@@ -212,7 +212,7 @@ async def login_2fa(body: TwoFALogin, request: Request, response: Response, db=D
 
     await log_audit(actor_id=user_id, target_id=user_id, action="LOGIN_SUCCESS", request=request)
     logger.info("User logged in (2FA): %s", user_id)
-    return {"message": "Anmeldung erfolgreich."}
+    return {"message": "Login successful."}
 
 
 @router.post("/refresh")
@@ -222,7 +222,7 @@ async def refresh_token(request: Request, response: Response):
     if not token:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Kein Refresh-Token vorhanden.",
+            detail="No refresh token provided.",
         )
 
     try:
@@ -230,13 +230,13 @@ async def refresh_token(request: Request, response: Response):
     except JWTError:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Ungültiges Refresh-Token.",
+            detail="Invalid refresh token.",
         )
 
     if payload.get("type") != "refresh":
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Ungültiger Token-Typ.",
+            detail="Invalid token type.",
         )
 
     jti = payload.get("jti")
@@ -250,7 +250,7 @@ async def refresh_token(request: Request, response: Response):
             await invalidate_token_family(family)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Token wurde bereits verwendet. Bitte neu anmelden.",
+            detail="Token has already been used. Please log in again.",
         )
 
     # Rotate: invalidate old, issue new
@@ -258,7 +258,7 @@ async def refresh_token(request: Request, response: Response):
     new_refresh = await rotate_refresh_token(jti, user_id, family)
     set_auth_cookies(response, new_access, new_refresh)
 
-    return {"message": "Token erneuert."}
+    return {"message": "Token refreshed."}
 
 
 @router.post("/logout")
@@ -275,7 +275,7 @@ async def logout(request: Request, response: Response):
             pass
 
     clear_auth_cookies(response)
-    return {"message": "Abgemeldet."}
+    return {"message": "Logged out."}
 
 
 class CompleteProfileRequest(BaseModel):
@@ -295,7 +295,7 @@ async def complete_profile(
     if user.get("is_adult"):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Profil bereits vollständig.",
+            detail="Profile already complete.",
         )
 
     try:
@@ -303,7 +303,7 @@ async def complete_profile(
     except (ValueError, TypeError):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Ungültiges Geburtsdatum. Format: JJJJ-MM-TT.",
+            detail="Invalid date of birth. Format: YYYY-MM-DD.",
         )
 
     today = utcnow().date()
@@ -311,13 +311,13 @@ async def complete_profile(
     if age < 18:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Du musst mindestens 18 Jahre alt sein, um Quotico.de zu nutzen (Jugendschutz).",
+            detail="You must be at least 18 years old to use Quotico.de.",
         )
 
     if not body.disclaimer_accepted:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Bitte bestätige den Haftungsausschluss.",
+            detail="Please accept the disclaimer.",
         )
 
     now = utcnow()
@@ -334,7 +334,7 @@ async def complete_profile(
     await log_audit(
         actor_id=user_id, target_id=user_id, action="AGE_VERIFIED", request=request,
     )
-    return {"message": "Profil vervollständigt."}
+    return {"message": "Profile completed."}
 
 
 @router.get("/me", response_model=UserResponse)
@@ -349,6 +349,8 @@ async def get_me(user=Depends(get_current_user)):
         is_admin=user.get("is_admin", False),
         is_2fa_enabled=user.get("is_2fa_enabled", False),
         is_adult=user.get("is_adult", True),
+        google_linked=bool(user.get("google_sub")),
+        has_password=bool(user.get("hashed_password")),
         terms_accepted_version=user.get("terms_accepted_version"),
         created_at=user["created_at"],
     )
@@ -364,6 +366,6 @@ async def check_alias(name: str = QueryParam(..., min_length=1), db=Depends(get_
     slug = normalize_slug(name)
     existing = await db.users.find_one({"alias_slug": slug}, {"_id": 1})
     if existing:
-        return {"available": False, "reason": "Dieser Name ist bereits vergeben."}
+        return {"available": False, "reason": "This name is already taken."}
 
     return {"available": True, "reason": ""}

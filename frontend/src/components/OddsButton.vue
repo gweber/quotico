@@ -1,7 +1,11 @@
 <script setup lang="ts">
-import { computed } from "vue";
+import { computed, ref, watch } from "vue";
+import { useI18n } from "vue-i18n";
 import { useBetSlipStore } from "@/stores/betslip";
-import type { UserTip } from "@/composables/useUserTips";
+import { useMatchesStore } from "@/stores/matches";
+import type { UserBet } from "@/composables/useUserBets";
+
+const { t } = useI18n();
 
 const props = defineProps<{
   matchId: string;
@@ -9,10 +13,11 @@ const props = defineProps<{
   label: string;
   odds: number | undefined;
   disabled?: boolean;
-  userTip?: UserTip;
+  userTip?: UserBet;
 }>();
 
 const betslip = useBetSlipStore();
+const matchesStore = useMatchesStore();
 
 const isSelected = computed(() =>
   betslip.items.some(
@@ -41,9 +46,40 @@ const formattedOdds = computed(() =>
 );
 
 const ariaLabel = computed(() => {
-  if (isTipped.value) return `${props.label}, Getippt @ ${formattedOdds.value}`;
+  if (isTipped.value) return `${props.label}, ${t("match.betPlaced", { odds: formattedOdds.value })}`;
   return `${props.label}, Quote ${formattedOdds.value}${isSelected.value ? ", ausgewählt" : ""}`;
 });
+
+// Subtle flash when odds change
+const isFlashing = ref(false);
+const prevOdds = ref(props.odds);
+const oddsDirection = ref<"up" | "down" | null>(null);
+
+watch(
+  () => props.odds,
+  (newVal, oldVal) => {
+    if (oldVal != null && newVal != null && oldVal !== newVal) {
+      oddsDirection.value = newVal > oldVal ? "up" : "down";
+      isFlashing.value = true;
+      prevOdds.value = newVal;
+      setTimeout(() => {
+        isFlashing.value = false;
+        oddsDirection.value = null;
+      }, 1500);
+    }
+  }
+);
+
+// Also flash when store signals this match's odds changed
+watch(
+  () => matchesStore.recentlyChangedOdds.has(props.matchId),
+  (changed) => {
+    if (changed && !isTipped.value) {
+      isFlashing.value = true;
+      setTimeout(() => { isFlashing.value = false; }, 1500);
+    }
+  }
+);
 </script>
 
 <template>
@@ -59,6 +95,9 @@ const ariaLabel = computed(() => {
         : isSelected
         ? 'bg-primary-muted/20 border-primary ring-1 ring-primary'
         : 'bg-surface-2 border-surface-3 hover:border-primary hover:bg-primary-muted/10 active:scale-95 cursor-pointer',
+      isFlashing && oddsDirection === 'up' ? 'odds-flash-up' : '',
+      isFlashing && oddsDirection === 'down' ? 'odds-flash-down' : '',
+      isFlashing && !oddsDirection ? 'odds-flash' : '',
     ]"
     :disabled="disabled || !!userTip"
     :aria-label="ariaLabel"
@@ -69,10 +108,41 @@ const ariaLabel = computed(() => {
       {{ prediction }}
     </span>
     <span
-      class="text-sm font-mono font-bold mt-0.5"
-      :class="isTipped ? 'text-success' : isSelected ? 'text-primary' : 'text-text-primary'"
+      class="text-sm font-mono font-bold mt-0.5 transition-colors duration-500"
+      :class="[
+        isTipped ? 'text-success' : isSelected ? 'text-primary' : 'text-text-primary',
+        isFlashing && oddsDirection === 'up' ? '!text-success' : '',
+        isFlashing && oddsDirection === 'down' ? '!text-danger' : '',
+      ]"
     >
       {{ formattedOdds }}
     </span>
   </button>
 </template>
+
+<style scoped>
+@keyframes odds-pulse-up {
+  0% { background-color: transparent; }
+  20% { background-color: rgb(var(--color-success) / 0.15); }
+  100% { background-color: transparent; }
+}
+@keyframes odds-pulse-down {
+  0% { background-color: transparent; }
+  20% { background-color: rgb(var(--color-danger) / 0.15); }
+  100% { background-color: transparent; }
+}
+@keyframes odds-pulse {
+  0% { background-color: transparent; }
+  20% { background-color: rgb(var(--color-primary) / 0.12); }
+  100% { background-color: transparent; }
+}
+.odds-flash-up {
+  animation: odds-pulse-up 1.5s ease-out;
+}
+.odds-flash-down {
+  animation: odds-pulse-down 1.5s ease-out;
+}
+.odds-flash {
+  animation: odds-pulse 1.5s ease-out;
+}
+</style>

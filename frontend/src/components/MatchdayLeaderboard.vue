@@ -29,13 +29,13 @@ async function load() {
   try {
     if (props.mode === "matchday" && props.matchdayId) {
       entries.value = await api.get<LeaderboardEntry[]>(
-        `/spieltag/matchdays/${props.matchdayId}/leaderboard`
+        `/matchday/matchdays/${props.matchdayId}/leaderboard`
       );
     } else {
       const params: Record<string, string> = { sport: props.sportKey };
       if (props.season) params.season = String(props.season);
       entries.value = await api.get<LeaderboardEntry[]>(
-        "/spieltag/leaderboard",
+        "/matchday/leaderboard",
         params
       );
     }
@@ -56,7 +56,7 @@ watch(
 <template>
   <div class="bg-surface-1 rounded-card p-4 border border-surface-3/50">
     <h3 class="text-sm font-semibold text-text-primary mb-3">
-      {{ mode === "matchday" ? "Spieltag-Rangliste" : "Saison-Rangliste" }}
+      {{ mode === "matchday" ? $t('matchday.matchdayLeaderboard') : $t('matchday.seasonLeaderboard') }}
     </h3>
 
     <!-- Loading -->
@@ -75,7 +75,7 @@ watch(
         <thead>
           <tr class="text-left text-text-muted border-b border-surface-3">
             <th class="pb-2 pr-2 w-8 font-medium">#</th>
-            <th class="pb-2 pr-2 font-medium">Spieler</th>
+            <th class="pb-2 pr-2 font-medium">{{ $t('match.players') }}</th>
             <th class="pb-2 pr-2 text-right font-medium">Pkt</th>
             <th v-if="mode === 'season'" class="pb-2 pr-2 text-right font-medium">ST</th>
             <th class="pb-2 text-right font-medium" title="Exakt / Differenz / Tendenz">

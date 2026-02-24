@@ -1,9 +1,11 @@
 <script setup lang="ts">
 import { ref } from "vue";
+import { useI18n } from "vue-i18n";
 import { useApi } from "@/composables/useApi";
 import { useToast } from "@/composables/useToast";
 import { useAuthStore } from "@/stores/auth";
 
+const { t } = useI18n();
 const api = useApi();
 const toast = useToast();
 const auth = useAuthStore();
@@ -20,7 +22,7 @@ async function startSetup() {
     qrCodeSrc.value = `data:image/png;base64,${data.qr_code}`;
     step.value = "setup";
   } catch (e: unknown) {
-    const msg = e instanceof Error ? e.message : "2FA-Setup fehlgeschlagen.";
+    const msg = e instanceof Error ? e.message : t('settings.twoFaSetupError');
     toast.error(msg);
   } finally {
     loading.value = false;
@@ -32,13 +34,13 @@ async function verifyCode() {
   loading.value = true;
   try {
     await api.post("/2fa/verify", { code: totpCode.value });
-    toast.success("2FA erfolgreich aktiviert!");
+    toast.success(t('settings.twoFaActivated'));
     await auth.fetchUser();
     step.value = "idle";
     totpCode.value = "";
     qrCodeSrc.value = "";
   } catch (e: unknown) {
-    const msg = e instanceof Error ? e.message : "Code ungültig.";
+    const msg = e instanceof Error ? e.message : t('settings.twoFaInvalidCode');
     toast.error(msg);
   } finally {
     loading.value = false;
@@ -49,10 +51,10 @@ async function disable2fa() {
   loading.value = true;
   try {
     await api.post("/2fa/disable");
-    toast.success("2FA deaktiviert.");
+    toast.success(t('settings.twoFaDeactivated'));
     await auth.fetchUser();
   } catch (e: unknown) {
-    const msg = e instanceof Error ? e.message : "Fehler beim Deaktivieren.";
+    const msg = e instanceof Error ? e.message : t('settings.twoFaDeactivateError');
     toast.error(msg);
   } finally {
     loading.value = false;
@@ -69,24 +71,24 @@ function cancel() {
 <template>
   <div class="bg-surface-1 rounded-card p-6">
     <h2 class="text-lg font-semibold text-text-primary mb-1">
-      Zwei-Faktor-Authentifizierung (2FA)
+      {{ $t('settings.twoFaHeading') }}
     </h2>
     <p class="text-sm text-text-secondary mb-4">
-      Schütze dein Konto mit einem zusätzlichen Sicherheitsschritt.
+      {{ $t('settings.twoFaDescription') }}
     </p>
 
     <!-- Already enabled -->
     <div v-if="auth.user?.is_2fa_enabled && step === 'idle'">
       <div class="flex items-center gap-2 mb-4">
         <span class="w-2 h-2 rounded-full bg-primary" />
-        <span class="text-sm font-medium text-primary">Aktiviert</span>
+        <span class="text-sm font-medium text-primary">{{ $t('settings.twoFaEnabled') }}</span>
       </div>
       <button
         :disabled="loading"
         class="px-4 py-2 rounded-lg text-sm border border-danger/30 text-danger hover:bg-danger-muted/10 transition-colors disabled:opacity-50"
         @click="disable2fa"
       >
-        2FA deaktivieren
+        {{ $t('settings.twoFaDisable') }}
       </button>
     </div>
 
@@ -94,31 +96,31 @@ function cancel() {
     <div v-else-if="step === 'idle'">
       <div class="flex items-center gap-2 mb-4">
         <span class="w-2 h-2 rounded-full bg-text-muted" />
-        <span class="text-sm text-text-muted">Nicht aktiviert</span>
+        <span class="text-sm text-text-muted">{{ $t('settings.twoFaDisabled') }}</span>
       </div>
       <button
         :disabled="loading"
         class="px-4 py-2 rounded-lg text-sm bg-primary text-surface-0 hover:bg-primary-hover transition-colors disabled:opacity-50"
         @click="startSetup"
       >
-        2FA einrichten
+        {{ $t('settings.twoFaSetup') }}
       </button>
     </div>
 
     <!-- Setup: show QR code -->
     <div v-else-if="step === 'setup'">
       <p class="text-sm text-text-secondary mb-4">
-        Scanne diesen QR-Code mit deiner Authenticator-App (z.B. Google Authenticator, Authy).
+        {{ $t('settings.twoFaQrInstruction') }}
       </p>
       <div class="flex justify-center mb-6">
         <img
           :src="qrCodeSrc"
-          alt="QR-Code für 2FA-Setup"
+          :alt="$t('settings.twoFaQrAlt')"
           class="w-48 h-48 rounded-lg bg-white p-2"
         />
       </div>
       <p class="text-sm text-text-secondary mb-3">
-        Gib anschließend den 6-stelligen Code ein:
+        {{ $t('settings.twoFaCodeInstruction') }}
       </p>
       <form @submit.prevent="verifyCode" class="flex gap-3">
         <input
@@ -136,14 +138,14 @@ function cancel() {
           :disabled="loading || totpCode.length !== 6"
           class="px-4 py-3 rounded-lg text-sm bg-primary text-surface-0 hover:bg-primary-hover transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
         >
-          Bestätigen
+          {{ $t('settings.confirm') }}
         </button>
       </form>
       <button
         class="mt-3 text-sm text-text-muted hover:text-text-secondary transition-colors"
         @click="cancel"
       >
-        Abbrechen
+        {{ $t('common.cancel') }}
       </button>
     </div>
   </div>

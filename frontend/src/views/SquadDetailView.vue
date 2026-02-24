@@ -1,15 +1,17 @@
 <script setup lang="ts">
 import { ref, computed, onMounted } from "vue";
 import { useRoute, useRouter } from "vue-router";
+import { useI18n } from "vue-i18n";
 import { useSquadsStore } from "@/stores/squads";
 import { useToast } from "@/composables/useToast";
-import { useSpieltagStore } from "@/stores/spieltag";
+import { useMatchdayStore } from "@/stores/matchday";
 import SquadLeagueConfigManager from "@/components/SquadLeagueConfigManager.vue";
 
+const { t } = useI18n();
 const route = useRoute();
 const router = useRouter();
 const squads = useSquadsStore();
-const spieltagStore = useSpieltagStore();
+const matchdayStore = useMatchdayStore();
 const toast = useToast();
 
 const squadId = computed(() => route.params.id as string);
@@ -17,21 +19,21 @@ const squad = computed(() => squads.squads.find((s) => s.id === squadId.value) ?
 const copied = ref(false);
 const showLeaveConfirm = ref(false);
 const showDeleteConfirm = ref(false);
-const togglingAutoTipp = ref(false);
+const togglingAutoBet = ref(false);
 const lockMinutesDraft = ref(15);
 const savingLockMinutes = ref(false);
 
-async function handleToggleAutoTipp() {
+async function handleToggleAutoBet() {
   if (!squad.value) return;
-  togglingAutoTipp.value = true;
+  togglingAutoBet.value = true;
   try {
-    const newBlocked = !squad.value.auto_tipp_blocked;
-    await squads.toggleAutoTipp(squadId.value, newBlocked);
-    toast.success(newBlocked ? "Auto-Tipp blockiert." : "Auto-Tipp erlaubt.");
+    const newBlocked = !squad.value.auto_bet_blocked;
+    await squads.toggleAutoBet(squadId.value, newBlocked);
+    toast.success(newBlocked ? t('squadDetail.autoBetBlockedSuccess') : t('squadDetail.autoBetAllowedSuccess'));
   } catch (e: unknown) {
-    toast.error(e instanceof Error ? e.message : "Fehler.");
+    toast.error(e instanceof Error ? e.message : t('common.error'));
   } finally {
-    togglingAutoTipp.value = false;
+    togglingAutoBet.value = false;
   }
 }
 async function handleSaveLockMinutes() {
@@ -39,9 +41,9 @@ async function handleSaveLockMinutes() {
   savingLockMinutes.value = true;
   try {
     await squads.setLockMinutes(squadId.value, lockMinutesDraft.value);
-    toast.success(`Tippfrist auf ${lockMinutesDraft.value} Minuten gesetzt.`);
+    toast.success(t('squadDetail.deadlineSaved', { minutes: lockMinutesDraft.value }));
   } catch (e: unknown) {
-    toast.error(e instanceof Error ? e.message : "Fehler.");
+    toast.error(e instanceof Error ? e.message : t('common.error'));
   } finally {
     savingLockMinutes.value = false;
   }
@@ -51,9 +53,9 @@ async function handleToggleInviteVisible() {
   if (!squad.value) return;
   try {
     await squads.setInviteVisible(squadId.value, !squad.value.invite_visible);
-    toast.success(squad.value.invite_visible ? "Einladungslink für Mitglieder verborgen." : "Einladungslink für Mitglieder freigegeben.");
+    toast.success(squad.value.invite_visible ? t('squadDetail.inviteHiddenSuccess') : t('squadDetail.inviteShownSuccess'));
   } catch (e: unknown) {
-    toast.error(e instanceof Error ? e.message : "Fehler.");
+    toast.error(e instanceof Error ? e.message : t('common.error'));
   }
 }
 
@@ -61,9 +63,9 @@ async function toggleVisibility() {
   if (!squad.value) return;
   try {
     await squads.setVisibility(squadId.value, !squad.value.is_public);
-    toast.success(squad.value.is_public ? "Squad ist jetzt privat." : "Squad ist jetzt öffentlich.");
+    toast.success(squad.value.is_public ? t('squadDetail.madePrivate') : t('squadDetail.madePublic'));
   } catch (e: unknown) {
-    toast.error(e instanceof Error ? e.message : "Fehler.");
+    toast.error(e instanceof Error ? e.message : t('common.error'));
   }
 }
 
@@ -71,51 +73,59 @@ async function toggleOpen() {
   if (!squad.value) return;
   try {
     await squads.setOpen(squadId.value, !squad.value.is_open);
-    toast.success(squad.value.is_open ? "Squad nimmt keine Anfragen mehr an." : "Squad nimmt jetzt Anfragen an.");
+    toast.success(squad.value.is_open ? t('squadDetail.rejectsRequests') : t('squadDetail.acceptsRequests'));
   } catch (e: unknown) {
-    toast.error(e instanceof Error ? e.message : "Fehler.");
+    toast.error(e instanceof Error ? e.message : t('common.error'));
   }
 }
 
 async function handleApprove(requestId: string) {
   try {
     await squads.approveJoinRequest(squadId.value, requestId);
-    toast.success("Beitritt genehmigt.");
+    toast.success(t('squadDetail.joinApproved'));
   } catch (e: unknown) {
-    toast.error(e instanceof Error ? e.message : "Fehler.");
+    toast.error(e instanceof Error ? e.message : t('common.error'));
   }
 }
 
 async function handleDecline(requestId: string) {
   try {
     await squads.declineJoinRequest(squadId.value, requestId);
-    toast.success("Anfrage abgelehnt.");
+    toast.success(t('squadDetail.requestDeclined'));
   } catch (e: unknown) {
-    toast.error(e instanceof Error ? e.message : "Fehler.");
+    toast.error(e instanceof Error ? e.message : t('common.error'));
   }
 }
 
+const error = ref(false);
 const editingDescription = ref(false);
 const descriptionDraft = ref("");
 
-onMounted(async () => {
-  if (squads.squads.length === 0) {
-    await squads.fetchMySquads();
-  }
-  // Fetch spieltag sports for league config manager
-  if (spieltagStore.sports.length === 0) {
-    await spieltagStore.fetchSports();
-  }
-  if (squadId.value) {
-    await squads.fetchLeaderboard(squadId.value);
-  }
-  if (squad.value) {
-    lockMinutesDraft.value = squad.value.lock_minutes ?? 15;
-    if (squad.value.is_admin && squad.value.pending_requests > 0) {
-      await squads.fetchJoinRequests(squadId.value);
+async function reload() {
+  error.value = false;
+  try {
+    if (squads.squads.length === 0) {
+      await squads.fetchMySquads();
     }
+    // Fetch matchday sports for league config manager
+    if (matchdayStore.sports.length === 0) {
+      await matchdayStore.fetchSports();
+    }
+    if (squadId.value) {
+      await squads.fetchLeaderboard(squadId.value);
+    }
+    if (squad.value) {
+      lockMinutesDraft.value = squad.value.lock_minutes ?? 15;
+      if (squad.value.is_admin && squad.value.pending_requests > 0) {
+        await squads.fetchJoinRequests(squadId.value);
+      }
+    }
+  } catch {
+    error.value = true;
   }
-});
+}
+
+onMounted(() => reload());
 
 function inviteLink(): string {
   if (!squad.value) return "";
@@ -127,7 +137,7 @@ const canNativeShare = typeof navigator !== "undefined" && !!navigator.share;
 async function copyLink() {
   await navigator.clipboard.writeText(inviteLink());
   copied.value = true;
-  toast.success("Einladungslink kopiert!");
+  toast.success(t('squadDetail.inviteCopied'));
   setTimeout(() => (copied.value = false), 2000);
 }
 
@@ -135,8 +145,8 @@ async function nativeShare() {
   if (!squad.value) return;
   try {
     await navigator.share({
-      title: `Squad "${squad.value.name}" bei Quotico`,
-      text: "Tritt meinem Squad bei!",
+      title: t('squadDetail.shareTitle', { name: squad.value.name }),
+      text: t('squadDetail.shareText'),
       url: inviteLink(),
     });
   } catch {
@@ -163,7 +173,7 @@ async function saveDescription() {
   const desc = descriptionDraft.value.trim() || null;
   await squads.updateSquad(squadId.value, desc);
   editingDescription.value = false;
-  toast.success("Beschreibung aktualisiert.");
+  toast.success(t('squadDetail.descriptionUpdated'));
 }
 </script>
 
@@ -171,10 +181,16 @@ async function saveDescription() {
   <div class="max-w-2xl mx-auto p-4">
     <!-- Back -->
     <RouterLink to="/squads" class="inline-flex items-center gap-1 text-sm text-text-muted hover:text-text-primary mb-4">
-      <span aria-hidden="true">&larr;</span> Alle Squads
+      <span aria-hidden="true">&larr;</span> {{ $t('squadDetail.allSquads') }}
     </RouterLink>
 
-    <template v-if="squad">
+    <!-- Error -->
+    <div v-if="error" class="text-center py-12">
+      <p class="text-text-muted mb-3">{{ $t('common.loadError') }}</p>
+      <button class="text-sm text-primary hover:underline" @click="reload">{{ $t('common.retry') }}</button>
+    </div>
+
+    <template v-else-if="squad">
       <!-- Header -->
       <div class="bg-surface-1 rounded-card p-5 border border-surface-3/50 mb-4">
         <div class="flex items-start justify-between">
@@ -187,18 +203,18 @@ async function saveDescription() {
                 v-model="descriptionDraft"
                 class="w-full bg-surface-2 border border-surface-3 rounded-lg px-3 py-2 text-sm text-text-primary placeholder:text-text-muted resize-none focus:outline-none focus:ring-1 focus:ring-primary"
                 rows="2"
-                placeholder="Beschreibung hinzufügen..."
+                :placeholder="$t('squadDetail.descriptionPlaceholder')"
                 maxlength="200"
               />
               <div class="flex items-center gap-2">
                 <button
                   class="text-xs px-3 py-1 rounded bg-primary text-surface-0 hover:bg-primary/80 transition-colors"
                   @click="saveDescription"
-                >Speichern</button>
+                >{{ $t('squadDetail.save') }}</button>
                 <button
                   class="text-xs text-text-muted hover:text-text-primary"
                   @click="editingDescription = false"
-                >Abbrechen</button>
+                >{{ $t('common.cancel') }}</button>
               </div>
             </div>
             <div v-else class="mt-1 group">
@@ -207,7 +223,7 @@ async function saveDescription() {
                 <button
                   v-if="squad.is_admin"
                   class="ml-1 text-text-muted/50 hover:text-text-secondary opacity-0 group-hover:opacity-100 transition-opacity"
-                  title="Beschreibung bearbeiten"
+                  :title="$t('squadDetail.editDescription')"
                   @click="startEditDescription"
                 >
                   <svg class="w-3 h-3 inline" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M15.232 5.232l3.536 3.536m-2.036-5.036a2.5 2.5 0 113.536 3.536L6.5 21.036H3v-3.572L16.732 3.732z" /></svg>
@@ -217,20 +233,20 @@ async function saveDescription() {
                 v-else-if="squad.is_admin"
                 class="text-xs text-text-muted/50 hover:text-text-secondary transition-colors"
                 @click="startEditDescription"
-              >+ Beschreibung hinzufügen</button>
+              >{{ $t('squadDetail.addDescription') }}</button>
             </div>
 
-            <p class="text-xs text-text-muted mt-2">{{ squad.member_count }} Mitglieder</p>
+            <p class="text-xs text-text-muted mt-2">{{ squad.member_count }} {{ $t('squads.members') }}</p>
           </div>
           <span
             v-if="squad.is_admin"
             class="px-2 py-0.5 text-xs font-medium bg-primary-muted/20 text-primary rounded-full shrink-0"
-          >Admin</span>
+          >{{ $t('squads.admin') }}</span>
         </div>
 
         <!-- Invite link (visible to admin, or members if invite_visible) -->
         <div v-if="squad.invite_code" class="mt-4 space-y-2">
-          <label class="text-xs text-text-muted">Einladungslink</label>
+          <label class="text-xs text-text-muted">{{ $t('squadDetail.inviteLink') }}</label>
           <div class="flex items-center gap-2">
             <div class="flex-1 bg-surface-2 rounded-lg px-3 py-2.5 text-sm text-text-secondary truncate border border-surface-3">
               {{ inviteLink() }}
@@ -239,12 +255,12 @@ async function saveDescription() {
               class="shrink-0 px-4 py-2.5 text-sm rounded-lg bg-primary text-surface-0 font-medium hover:bg-primary/90 transition-colors"
               @click="copyLink"
             >
-              {{ copied ? "Kopiert!" : "Kopieren" }}
+              {{ copied ? $t('squadDetail.copied') : $t('squadDetail.copy') }}
             </button>
             <button
               v-if="canNativeShare"
               class="shrink-0 p-2.5 rounded-lg bg-surface-2 text-text-secondary hover:bg-surface-3 transition-colors border border-surface-3"
-              title="Teilen"
+              :title="$t('squadDetail.share')"
               @click="nativeShare"
             >
               <svg class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
@@ -255,13 +271,13 @@ async function saveDescription() {
           <!-- Invite visibility toggle (admin only) -->
           <div v-if="squad.is_admin" class="flex items-center justify-between pt-1">
             <span class="text-xs text-text-muted">
-              {{ squad.invite_visible ? "Mitglieder sehen den Einladungslink." : "Nur du siehst den Einladungslink." }}
+              {{ squad.invite_visible ? $t('squadDetail.inviteVisibleMembers') : $t('squadDetail.inviteHiddenMembers') }}
             </span>
             <button
               class="text-xs text-text-muted hover:text-text-secondary transition-colors"
               @click="handleToggleInviteVisible"
             >
-              {{ squad.invite_visible ? "Für Mitglieder verbergen" : "Für Mitglieder freigeben" }}
+              {{ squad.invite_visible ? $t('squadDetail.hideFromMembers') : $t('squadDetail.showToMembers') }}
             </button>
           </div>
         </div>
@@ -275,7 +291,7 @@ async function saveDescription() {
             <svg class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
               <path stroke-linecap="round" stroke-linejoin="round" d="M3.75 13.5l10.5-11.25L12 10.5h8.25L9.75 21.75 12 13.5H3.75z" />
             </svg>
-            War Room
+            {{ $t('squadDetail.warRoom') }}
           </RouterLink>
         </div>
 
@@ -286,18 +302,18 @@ async function saveDescription() {
             class="text-xs text-text-muted hover:text-danger transition-colors"
             @click="showLeaveConfirm = true"
           >
-            Squad verlassen
+            {{ $t('squadDetail.leaveSquad') }}
           </button>
           <div v-else class="flex items-center gap-2">
-            <span class="text-xs text-text-muted">Sicher?</span>
+            <span class="text-xs text-text-muted">{{ $t('squadDetail.confirmLeave') }}</span>
             <button
               class="text-xs px-3 py-1 rounded bg-danger text-white hover:bg-danger/80 transition-colors"
               @click="handleLeave"
-            >Ja, verlassen</button>
+            >{{ $t('squadDetail.confirmLeaveYes') }}</button>
             <button
               class="text-xs text-text-muted hover:text-text-primary"
               @click="showLeaveConfirm = false"
-            >Abbrechen</button>
+            >{{ $t('common.cancel') }}</button>
           </div>
         </div>
 
@@ -306,7 +322,7 @@ async function saveDescription() {
       <!-- Admin: Join Requests -->
       <div v-if="squad.is_admin && squads.joinRequests.length > 0" class="bg-surface-1 rounded-card p-5 border border-surface-3/50 mb-4">
         <h3 class="text-sm font-semibold text-text-primary mb-3">
-          Beitrittsanfragen
+          {{ $t('squadDetail.joinRequests') }}
           <span class="ml-1 px-1.5 py-0.5 text-xs bg-primary/15 text-primary rounded-full">{{ squads.joinRequests.length }}</span>
         </h3>
         <div class="space-y-3">
@@ -324,13 +340,13 @@ async function saveDescription() {
                 class="px-3 py-1 text-xs font-medium rounded-lg bg-primary/10 text-primary border border-primary/30 hover:bg-primary/20 transition-colors"
                 @click="handleApprove(req.id)"
               >
-                Annehmen
+                {{ $t('squadDetail.acceptRequest') }}
               </button>
               <button
                 class="px-3 py-1 text-xs font-medium rounded-lg bg-surface-2 text-text-muted border border-surface-3 hover:bg-surface-3/50 transition-colors"
                 @click="handleDecline(req.id)"
               >
-                Ablehnen
+                {{ $t('squadDetail.declineRequest') }}
               </button>
             </div>
           </div>
@@ -339,26 +355,26 @@ async function saveDescription() {
 
       <!-- Admin: Danger zone -->
       <div v-if="squad.is_admin" class="bg-surface-1 rounded-card p-5 border border-danger/20 mb-4">
-        <h3 class="text-sm font-semibold text-danger mb-3">Gefahrenzone</h3>
+        <h3 class="text-sm font-semibold text-danger mb-3">{{ $t('squadDetail.dangerZone') }}</h3>
         <div v-if="!showDeleteConfirm" class="flex items-center justify-between">
-          <p class="text-xs text-text-muted">Squad dauerhaft löschen. Diese Aktion kann nicht rückgängig gemacht werden.</p>
+          <p class="text-xs text-text-muted">{{ $t('squadDetail.deleteWarning') }}</p>
           <button
             class="shrink-0 ml-4 px-4 py-2 text-xs font-medium rounded-lg border border-danger text-danger hover:bg-danger hover:text-white transition-colors"
             @click="showDeleteConfirm = true"
           >
-            Squad löschen
+            {{ $t('squadDetail.deleteSquad') }}
           </button>
         </div>
         <div v-else class="flex items-center gap-3">
-          <span class="text-xs text-danger">Bist du sicher?</span>
+          <span class="text-xs text-danger">{{ $t('squadDetail.sure') }}</span>
           <button
             class="text-xs px-4 py-2 rounded-lg bg-danger text-white font-medium hover:bg-danger/80 transition-colors"
             @click="handleDelete"
-          >Ja, endgültig löschen</button>
+          >{{ $t('squadDetail.confirmDelete') }}</button>
           <button
             class="text-xs text-text-muted hover:text-text-primary"
             @click="showDeleteConfirm = false"
-          >Abbrechen</button>
+          >{{ $t('common.cancel') }}</button>
         </div>
       </div>
 
@@ -375,23 +391,23 @@ async function saveDescription() {
           <div class="mt-4 pt-4 border-t border-surface-3/50">
             <div class="flex items-center justify-between">
               <div>
-                <p class="text-sm font-medium text-text-primary">Auto-Tipp</p>
+                <p class="text-sm font-medium text-text-primary">{{ $t('squadDetail.autoBet') }}</p>
                 <p class="text-xs text-text-muted">
-                  {{ squad.auto_tipp_blocked
-                    ? "Mitglieder können keine Auto-Tipps verwenden."
-                    : "Mitglieder können Auto-Tipps für nicht getippte Spiele nutzen."
+                  {{ squad.auto_bet_blocked
+                    ? $t('squadDetail.autoBetBlocked')
+                    : $t('squadDetail.autoBetAllowed')
                   }}
                 </p>
               </div>
               <button
                 class="relative shrink-0 w-10 h-6 rounded-full transition-colors focus:outline-none focus:ring-2 focus:ring-primary/50"
-                :class="squad.auto_tipp_blocked ? 'bg-surface-3' : 'bg-primary'"
-                :disabled="togglingAutoTipp"
-                @click="handleToggleAutoTipp"
+                :class="squad.auto_bet_blocked ? 'bg-surface-3' : 'bg-primary'"
+                :disabled="togglingAutoBet"
+                @click="handleToggleAutoBet"
               >
                 <span
                   class="absolute top-0.5 left-0.5 w-5 h-5 bg-white rounded-full shadow transition-transform"
-                  :class="squad.auto_tipp_blocked ? '' : 'translate-x-4'"
+                  :class="squad.auto_bet_blocked ? '' : 'translate-x-4'"
                 />
               </button>
             </div>
@@ -401,9 +417,9 @@ async function saveDescription() {
           <div class="mt-4 pt-4 border-t border-surface-3/50">
             <div class="flex items-center justify-between">
               <div>
-                <p class="text-sm font-medium text-text-primary">Tippfrist</p>
+                <p class="text-sm font-medium text-text-primary">{{ $t('squadDetail.deadline') }}</p>
                 <p class="text-xs text-text-muted">
-                  Tipps sperren {{ squad.lock_minutes }} Min. vor Anpfiff.
+                  {{ t('squadDetail.deadlineDescription', { minutes: squad.lock_minutes }) }}
                 </p>
               </div>
               <div class="flex items-center gap-2">
@@ -425,7 +441,7 @@ async function saveDescription() {
                   :disabled="savingLockMinutes"
                   @click="handleSaveLockMinutes"
                 >
-                  {{ savingLockMinutes ? "..." : "Speichern" }}
+                  {{ savingLockMinutes ? "..." : $t('squadDetail.save') }}
                 </button>
               </div>
             </div>
@@ -435,11 +451,11 @@ async function saveDescription() {
           <div class="mt-4 pt-4 border-t border-surface-3/50">
             <div class="flex items-center justify-between">
               <div>
-                <p class="text-sm font-medium text-text-primary">Sichtbarkeit</p>
+                <p class="text-sm font-medium text-text-primary">{{ $t('squadDetail.visibility') }}</p>
                 <p class="text-xs text-text-muted mt-0.5">
                   {{ squad.is_public
-                    ? "Öffentlich — wird in der Squad-Suche angezeigt."
-                    : "Privat — nur per Einladungscode oder ID erreichbar."
+                    ? $t('squadDetail.publicDescription')
+                    : $t('squadDetail.privateDescription')
                   }}
                 </p>
               </div>
@@ -460,11 +476,11 @@ async function saveDescription() {
           <div class="mt-4 pt-4 border-t border-surface-3/50">
             <div class="flex items-center justify-between">
               <div>
-                <p class="text-sm font-medium text-text-primary">Beitrittsanfragen</p>
+                <p class="text-sm font-medium text-text-primary">{{ $t('squadDetail.joinRequests') }}</p>
                 <p class="text-xs text-text-muted mt-0.5">
                   {{ squad.is_open
-                    ? "Offen — Nutzer können Beitrittsanfragen senden."
-                    : "Gesperrt — Keine neuen Beitrittsanfragen möglich."
+                    ? $t('squadDetail.openStatus')
+                    : $t('squadDetail.closedStatus')
                   }}
                 </p>
               </div>
@@ -486,18 +502,18 @@ async function saveDescription() {
       <!-- Squad Leaderboard -->
       <div class="bg-surface-1 rounded-card border border-surface-3/50">
         <h2 class="text-sm font-semibold text-text-primary px-5 py-3 border-b border-surface-3/50">
-          Squad-Rangliste
+          {{ $t('squadDetail.squadLeaderboard') }}
         </h2>
         <div v-if="squads.leaderboard.length === 0" class="px-5 py-8 text-center">
-          <p class="text-sm text-text-muted">Noch keine Tipps abgegeben.</p>
+          <p class="text-sm text-text-muted">{{ $t('squadDetail.noBets') }}</p>
         </div>
         <table v-else class="w-full text-sm">
           <thead>
             <tr class="text-xs text-text-muted border-b border-surface-3/30">
               <th class="text-left px-5 py-2 font-medium w-12">#</th>
-              <th class="text-left py-2 font-medium">Spieler</th>
-              <th class="text-right py-2 font-medium pr-5">Punkte</th>
-              <th class="text-right py-2 font-medium pr-5 hidden sm:table-cell">Tipps</th>
+              <th class="text-left py-2 font-medium">{{ $t('squadDetail.player') }}</th>
+              <th class="text-right py-2 font-medium pr-5">{{ $t('settings.points') }}</th>
+              <th class="text-right py-2 font-medium pr-5 hidden sm:table-cell">{{ $t('nav.bets') }}</th>
               <th class="text-right py-2 font-medium pr-5 hidden sm:table-cell">&#x2300; Quote</th>
             </tr>
           </thead>
@@ -531,7 +547,7 @@ async function saveDescription() {
 
     <!-- Not found -->
     <div v-else class="text-center py-16">
-      <p class="text-sm text-text-muted">Squad nicht gefunden.</p>
+      <p class="text-sm text-text-muted">{{ $t('squadDetail.notFound') }}</p>
     </div>
   </div>
 </template>

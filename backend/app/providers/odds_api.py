@@ -101,7 +101,7 @@ class TheOddsAPIProvider(BaseProvider):
                 self._api_usage["requests_used"] = doc.get("requests_used", 0)
                 self._api_usage["requests_remaining"] = doc.get("requests_remaining")
         except Exception:
-            pass
+            logger.debug("Failed to load persisted API usage from DB", exc_info=True)
 
     def _track_usage_headers(self, resp) -> None:
         """Extract and store API usage from response headers."""
@@ -125,7 +125,7 @@ class TheOddsAPIProvider(BaseProvider):
                 upsert=True,
             )
         except Exception:
-            pass
+            logger.warning("Failed to persist API usage to DB", exc_info=True)
 
     async def get_odds(self, sport_key: str) -> list[dict[str, Any]]:
         cache_key = f"odds:{sport_key}"

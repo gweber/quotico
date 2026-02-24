@@ -14,17 +14,17 @@ _STATE_KEY = "badge_engine"
 async def check_badges() -> None:
     """Background task: check all users for badge eligibility.
 
-    Smart sleep: skips if no tips resolved and no squads created since last run.
+    Smart sleep: skips if no bets resolved and no squads created since last run.
     """
     last_run = await get_synced_at(_STATE_KEY)
     if last_run:
-        recent_tip = await _db.db.tips.find_one(
+        recent_bet = await _db.db.betting_slips.find_one(
             {"resolved_at": {"$gte": last_run}},
         )
         recent_squad = await _db.db.squads.find_one(
             {"created_at": {"$gte": last_run}},
         )
-        if not recent_tip and not recent_squad:
+        if not recent_bet and not recent_squad:
             logger.debug("Smart sleep: no activity since last run, skipping badge check")
             return
 
@@ -50,34 +50,38 @@ async def _check_user_badges(user_id: str, user: dict) -> int:
     now = utcnow()
     awarded = 0
 
-    # --- Tip count badges ---
-    tip_count = await _db.db.tips.count_documents({"user_id": user_id})
+    # --- Bet count badges (classic single/parlay slips) ---
+    slip_filter = {"user_id": user_id, "type": {"$in": ["single", "parlay"]}}
+    bet_count = await _db.db.betting_slips.count_documents(slip_filter)
 
-    if tip_count >= 1 and "first_tip" not in existing_keys:
-        await _award(user_id, "first_tip", now)
+    if bet_count >= 1 and "first_bet" not in existing_keys:
+        await _award(user_id, "first_bet", now)
         awarded += 1
 
-    if tip_count >= 10 and "ten_tips" not in existing_keys:
-        await _award(user_id, "ten_tips", now)
+    if bet_count >= 10 and "ten_bets" not in existing_keys:
+        await _award(user_id, "ten_bets", now)
         awarded += 1
 
-    if tip_count >= 50 and "fifty_tips" not in existing_keys:
-        await _award(user_id, "fifty_tips", now)
+    if bet_count >= 50 and "fifty_bets" not in existing_keys:
+        await _award(user_id, "fifty_bets", now)
         awarded += 1
 
     # --- Win badges ---
-    won_count = await _db.db.tips.count_documents({"user_id": user_id, "status": "won"})
+    won_count = await _db.db.betting_slips.count_documents(
+        {"user_id": user_id, "status": "won", "type": {"$in": ["single", "parlay"]}}
+    )
 
     if won_count >= 1 and "first_win" not in existing_keys:
         await _award(user_id, "first_win", now)
         awarded += 1
 
-    # --- Underdog King: won a tip with locked_odds > 4.0 ---
+    # --- Underdog King: won a single bet with locked_odds > 4.0 ---
     if "underdog_king" not in existing_keys:
-        underdog = await _db.db.tips.find_one({
+        underdog = await _db.db.betting_slips.find_one({
             "user_id": user_id,
             "status": "won",
-            "locked_odds": {"$gt": 4.0},
+            "type": "single",
+            "selections.locked_odds": {"$gt": 4.0},
         })
         if underdog:
             await _award(user_id, "underdog_king", now)
@@ -85,13 +89,13 @@ async def _check_user_badges(user_id: str, user: dict) -> int:
 
     # --- Hot Streak: 3 consecutive wins ---
     if "hot_streak_3" not in existing_keys:
-        recent_tips = await _db.db.tips.find(
-            {"user_id": user_id, "status": {"$in": ["won", "lost"]}}
+        recent_slips = await _db.db.betting_slips.find(
+            {"user_id": user_id, "status": {"$in": ["won", "lost"]}, "type": {"$in": ["single", "parlay"]}}
         ).sort("resolved_at", -1).limit(20).to_list(length=20)
 
         streak = 0
-        for tip in recent_tips:
-            if tip["status"] == "won":
+        for slip in recent_slips:
+            if slip["status"] == "won":
                 streak += 1
                 if streak >= 3:
                     await _award(user_id, "hot_streak_3", now)
@@ -119,34 +123,34 @@ async def _check_user_badges(user_id: str, user: dict) -> int:
         await _award(user_id, "century_points", now)
         awarded += 1
 
-    # --- Spieltag badges ---
-    if "spieltag_debut" not in existing_keys:
-        spieltag_pred = await _db.db.spieltag_predictions.find_one({
+    # --- Matchday badges ---
+    if "matchday_debut" not in existing_keys:
+        matchday_pred = await _db.db.matchday_predictions.find_one({
             "user_id": user_id, "status": "resolved",
         })
-        if spieltag_pred:
-            await _award(user_id, "spieltag_debut", now)
+        if matchday_pred:
+            await _award(user_id, "matchday_debut", now)
             awarded += 1
 
-    if "hellseher" not in existing_keys:
-        exact_pred = await _db.db.spieltag_predictions.find_one({
+    if "oracle" not in existing_keys:
+        exact_pred = await _db.db.matchday_predictions.find_one({
             "user_id": user_id,
             "predictions.points_earned": 3,
         })
         if exact_pred:
-            await _award(user_id, "hellseher", now)
+            await _award(user_id, "oracle", now)
             awarded += 1
 
-    if "perfekter_spieltag" not in existing_keys:
+    if "perfect_matchday" not in existing_keys:
         # Find a resolved prediction where ALL predictions scored 3
-        perfect = await _db.db.spieltag_predictions.find_one({
+        perfect = await _db.db.matchday_predictions.find_one({
             "user_id": user_id,
             "status": "resolved",
             "predictions": {"$not": {"$elemMatch": {"points_earned": {"$ne": 3}}}},
             "predictions.0": {"$exists": True},  # At least 1 prediction
         })
         if perfect:
-            await _award(user_id, "perfekter_spieltag", now)
+            await _award(user_id, "perfect_matchday", now)
             awarded += 1
 
     return awarded

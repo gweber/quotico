@@ -35,7 +35,7 @@ No test suite exists yet. The frontend uses TypeScript strict mode as its primar
 - **Entry:** `backend/app/main.py` — FastAPI app, scheduler startup, middleware registration
 - **Config:** `backend/app/config.py` — Pydantic Settings, reads `.env` from project root
 - **Database:** `backend/app/database.py` — Motor async MongoDB client, index creation, migrations on startup
-- **Routers:** `backend/app/routers/` — one file per domain (auth, matches, tips, squads, battles, etc.)
+- **Routers:** `backend/app/routers/` — one file per domain (auth, matches, bets, squads, battles, matchday, etc.)
 - **Services:** `backend/app/services/` — business logic separated from HTTP layer
 - **Providers:** `backend/app/providers/` — external API integrations (TheOddsAPI, football-data.org, OpenLigaDB, ESPN)
 - **Workers:** `backend/app/workers/` — APScheduler background jobs (odds polling, match resolution, leaderboard materialization, badge engine) running every 30 minutes
@@ -45,12 +45,18 @@ No test suite exists yet. The frontend uses TypeScript strict mode as its primar
 - **State:** Pinia stores in `frontend/src/stores/`
 - **Routing:** Vue Router in `frontend/src/router/index.ts`
 - **API calls:** `frontend/src/composables/useApi.ts` — fetch wrapper with auth
+- **i18n:** vue-i18n with locale files in `frontend/src/locales/` (`de.ts`, `en.ts`). Default locale: `de`. Config in `frontend/src/i18n.ts`. Use `$t('key')` in templates, `t('key')` in script setup via `useI18n()`.
 - **Styling:** Tailwind CSS
 - **Path alias:** `@/*` maps to `frontend/src/*`
 - **Dev proxy:** Vite proxies `/api` and `/ws` to backend at localhost:4201
 
 ### Database — MongoDB 7
-No ORM. Direct Motor async driver with `app.database.db` module-level instance. Collections: `users`, `matches`, `tips`, `squads`, `battles`, `battle_participations`, `leaderboard`, `points_transactions`, `badges`, `audit_logs`, `refresh_tokens`, `access_blocklist`. Indexes are created on startup in `database._ensure_indexes()`.
+No ORM. Direct Motor async driver with `app.database.db` module-level instance. Collections: `users`, `matches`, `bets`, `squads`, `battles`, `battle_participations`, `leaderboard`, `points_transactions`, `badges`, `audit_logs`, `refresh_tokens`, `access_blocklist`, `matchday_predictions`, `matchday_leaderboard`, `quotico_tips`, `join_requests`, `wallet_transactions`. Indexes are created on startup in `database._ensure_indexes()`. Naming migrations run on startup in `database._migrate_naming_refactor()`.
+
+**Datetime convention:** MongoDB returns naive datetimes (no tzinfo). All Python-side datetime arithmetic must use the helpers in `backend/app/utils.py`:
+- `utcnow()` — tz-aware "now" (use instead of `datetime.now()`/`datetime.utcnow()`)
+- `ensure_utc(dt)` — wrap any datetime read from MongoDB before comparing/subtracting with `utcnow()`
+- `parse_utc(value)` — parse a string or datetime into tz-aware UTC (use for provider API responses)
 
 ### Auth Flow
 - JWT access tokens (15 min, httpOnly cookie) + refresh tokens (7 days, httpOnly cookie)
@@ -62,7 +68,7 @@ No ORM. Direct Motor async driver with `app.database.db` module-level instance. 
 - Passwords hashed with Argon2
 
 ### Key Business Logic
-- **Tips:** User selects match outcome (1/X/2), odds locked server-side at creation. On match completion, worker resolves tips: win = `locked_odds × 10` points, loss = 0.
+- **Bets:** User selects match outcome (1/X/2), odds locked server-side at creation. On match completion, worker resolves bets: win = `locked_odds × 10` points, loss = 0.
 - **Squads:** User groups with invite codes (QUO-XXXX-XX). One admin per squad.
 - **Battles:** Squad vs squad over a date range, resolved by weighted average points.
 - **Aliases:** Auto-generated on registration (e.g. "BrilliantFlamingo"), customizable. Slugified for uniqueness.

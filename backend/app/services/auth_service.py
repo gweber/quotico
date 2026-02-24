@@ -158,7 +158,7 @@ async def get_current_user(request: Request, db=Depends(get_db)) -> dict:
     if not token:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Nicht angemeldet",
+            detail="Not authenticated",
         )
 
     try:
@@ -166,13 +166,13 @@ async def get_current_user(request: Request, db=Depends(get_db)) -> dict:
     except JWTError:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Ungültiges Token",
+            detail="Invalid token",
         )
 
     if payload.get("type") != "access":
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Ungültiger Token-Typ",
+            detail="Invalid token type",
         )
 
     jti = payload.get("jti")
@@ -181,14 +181,14 @@ async def get_current_user(request: Request, db=Depends(get_db)) -> dict:
         if blocked:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Token widerrufen",
+                detail="Token revoked",
             )
 
     user_id = payload.get("sub")
     if not user_id:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Ungültiges Token",
+            detail="Invalid token",
         )
 
     from bson import ObjectId
@@ -198,13 +198,13 @@ async def get_current_user(request: Request, db=Depends(get_db)) -> dict:
     if not user:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Nutzer nicht gefunden",
+            detail="User not found",
         )
 
     if user.get("is_banned"):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Dein Konto wurde gesperrt.",
+            detail="Your account has been banned.",
         )
 
     return user
@@ -216,6 +216,6 @@ async def get_admin_user(request: Request, db=Depends(get_db)) -> dict:
     if not user.get("is_admin"):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Nur für Administratoren.",
+            detail="Admin access only.",
         )
     return user

@@ -24,21 +24,21 @@ def normalize_slug(alias: str) -> str:
 def validate_alias(alias: str) -> str | None:
     """Validate an alias. Returns an error message string, or None if valid."""
     if len(alias) < ALIAS_MIN_LENGTH:
-        return f"Alias muss mindestens {ALIAS_MIN_LENGTH} Zeichen lang sein."
+        return f"Alias must be at least {ALIAS_MIN_LENGTH} characters long."
 
     if len(alias) > ALIAS_MAX_LENGTH:
-        return f"Alias darf maximal {ALIAS_MAX_LENGTH} Zeichen lang sein."
+        return f"Alias must be at most {ALIAS_MAX_LENGTH} characters long."
 
     if not ALIAS_PATTERN.match(alias):
-        return "Alias darf nur Buchstaben (A-Z), Ziffern (0-9) und Unterstriche (_) enthalten."
+        return "Alias may only contain letters (A-Z), digits (0-9), and underscores (_)."
 
     slug = normalize_slug(alias)
 
     if slug in ALIAS_BLACKLIST:
-        return "Dieser Name ist reserviert."
+        return "This name is reserved."
 
     if DEFAULT_ALIAS_PATTERN.match(slug):
-        return "Dieser Name ist reserviert."
+        return "This name is reserved."
 
     return None
 

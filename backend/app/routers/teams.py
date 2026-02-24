@@ -25,5 +25,5 @@ async def get_team(
     """Team detail page data: profile, form, season stats, upcoming schedule."""
     profile = await get_team_profile(team_slug, sport_key)
     if not profile:
-        raise HTTPException(status_code=404, detail="Team nicht gefunden.")
+        raise HTTPException(status_code=404, detail="Team not found.")
     return profile

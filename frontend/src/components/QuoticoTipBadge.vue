@@ -1,6 +1,9 @@
 <script setup lang="ts">
 import { ref, computed } from "vue";
+import { useI18n } from "vue-i18n";
 import type { QuoticoTip } from "@/composables/useQuoticoTip";
+
+const { t } = useI18n();
 
 const props = defineProps<{
   tip: QuoticoTip;
@@ -13,10 +16,10 @@ const expanded = ref(false);
 const isNoSignal = computed(() => !!props.tip.skip_reason);
 
 const pickLabel = computed(() => {
-  if (isNoSignal.value) return "Keine Empfehlung";
+  if (isNoSignal.value) return t("qtip.noRecommendation");
   if (props.tip.recommended_selection === "1") return props.homeTeam;
   if (props.tip.recommended_selection === "2") return props.awayTeam;
-  return "Unentschieden";
+  return t("match.draw");
 });
 
 const confidencePct = computed(() => Math.round(props.tip.confidence * 100));
@@ -57,9 +60,110 @@ const hasBtb = computed(() => pickedBtb.value?.contributes === true);
 const btbPositive = computed(() => hasBtb.value && pickedBtb.value!.evd > 0.10);
 const btbNegative = computed(() => hasBtb.value && pickedBtb.value!.evd < -0.10);
 
+// Rest advantage signal
+const restAdvantage = computed(() => props.tip.tier_signals.rest_advantage);
+const hasRest = computed(() => restAdvantage.value?.contributes === true);
+
 const tierCount = computed(() =>
-  [hasPoisson.value, hasMomentum.value, hasSharp.value, hasKings.value, hasBtb.value].filter(Boolean).length
+  [hasPoisson.value, hasMomentum.value, hasSharp.value, hasKings.value, hasBtb.value, hasRest.value].filter(Boolean).length
 );
+
+const localizedJustification = computed(() => {
+  const tip = props.tip;
+  const sel = tip.recommended_selection;
+  const teamName = sel === "1" ? props.homeTeam : sel === "2" ? props.awayTeam : t("match.draw");
+  const parts: string[] = [];
+
+  // Recommendation headline
+  parts.push(t("qbot.justRecommendation", { team: teamName, outcome: sel }));
+
+  // Model vs market
+  if (tip.true_probability > 0) {
+    parts.push(t("qbot.justModel", {
+      truePct: (tip.true_probability * 100).toFixed(0),
+      impliedPct: (tip.implied_probability * 100).toFixed(0),
+      edge: tip.edge_pct.toFixed(1),
+    }));
+  }
+
+  // Expected goals
+  if (tip.expected_goals_home > 0) {
+    parts.push(t("qbot.justExpectedGoals", {
+      home: tip.expected_goals_home.toFixed(1),
+      away: tip.expected_goals_away.toFixed(1),
+    }));
+  }
+
+  // H2H
+  const poisson = tip.tier_signals.poisson;
+  if (poisson && (poisson as any).h2h_total >= 3) {
+    parts.push(t("qbot.justH2h", { count: (poisson as any).h2h_total }));
+  }
+
+  // Momentum / Form
+  const mom = tip.tier_signals.momentum;
+  if (mom?.contributes && mom.gap > 0.20) {
+    parts.push(t("qbot.justMomentum"));
+  }
+
+  // Sharp money
+  const sharp = tip.tier_signals.sharp_movement;
+  if (sharp?.has_sharp_movement) {
+    if (sharp.is_late_money) {
+      parts.push(t("qbot.justSharpLate"));
+    } else {
+      parts.push(t("qbot.justSharp"));
+    }
+  }
+  if ((sharp as any)?.has_steam_move) {
+    parts.push(t("qbot.justSteam"));
+  }
+  if ((sharp as any)?.has_reversal) {
+    parts.push(t("qbot.justReversal"));
+  }
+
+  // King's Choice
+  const kings = tip.tier_signals.kings_choice;
+  if (kings?.has_kings_choice) {
+    parts.push(t("qbot.justKings", { pct: ((kings as any).kings_pct * 100).toFixed(0) }));
+  }
+
+  // BTB / EVD
+  if (hasBtb.value && pickedBtb.value) {
+    const evdVal = pickedBtb.value.evd;
+    const ratioPct = (pickedBtb.value.btb_ratio * 100).toFixed(0);
+    if (evdVal > 0.10) {
+      parts.push(t("qbot.justBtbPositive", { team: teamName, pct: ratioPct, evd: (evdVal * 100).toFixed(1) + "%" }));
+    } else if (evdVal < -0.10) {
+      parts.push(t("qbot.justBtbNegative", { team: teamName, evd: (evdVal * 100).toFixed(1) + "%" }));
+    }
+  }
+
+  // Rest advantage
+  if (hasRest.value && restAdvantage.value) {
+    const diff = restAdvantage.value.diff;
+    const restedTeam = diff > 0 ? props.homeTeam : props.awayTeam;
+    const penalty = Math.abs(diff) >= 4 ? "10" : "5";
+    parts.push(t("qbot.justRestAdvantage", {
+      team: restedTeam,
+      homeDays: restAdvantage.value.home_rest_days,
+      awayDays: restAdvantage.value.away_rest_days,
+      penalty,
+    }));
+  }
+
+  // Fallback: if only momentum-based (no poisson)
+  if (!hasPoisson.value && mom?.contributes) {
+    parts.length = 0;
+    parts.push(t("qbot.justRecommendation", { team: teamName, outcome: sel }));
+    parts.push(t("qbot.justFormBased", { gap: (mom.gap * 100).toFixed(0) }));
+    if (sharp?.has_sharp_movement) {
+      parts.push(t("qbot.justFormSharp"));
+    }
+  }
+
+  return parts.join(" ");
+});
 </script>
 
 <template>
@@ -104,12 +208,12 @@ const tierCount = computed(() =>
           <span
             v-if="hasPoisson"
             class="text-[10px] text-blue-400"
-            title="Poisson-Modell"
+            :title="$t('qtipPerformance.signalPoisson')"
           >P</span>
           <span
             v-if="hasMomentum"
             class="text-[10px] text-orange-400"
-            title="Formstärke"
+            :title="$t('common.formStrength')"
           >F</span>
           <span
             v-if="hasSharp"
@@ -125,8 +229,13 @@ const tierCount = computed(() =>
             v-if="hasBtb"
             class="text-[10px]"
             :class="btbPositive ? 'text-teal-400' : btbNegative ? 'text-rose-400' : 'text-text-muted'"
-            :title="btbPositive ? 'Markt-Kante (unterschätzt)' : btbNegative ? 'Markt-Risiko (überschätzt)' : 'Beat the Books'"
+            :title="btbPositive ? $t('qtip.marketEdgeTitle') : btbNegative ? $t('qtip.marketRiskTitle') : 'Beat the Books'"
           >B</span>
+          <span
+            v-if="hasRest"
+            class="text-[10px] text-cyan-400"
+            :title="$t('qtipPerformance.signalRest')"
+          >R</span>
         </div>
 
         <!-- Confidence percentage -->
@@ -156,19 +265,19 @@ const tierCount = computed(() =>
 
           <!-- Justification (active tips) -->
           <p v-else class="text-text-secondary leading-relaxed">
-            {{ tip.justification }}
+            {{ localizedJustification }}
           </p>
 
           <!-- xG + Probability breakdown -->
           <div v-if="tip.expected_goals_home > 0" class="grid grid-cols-2 gap-3">
             <div class="bg-surface-2/50 rounded-lg p-2">
-              <div class="text-text-muted mb-1">Erwartete Tore</div>
+              <div class="text-text-muted mb-1">{{ $t('qtip.expectedGoals') }}</div>
               <div class="font-mono font-bold text-text-primary tabular-nums text-sm">
                 {{ tip.expected_goals_home.toFixed(1) }} – {{ tip.expected_goals_away.toFixed(1) }}
               </div>
             </div>
             <div class="bg-surface-2/50 rounded-lg p-2">
-              <div class="text-text-muted mb-1">Modell vs Markt</div>
+              <div class="text-text-muted mb-1">{{ $t('qtip.modelVsMarket') }}</div>
               <div class="font-mono font-bold tabular-nums text-sm">
                 <span class="text-emerald-400">{{ (tip.true_probability * 100).toFixed(0) }}%</span>
                 <span class="text-text-muted mx-1">vs</span>
@@ -180,11 +289,11 @@ const tierCount = computed(() =>
           <!-- Poisson probabilities -->
           <div v-if="tip.tier_signals.poisson" class="space-y-1.5">
             <div class="text-text-muted font-semibold uppercase tracking-wider text-[10px]">
-              Poisson-Wahrscheinlichkeiten
+              {{ $t('qtip.poissonProbs') }}
             </div>
             <div class="flex gap-2">
               <div
-                v-for="(label, key) in { '1': homeTeam, 'X': 'Unentschieden', '2': awayTeam }"
+                v-for="(label, key) in { '1': homeTeam, 'X': $t('match.draw'), '2': awayTeam }"
                 :key="key"
                 class="flex-1 bg-surface-2/50 rounded-lg p-1.5 text-center"
               >
@@ -205,20 +314,20 @@ const tierCount = computed(() =>
               v-if="hasPoisson"
               class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-blue-500/10 text-blue-400"
             >
-              <span class="font-bold">P</span> Poisson
+              <span class="font-bold">P</span> Dixon-Coles
             </span>
             <span
               v-if="hasMomentum"
               class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-orange-500/10 text-orange-400"
             >
-              <span class="font-bold">F</span> Form {{ (tip.tier_signals.momentum.gap * 100).toFixed(0) }}% Vorsprung
+              <span class="font-bold">F</span> {{ $t('qtip.formLead', { gap: (tip.tier_signals.momentum.gap * 100).toFixed(0) }) }}
             </span>
             <span
               v-if="hasSharp"
               class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-purple-500/10 text-purple-400"
             >
               <span class="font-bold">S</span> Sharp
-              {{ tip.tier_signals.sharp_movement.is_late_money ? '(Spät)' : '' }}
+              {{ tip.tier_signals.sharp_movement.is_late_money ? $t('qtip.sharpLate') : '' }}
               -{{ tip.tier_signals.sharp_movement.max_drop_pct }}%
             </span>
             <span
@@ -231,20 +340,26 @@ const tierCount = computed(() =>
               v-if="btbPositive"
               class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-teal-500/10 text-teal-400"
             >
-              <span class="font-bold">B</span> Markt-Kante {{ (pickedBtb!.btb_ratio * 100).toFixed(0) }}%
+              <span class="font-bold">B</span> {{ $t('qtip.marketEdge') }} {{ (pickedBtb!.btb_ratio * 100).toFixed(0) }}%
             </span>
             <span
               v-if="btbNegative"
               class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-rose-500/10 text-rose-400"
             >
-              <span class="font-bold">B</span> Markt-Risiko
+              <span class="font-bold">B</span> {{ $t('qtip.marketRisk') }}
+            </span>
+            <span
+              v-if="hasRest && restAdvantage"
+              class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-cyan-500/10 text-cyan-400"
+            >
+              <span class="font-bold">R</span> {{ $t('qtip.restAdvantage') }} {{ restAdvantage.home_rest_days }}d vs {{ restAdvantage.away_rest_days }}d
             </span>
           </div>
 
           <!-- BTB / EVD detail section -->
           <div v-if="hasBtb && btb" class="space-y-1.5">
             <div class="text-text-muted font-semibold uppercase tracking-wider text-[10px]">
-              Beat the Books (EVD)
+              {{ $t('qtip.beatTheBooks') }}
             </div>
             <div class="flex gap-2">
               <!-- Home EVD -->

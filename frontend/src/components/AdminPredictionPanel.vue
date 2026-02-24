@@ -1,14 +1,17 @@
 <script setup lang="ts">
 import { ref, watch, computed } from "vue";
-import { useSpieltagStore } from "@/stores/spieltag";
+import { useI18n } from "vue-i18n";
+import { useMatchdayStore } from "@/stores/matchday";
 import { useToast } from "@/composables/useToast";
+
+const { t } = useI18n();
 
 const props = defineProps<{
   squadId: string;
   matchdayId: string;
 }>();
 
-const spieltag = useSpieltagStore();
+const matchday = useMatchdayStore();
 const toast = useToast();
 
 const expanded = ref(false);
@@ -21,23 +24,23 @@ const adminDrafts = ref<Map<string, { home: number; away: number }>>(new Map());
 
 // Load squad members when panel is expanded
 watch(expanded, async (isOpen) => {
-  if (isOpen && spieltag.squadMembers.length === 0) {
-    await spieltag.fetchSquadMembers(props.squadId);
+  if (isOpen && matchday.squadMembers.length === 0) {
+    await matchday.fetchSquadMembers(props.squadId);
   }
 });
 
 // Load target user's predictions when selected
 watch(selectedUserId, async (userId) => {
   if (userId && props.matchdayId) {
-    await spieltag.fetchAdminPredictions(
+    await matchday.fetchAdminPredictions(
       props.matchdayId,
       props.squadId,
       userId
     );
     // Populate drafts from existing predictions
     adminDrafts.value = new Map();
-    if (spieltag.adminTargetPredictions?.predictions) {
-      for (const p of spieltag.adminTargetPredictions.predictions) {
+    if (matchday.adminTargetPredictions?.predictions) {
+      for (const p of matchday.adminTargetPredictions.predictions) {
         adminDrafts.value.set(p.match_id, {
           home: p.home_score,
           away: p.away_score,
@@ -45,7 +48,7 @@ watch(selectedUserId, async (userId) => {
       }
     }
   } else {
-    spieltag.adminTargetPredictions = null;
+    matchday.adminTargetPredictions = null;
     adminDrafts.value = new Map();
   }
 });
@@ -53,12 +56,12 @@ watch(selectedUserId, async (userId) => {
 const unlockedSet = computed(
   () =>
     new Set(
-      spieltag.adminTargetPredictions?.admin_unlocked_matches ?? []
+      matchday.adminTargetPredictions?.admin_unlocked_matches ?? []
     )
 );
 
 function getPrediction(matchId: string) {
-  return spieltag.adminTargetPredictions?.predictions.find(
+  return matchday.adminTargetPredictions?.predictions.find(
     (p) => p.match_id === matchId
   );
 }
@@ -76,7 +79,7 @@ function setDraft(matchId: string, home: number, away: number) {
 async function handleUnlock(matchId: string) {
   if (!selectedUserId.value) return;
   unlockingMatch.value = matchId;
-  const ok = await spieltag.adminUnlockMatch(
+  const ok = await matchday.adminUnlockMatch(
     props.squadId,
     props.matchdayId,
     selectedUserId.value,
@@ -95,7 +98,7 @@ async function handleSavePrediction(matchId: string) {
   const draft = getDraft(matchId);
   if (!draft) return;
   savingMatch.value = matchId;
-  const result = await spieltag.adminSavePrediction(
+  const result = await matchday.adminSavePrediction(
     props.squadId,
     props.matchdayId,
     selectedUserId.value,
@@ -110,7 +113,7 @@ async function handleSavePrediction(matchId: string) {
         : "";
     toast.success(`Tipp eingetragen${ptsMsg}.`);
   } else {
-    toast.error("Fehler beim Speichern.");
+    toast.error(t("matchday.saveError"));
   }
   savingMatch.value = null;
 }
@@ -166,9 +169,9 @@ async function handleSavePrediction(matchId: string) {
           v-model="selectedUserId"
           class="w-full bg-surface-2 border border-surface-3 rounded-lg px-3 py-2 text-sm text-text-primary focus:outline-none focus:ring-1 focus:ring-primary"
         >
-          <option :value="null">-- Mitglied wählen --</option>
+          <option :value="null">{{ $t('admin.selectMember') }}</option>
           <option
-            v-for="member in spieltag.squadMembers"
+            v-for="member in matchday.squadMembers"
             :key="member.user_id"
             :value="member.user_id"
           >
@@ -181,21 +184,21 @@ async function handleSavePrediction(matchId: string) {
       <template v-if="selectedUserId">
         <div class="space-y-2">
           <div
-            v-for="match in spieltag.matches"
+            v-for="match in matchday.matches"
             :key="match.id"
             class="bg-surface-2 rounded-lg p-3 border border-surface-3/50"
           >
             <div class="flex items-center justify-between mb-2">
               <div class="flex-1 min-w-0">
                 <p class="text-xs font-medium text-text-primary truncate">
-                  {{ match.teams.home }} — {{ match.teams.away }}
+                  {{ match.home_team }} — {{ match.away_team }}
                 </p>
                 <div class="flex items-center gap-2 mt-0.5">
                   <span
-                    v-if="match.status === 'completed'"
+                    v-if="match.status === 'final'"
                     class="text-[10px] text-text-muted"
-                    >Ergebnis: {{ match.home_score }}:{{
-                      match.away_score
+                    >{{ $t('match.result') }} {{ (match.result as any)?.home_score }}:{{
+                      (match.result as any)?.away_score
                     }}</span
                   >
                   <span
@@ -310,7 +313,7 @@ async function handleSavePrediction(matchId: string) {
         v-else
         class="text-xs text-text-muted text-center py-2"
       >
-        Wähle ein Mitglied, um dessen Tipps zu verwalten.
+        {{ $t('admin.selectMemberInstruction') }}
       </p>
     </div>
   </div>

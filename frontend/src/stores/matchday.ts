@@ -3,7 +3,7 @@ import { ref, computed } from "vue";
 import { useApi } from "@/composables/useApi";
 import { populateTipCache, type QuoticoTip } from "@/composables/useQuoticoTip";
 
-export interface SpieltagSport {
+export interface MatchdaySport {
   sport_key: string;
   label: string;
   matchdays_per_season: number;
@@ -22,17 +22,14 @@ export interface Matchday {
   all_resolved: boolean;
 }
 
-export interface SpieltagMatch {
+export interface MatchdayMatch {
   id: string;
-  teams: { home: string; away: string };
-  commence_time: string;
-  status: string;
-  current_odds: Record<string, number>;
-  totals_odds?: { over: number; under: number; line: number };
-  spreads_odds?: { home_line: number; home_odds: number; away_line: number; away_odds: number };
-  result: string | null;
-  home_score: number | null;
-  away_score: number | null;
+  home_team: string;
+  away_team: string;
+  match_date: string;
+  status: string;  // scheduled, live, final, cancelled
+  odds: Record<string, unknown>;
+  result: Record<string, unknown>;
   is_locked: boolean;
   h2h_context?: Record<string, unknown> | null;
   quotico_tip?: QuoticoTip | null;
@@ -47,10 +44,10 @@ export interface Prediction {
   points_earned: number | null;
 }
 
-export interface SpieltagPrediction {
+export interface MatchdayPrediction {
   matchday_id: string;
   squad_id: string | null;
-  auto_tipp_strategy: string;
+  auto_bet_strategy: string;
   predictions: Prediction[];
   admin_unlocked_matches: string[];
   total_points: number | null;
@@ -62,7 +59,7 @@ export interface SquadMember {
   alias: string;
 }
 
-export interface MoneylineTip {
+export interface MoneylineBet {
   id: string;
   match_id: string;
   selection: string; // "1", "X", "2"
@@ -71,22 +68,22 @@ export interface MoneylineTip {
   status: string; // "pending", "won", "lost", "void"
 }
 
-export const useSpieltagStore = defineStore("spieltag", () => {
+export const useMatchdayStore = defineStore("matchday", () => {
   const api = useApi();
 
   // State
-  const sports = ref<SpieltagSport[]>([]);
+  const sports = ref<MatchdaySport[]>([]);
   const matchdays = ref<Matchday[]>([]);
   const currentMatchday = ref<Matchday | null>(null);
-  const matches = ref<SpieltagMatch[]>([]);
-  const predictions = ref<SpieltagPrediction | null>(null);
+  const matches = ref<MatchdayMatch[]>([]);
+  const predictions = ref<MatchdayPrediction | null>(null);
 
   // Draft state (local edits before saving)
   const draftPredictions = ref<Map<string, { home: number; away: number }>>(new Map());
   const draftAutoStrategy = ref<string>("none");
 
-  // Moneyline tips state (keyed by match_id)
-  const moneylineTips = ref<Map<string, MoneylineTip>>(new Map());
+  // Moneyline bets state (keyed by match_id)
+  const moneylineBets = ref<Map<string, MoneylineBet>>(new Map());
 
   const loading = ref(false);
   const saving = ref(false);
@@ -96,7 +93,7 @@ export const useSpieltagStore = defineStore("spieltag", () => {
   // --- In-memory caches (not reactive — internal bookkeeping only) ---
   interface CachedDetail {
     matchday: Matchday;
-    matches: SpieltagMatch[];
+    matches: MatchdayMatch[];
     fetchedAt: number;
   }
   const detailCache = new Map<string, CachedDetail>();
@@ -111,7 +108,7 @@ export const useSpieltagStore = defineStore("spieltag", () => {
   // Admin state
   const squadMembers = ref<SquadMember[]>([]);
   const adminTargetUserId = ref<string | null>(null);
-  const adminTargetPredictions = ref<SpieltagPrediction | null>(null);
+  const adminTargetPredictions = ref<MatchdayPrediction | null>(null);
 
   // Computed
   const adminUnlockedSet = computed(() =>
@@ -128,13 +125,13 @@ export const useSpieltagStore = defineStore("spieltag", () => {
     matches.value.filter((m) => m.is_locked)
   );
 
-  const tippedCount = computed(() => draftPredictions.value.size);
+  const betCount = computed(() => draftPredictions.value.size);
 
   // Actions
   async function fetchSports() {
     if (sports.value.length > 0) return; // static for the session
     try {
-      sports.value = await api.get<SpieltagSport[]>("/spieltag/sports");
+      sports.value = await api.get<MatchdaySport[]>("/matchday/sports");
     } catch {
       sports.value = [];
     }
@@ -152,7 +149,7 @@ export const useSpieltagStore = defineStore("spieltag", () => {
 
     loading.value = true;
     try {
-      matchdays.value = await api.get<Matchday[]>("/spieltag/matchdays", {
+      matchdays.value = await api.get<Matchday[]>("/matchday/matchdays", {
         sport: sportKey,
       });
       matchdaysCache.set(sportKey, { data: matchdays.value, fetchedAt: Date.now() });
@@ -163,22 +160,22 @@ export const useSpieltagStore = defineStore("spieltag", () => {
     }
   }
 
-  function applyDetail(data: { matchday: Matchday; matches: SpieltagMatch[] }) {
+  function applyDetail(data: { matchday: Matchday; matches: MatchdayMatch[] }) {
     currentMatchday.value = data.matchday;
     const sorted = [...data.matches];
     if (data.matchday.status === "in_progress") {
       sorted.sort((a, b) => {
-        const aDone = a.status === "completed" ? 1 : 0;
-        const bDone = b.status === "completed" ? 1 : 0;
+        const aDone = a.status === "final" ? 1 : 0;
+        const bDone = b.status === "final" ? 1 : 0;
         return aDone - bDone;
       });
     }
     matches.value = sorted;
-    const tips: QuoticoTip[] = [];
+    const qTips: QuoticoTip[] = [];
     for (const m of data.matches) {
-      if (m.quotico_tip) tips.push(m.quotico_tip);
+      if (m.quotico_tip) qTips.push(m.quotico_tip);
     }
-    if (tips.length) populateTipCache(tips);
+    if (qTips.length) populateTipCache(qTips);
   }
 
   async function doFetchDetail(matchdayId: string, squadId?: string | null, showSpinner = true) {
@@ -188,8 +185,8 @@ export const useSpieltagStore = defineStore("spieltag", () => {
       if (squadId) params.squad_id = squadId;
       const data = await api.get<{
         matchday: Matchday;
-        matches: SpieltagMatch[];
-      }>(`/spieltag/matchdays/${matchdayId}`, params);
+        matches: MatchdayMatch[];
+      }>(`/matchday/matchdays/${matchdayId}`, params);
 
       detailCache.set(matchdayId, {
         matchday: data.matchday,
@@ -239,8 +236,8 @@ export const useSpieltagStore = defineStore("spieltag", () => {
     try {
       const params: Record<string, string> = {};
       if (activeSquadId.value) params.squad_id = activeSquadId.value;
-      const data = await api.get<SpieltagPrediction | null>(
-        `/spieltag/matchdays/${matchdayId}/predictions`,
+      const data = await api.get<MatchdayPrediction | null>(
+        `/matchday/matchdays/${matchdayId}/predictions`,
         params
       );
       predictions.value = data;
@@ -255,7 +252,7 @@ export const useSpieltagStore = defineStore("spieltag", () => {
           });
         }
       }
-      draftAutoStrategy.value = data?.auto_tipp_strategy || "none";
+      draftAutoStrategy.value = data?.auto_bet_strategy || "none";
     } catch {
       predictions.value = null;
     }
@@ -284,9 +281,9 @@ export const useSpieltagStore = defineStore("spieltag", () => {
         })
       );
 
-      await api.post(`/spieltag/matchdays/${matchdayId}/predictions`, {
+      await api.post(`/matchday/matchdays/${matchdayId}/predictions`, {
         predictions: preds,
-        auto_tipp_strategy: draftAutoStrategy.value,
+        auto_bet_strategy: draftAutoStrategy.value,
         squad_id: activeSquadId.value,
       });
 
@@ -300,10 +297,10 @@ export const useSpieltagStore = defineStore("spieltag", () => {
     }
   }
 
-  async function fetchMoneylineTips(matchIds: string[]) {
+  async function fetchMoneylineBets(matchIds: string[]) {
     if (matchIds.length === 0) return;
     try {
-      interface TipResponse {
+      interface BetResponse {
         id: string;
         match_id: string;
         selection: { type: string; value: string };
@@ -312,11 +309,11 @@ export const useSpieltagStore = defineStore("spieltag", () => {
         status: string;
         created_at: string;
       }
-      const tips = await api.get<TipResponse[]>("/tips/mine", {
+      const bets = await api.get<BetResponse[]>("/bets/mine", {
         match_ids: matchIds.join(","),
       });
-      const newMap = new Map<string, MoneylineTip>();
-      for (const t of tips) {
+      const newMap = new Map<string, MoneylineBet>();
+      for (const t of bets) {
         newMap.set(t.match_id, {
           id: t.id,
           match_id: t.match_id,
@@ -326,20 +323,20 @@ export const useSpieltagStore = defineStore("spieltag", () => {
           status: t.status,
         });
       }
-      moneylineTips.value = newMap;
+      moneylineBets.value = newMap;
     } catch {
-      moneylineTips.value = new Map();
+      moneylineBets.value = new Map();
     }
   }
 
-  async function submitMoneylineTip(
+  async function submitMoneylineBet(
     matchId: string,
     prediction: string,
     displayedOdds: number
   ): Promise<boolean> {
     saving.value = true;
     try {
-      interface TipResponse {
+      interface BetResponse {
         id: string;
         match_id: string;
         selection: { type: string; value: string };
@@ -348,21 +345,21 @@ export const useSpieltagStore = defineStore("spieltag", () => {
         status: string;
         created_at: string;
       }
-      const tip = await api.post<TipResponse>("/tips/", {
+      const bet = await api.post<BetResponse>("/bets/", {
         match_id: matchId,
         prediction,
         displayed_odds: displayedOdds,
       });
-      const newMap = new Map(moneylineTips.value);
-      newMap.set(tip.match_id, {
-        id: tip.id,
-        match_id: tip.match_id,
-        selection: tip.selection.value,
-        locked_odds: tip.locked_odds,
-        points_earned: tip.points_earned,
-        status: tip.status,
+      const newMap = new Map(moneylineBets.value);
+      newMap.set(bet.match_id, {
+        id: bet.id,
+        match_id: bet.match_id,
+        selection: bet.selection.value,
+        locked_odds: bet.locked_odds,
+        points_earned: bet.points_earned,
+        status: bet.status,
       });
-      moneylineTips.value = newMap;
+      moneylineBets.value = newMap;
       return true;
     } catch {
       return false;
@@ -378,7 +375,7 @@ export const useSpieltagStore = defineStore("spieltag", () => {
     matches.value = [];
     predictions.value = null;
     draftPredictions.value = new Map();
-    moneylineTips.value = new Map();
+    moneylineBets.value = new Map();
   }
 
   function invalidateCache(matchdayId?: string) {
@@ -395,7 +392,7 @@ export const useSpieltagStore = defineStore("spieltag", () => {
     // Clear predictions when squad changes (different squad = different predictions)
     predictions.value = null;
     draftPredictions.value = new Map();
-    moneylineTips.value = new Map();
+    moneylineBets.value = new Map();
     // Clear admin state
     adminTargetUserId.value = null;
     adminTargetPredictions.value = null;
@@ -406,7 +403,7 @@ export const useSpieltagStore = defineStore("spieltag", () => {
   async function fetchSquadMembers(squadId: string) {
     try {
       squadMembers.value = await api.get<SquadMember[]>(
-        `/spieltag/admin/members/${squadId}`
+        `/matchday/admin/members/${squadId}`
       );
     } catch {
       squadMembers.value = [];
@@ -420,8 +417,8 @@ export const useSpieltagStore = defineStore("spieltag", () => {
   ) {
     try {
       adminTargetPredictions.value =
-        await api.get<SpieltagPrediction | null>(
-          `/spieltag/admin/predictions/${matchdayId}`,
+        await api.get<MatchdayPrediction | null>(
+          `/matchday/admin/predictions/${matchdayId}`,
           { squad_id: squadId, user_id: userId }
         );
     } catch {
@@ -436,7 +433,7 @@ export const useSpieltagStore = defineStore("spieltag", () => {
     matchId: string
   ): Promise<boolean> {
     try {
-      await api.post("/spieltag/admin/unlock", {
+      await api.post("/matchday/admin/unlock", {
         squad_id: squadId,
         matchday_id: matchdayId,
         user_id: userId,
@@ -460,7 +457,7 @@ export const useSpieltagStore = defineStore("spieltag", () => {
   ): Promise<{ points_earned: number | null } | null> {
     try {
       const result = await api.post<{ points_earned: number | null }>(
-        "/spieltag/admin/prediction",
+        "/matchday/admin/prediction",
         {
           squad_id: squadId,
           matchday_id: matchdayId,
@@ -492,7 +489,7 @@ export const useSpieltagStore = defineStore("spieltag", () => {
     activeSquadId,
     editableMatches,
     lockedMatches,
-    tippedCount,
+    betCount,
     fetchSports,
     fetchMatchdays,
     fetchMatchdayDetail,
@@ -501,9 +498,9 @@ export const useSpieltagStore = defineStore("spieltag", () => {
     setDraftPrediction,
     removeDraftPrediction,
     savePredictions,
-    moneylineTips,
-    fetchMoneylineTips,
-    submitMoneylineTip,
+    moneylineBets,
+    fetchMoneylineBets,
+    submitMoneylineBet,
     setSport,
     setSquadContext,
     invalidateCache,

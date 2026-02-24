@@ -1,4 +1,4 @@
-"""Spieltag-Modus data models."""
+"""Matchday mode data models."""
 
 from datetime import datetime
 from enum import Enum
@@ -13,21 +13,21 @@ class MatchdayStatus(str, Enum):
     completed = "completed"
 
 
-class AutoTippStrategy(str, Enum):
+class AutoBetStrategy(str, Enum):
     q_bot = "q_bot"       # Follow QuoticoTip → fallback odds favorite → fallback 1:1
     draw = "draw"         # Predict 1:1 for all untipped matches
     favorite = "favorite" # Predict based on odds favorite
-    none = "none"         # No auto-tipp
+    none = "none"         # No auto-bet
 
 
 # ---------- MongoDB documents ----------
 
 class MatchdayInDB(BaseModel):
-    """A single matchday (Spieltag) in a league season."""
+    """A single matchday in a league season."""
     sport_key: str
     season: int
     matchday_number: int
-    label: str                          # "Spieltag 17"
+    label: str                          # e.g. "Matchday 17"
     match_ids: list[str] = Field(default_factory=list)  # References to matches collection
     match_count: int = 0
     first_kickoff: Optional[datetime] = None
@@ -39,7 +39,7 @@ class MatchdayInDB(BaseModel):
 
 
 class MatchPrediction(BaseModel):
-    """A single match prediction within a Spieltag prediction."""
+    """A single match prediction within a matchday prediction."""
     match_id: str
     home_score: int
     away_score: int
@@ -48,7 +48,7 @@ class MatchPrediction(BaseModel):
     points_earned: Optional[int] = None  # 0/1/2/3 after resolution
 
 
-class SpieltagPredictionInDB(BaseModel):
+class MatchdayPredictionInDB(BaseModel):
     """A user's predictions for an entire matchday."""
     user_id: str
     matchday_id: str
@@ -56,7 +56,7 @@ class SpieltagPredictionInDB(BaseModel):
     sport_key: str
     season: int
     matchday_number: int
-    auto_tipp_strategy: AutoTippStrategy = AutoTippStrategy.none
+    auto_bet_strategy: AutoBetStrategy = AutoBetStrategy.none
     predictions: list[MatchPrediction] = Field(default_factory=list)
     admin_unlocked_matches: list[str] = Field(default_factory=list)
     total_points: Optional[int] = None
@@ -77,7 +77,7 @@ class PredictionInput(BaseModel):
 class SavePredictionsRequest(BaseModel):
     """Request to save/update predictions for a matchday."""
     predictions: list[PredictionInput]
-    auto_tipp_strategy: AutoTippStrategy = AutoTippStrategy.none
+    auto_bet_strategy: AutoBetStrategy = AutoBetStrategy.none
     squad_id: Optional[str] = None  # Optional squad context
 
 
@@ -116,15 +116,12 @@ class MatchdayResponse(BaseModel):
 class MatchdayDetailMatch(BaseModel):
     """Match data within a matchday detail response."""
     id: str
-    teams: dict[str, str]
-    commence_time: datetime
+    home_team: str
+    away_team: str
+    match_date: datetime
     status: str
-    current_odds: dict[str, float] = Field(default_factory=dict)
-    totals_odds: dict[str, float] = Field(default_factory=dict)
-    spreads_odds: dict[str, float] = Field(default_factory=dict)
-    result: Optional[str] = None
-    home_score: Optional[int] = None
-    away_score: Optional[int] = None
+    odds: dict = Field(default_factory=dict)      # {h2h, totals, spreads, updated_at}
+    result: dict = Field(default_factory=dict)     # {home_score, away_score, outcome}
     is_locked: bool = False  # True if < 15 min to kickoff or started
     h2h_context: Optional[dict] = None  # Embedded historical H2H + form data
     quotico_tip: Optional[dict] = None  # Embedded QuoticoTip recommendation
@@ -140,19 +137,19 @@ class PredictionResponse(BaseModel):
     points_earned: Optional[int] = None
 
 
-class SpieltagPredictionResponse(BaseModel):
+class MatchdayPredictionResponse(BaseModel):
     """User's prediction set for a matchday."""
     matchday_id: str
     squad_id: Optional[str] = None
-    auto_tipp_strategy: str
+    auto_bet_strategy: str
     predictions: list[PredictionResponse]
     admin_unlocked_matches: list[str] = Field(default_factory=list)
     total_points: Optional[int] = None
     status: str
 
 
-class SpieltagLeaderboardEntry(BaseModel):
-    """Single entry in the Spieltag leaderboard."""
+class MatchdayLeaderboardEntry(BaseModel):
+    """Single entry in the matchday leaderboard."""
     rank: int
     user_id: str
     alias: str

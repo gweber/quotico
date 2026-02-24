@@ -1,46 +1,45 @@
-"""Spieltag-Modus: resolve predictions after matches complete."""
+"""Matchday mode: auto-bet injection after matchday completes.
+
+Scoring of individual predictions is handled by the Universal Resolver
+in match_resolver._resolve_match() — this worker only fills in missing
+predictions via auto-bet strategies when all matches in a matchday are done.
+"""
 
 import logging
-from datetime import datetime
 
 from bson import ObjectId
 
 import app.database as _db
 from app.utils import utcnow
-from app.services.spieltag_service import (
-    calculate_points,
-    generate_auto_prediction,
-)
+from app.services.matchday_service import generate_auto_prediction
 
-logger = logging.getLogger("quotico.spieltag_resolver")
+logger = logging.getLogger("quotico.matchday_resolver")
 
 
-async def resolve_spieltag_predictions() -> None:
-    """Check completed matchdays and resolve predictions.
+async def resolve_matchday_predictions() -> None:
+    """Check completed matchdays and inject auto-bet predictions.
 
-    For each matchday that has all matches completed:
-    1. Apply auto-tipps for missing predictions
-    2. Score each prediction
-    3. Sum total points
-    4. Mark prediction as resolved
+    For each matchday where all matches are completed:
+    1. Find betting_slips with type=matchday_round that have auto_bet_strategy
+    2. Fill in missing predictions via auto-bet
+    3. The universal resolver will score them on next match_resolver cycle
     """
-    # Find matchdays where all matches are completed but not yet marked resolved
     matchdays = await _db.db.matchdays.find({
         "status": {"$in": ["in_progress", "completed"]},
     }).to_list(length=100)
 
     for matchday in matchdays:
         try:
-            await _resolve_matchday(matchday)
+            await _inject_auto_bets(matchday)
         except Exception as e:
             logger.error(
-                "Spieltag resolver error for %s: %s",
+                "Matchday auto-bet error for %s: %s",
                 matchday.get("label", "?"), e,
             )
 
 
-async def _resolve_matchday(matchday: dict) -> None:
-    """Resolve all predictions for a single matchday."""
+async def _inject_auto_bets(matchday: dict) -> None:
+    """Inject auto-bet predictions for a matchday where all matches are done."""
     matchday_id = str(matchday["_id"])
     match_ids = matchday.get("match_ids", [])
 
@@ -54,157 +53,108 @@ async def _resolve_matchday(matchday: dict) -> None:
 
     matches_by_id = {str(m["_id"]): m for m in matches}
 
-    # Check which matches are completed
-    completed_matches = {
-        str(m["_id"]): m for m in matches
-        if m.get("status") == "completed"
-        and m.get("home_score") is not None
-        and m.get("away_score") is not None
-    }
-
-    if not completed_matches:
-        return
-
     # Check if entire matchday is done
-    all_done = len(completed_matches) == len(match_ids)
+    completed = sum(
+        1 for m in matches
+        if m.get("status") == "final"
+        and m.get("result", {}).get("home_score") is not None
+    )
+    if completed < len(match_ids):
+        return  # Not all done yet, wait
 
-    # Get all predictions for this matchday that need resolving
-    predictions = await _db.db.spieltag_predictions.find({
+    # Find matchday_round slips for this matchday that have an auto_bet_strategy
+    slips = await _db.db.betting_slips.find({
         "matchday_id": matchday_id,
-        "status": {"$ne": "resolved"},
+        "type": "matchday_round",
+        "auto_bet_strategy": {"$nin": [None, "none"]},
+        "status": {"$in": ["draft", "pending", "partial"]},
     }).to_list(length=10000)
 
-    # Pre-fetch squads for auto-tipp blocking check (avoids N+1 queries)
-    squad_ids = list({p["squad_id"] for p in predictions if p.get("squad_id")})
+    if not slips:
+        # Update matchday status if all done
+        await _db.db.matchdays.update_one(
+            {"_id": matchday["_id"]},
+            {"$set": {"status": "completed", "all_resolved": True, "updated_at": utcnow()}},
+        )
+        return
+
+    # Pre-fetch squads for auto-bet blocking check
+    squad_ids = list({s["squad_id"] for s in slips if s.get("squad_id")})
     squads_by_id: dict[str, dict] = {}
     if squad_ids:
         _squads = await _db.db.squads.find(
             {"_id": {"$in": [ObjectId(sid) for sid in squad_ids]}},
-            {"auto_tipp_blocked": 1},
+            {"auto_bet_blocked": 1},
         ).to_list(length=len(squad_ids))
         squads_by_id = {str(s["_id"]): s for s in _squads}
 
-    # Pre-fetch QuoticoTips for Q-Bot auto-tipp strategy
+    # Pre-fetch QuoticoTips for Q-Bot strategy
     match_id_strs = [str(m["_id"]) for m in matches]
-    qtips_by_match: dict[str, dict] = {}
-    has_qbot = any(p.get("auto_tipp_strategy") == "q_bot" for p in predictions)
+    qbets_by_match: dict[str, dict] = {}
+    has_qbot = any(s.get("auto_bet_strategy") == "q_bot" for s in slips)
     if has_qbot and match_id_strs:
-        _qtips = await _db.db.quotico_tips.find(
+        _qbets = await _db.db.quotico_tips.find(
             {"match_id": {"$in": match_id_strs}},
             {"match_id": 1, "recommended_selection": 1, "confidence": 1},
         ).to_list(length=len(match_id_strs))
-        qtips_by_match = {t["match_id"]: t for t in _qtips}
+        qbets_by_match = {t["match_id"]: t for t in _qbets}
 
     now = utcnow()
-    resolved_count = 0
+    injected_count = 0
 
-    for pred_doc in predictions:
-        updated = await _score_prediction(
-            pred_doc, matches_by_id, completed_matches, all_done, now,
-            squads_by_id=squads_by_id,
-            qtips_by_match=qtips_by_match,
-        )
-        if updated:
-            resolved_count += 1
-
-    # Update matchday status
-    if all_done:
-        await _db.db.matchdays.update_one(
-            {"_id": matchday["_id"]},
-            {"$set": {"status": "completed", "all_resolved": True, "updated_at": now}},
-        )
-
-    if resolved_count > 0:
-        logger.info(
-            "Resolved %d predictions for %s (%s)",
-            resolved_count, matchday.get("label"), matchday.get("sport_key"),
-        )
-
-
-async def _score_prediction(
-    pred_doc: dict,
-    matches_by_id: dict[str, dict],
-    completed_matches: dict[str, dict],
-    all_done: bool,
-    now: datetime,
-    *,
-    squads_by_id: dict[str, dict] | None = None,
-    qtips_by_match: dict[str, dict] | None = None,
-) -> bool:
-    """Score a single user's predictions and optionally apply auto-tipps.
-
-    Returns True if the prediction was resolved.
-    """
-    existing_preds = {p["match_id"]: p for p in pred_doc.get("predictions", [])}
-    auto_strategy = pred_doc.get("auto_tipp_strategy", "none")
-
-    # Check if the squad blocks auto-tipp
-    squad_id = pred_doc.get("squad_id")
-    auto_blocked = False
-    if squad_id and squads_by_id:
-        squad = squads_by_id.get(squad_id)
-        if squad and squad.get("auto_tipp_blocked", False):
-            auto_blocked = True
-
-    updated_predictions = []
-    total_points = 0
-    any_scored = False
-
-    for match_id, match in matches_by_id.items():
-        pred = existing_preds.get(match_id)
-
-        # Apply auto-tipp if no prediction exists and matchday is fully done
-        if pred is None and all_done and auto_strategy != "none" and not auto_blocked:
-            qtip = (qtips_by_match or {}).get(match_id)
-            auto = generate_auto_prediction(auto_strategy, match, quotico_tip=qtip)
-            if auto:
-                pred = {
-                    "match_id": match_id,
-                    "home_score": auto[0],
-                    "away_score": auto[1],
-                    "is_auto": True,
-                    "points_earned": None,
-                }
-
-        if pred is None:
+    for slip in slips:
+        auto_strategy = slip.get("auto_bet_strategy", "none")
+        if auto_strategy == "none":
             continue
 
-        # Score if match is completed and not yet scored
-        if match_id in completed_matches and pred.get("points_earned") is None:
-            actual_home = completed_matches[match_id]["home_score"]
-            actual_away = completed_matches[match_id]["away_score"]
-            points = calculate_points(
-                pred["home_score"], pred["away_score"],
-                actual_home, actual_away,
+        # Check squad auto-bet block
+        squad_id = slip.get("squad_id")
+        if squad_id:
+            squad = squads_by_id.get(squad_id)
+            if squad and squad.get("auto_bet_blocked", False):
+                continue
+
+        # Find which matches are missing predictions
+        existing_match_ids = {
+            sel["match_id"] for sel in slip.get("selections", [])
+        }
+        new_selections = []
+
+        for match_id, match in matches_by_id.items():
+            if match_id in existing_match_ids:
+                continue
+
+            qbet = qbets_by_match.get(match_id)
+            auto = generate_auto_prediction(auto_strategy, match, quotico_tip=qbet)
+            if auto:
+                new_selections.append({
+                    "match_id": match_id,
+                    "market": "exact_score",
+                    "pick": {"home": auto[0], "away": auto[1]},
+                    "is_auto": True,
+                    "status": "pending",  # Auto-bets go directly to pending
+                    "locked_at": now,
+                    "points_earned": None,
+                })
+
+        if new_selections:
+            await _db.db.betting_slips.update_one(
+                {"_id": slip["_id"]},
+                {
+                    "$push": {"selections": {"$each": new_selections}},
+                    "$set": {"updated_at": now},
+                },
             )
-            pred = {**pred, "points_earned": points}
-            any_scored = True
+            injected_count += len(new_selections)
 
-        if pred.get("points_earned") is not None:
-            total_points += pred["points_earned"]
-
-        updated_predictions.append(pred)
-
-    if not any_scored:
-        return False
-
-    # Determine status
-    all_scored = all(
-        p.get("points_earned") is not None for p in updated_predictions
-    )
-    new_status = "resolved" if (all_done and all_scored) else "partial"
-
-    update: dict = {
-        "predictions": updated_predictions,
-        "status": new_status,
-        "updated_at": now,
-    }
-    if new_status == "resolved":
-        update["total_points"] = total_points
-
-    await _db.db.spieltag_predictions.update_one(
-        {"_id": pred_doc["_id"]},
-        {"$set": update},
+    # Update matchday status
+    await _db.db.matchdays.update_one(
+        {"_id": matchday["_id"]},
+        {"$set": {"status": "completed", "all_resolved": True, "updated_at": now}},
     )
 
-    return new_status == "resolved"
+    if injected_count > 0:
+        logger.info(
+            "Auto-bet injected %d predictions for %s (%s)",
+            injected_count, matchday.get("label"), matchday.get("sport_key"),
+        )

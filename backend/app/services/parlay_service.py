@@ -1,4 +1,4 @@
-"""Parlay (Kombi-Joker) — combine 3 bets, multiply odds."""
+"""Parlay (combo bet) — combine 3 bets, multiply odds."""
 
 import logging
 import math
@@ -31,34 +31,34 @@ async def create_parlay(
     # Validate squad
     squad = await _db.db.squads.find_one({"_id": ObjectId(squad_id)})
     if not squad:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Squad nicht gefunden.")
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Squad not found.")
 
     game_mode = squad.get("game_mode", "classic")
     if game_mode not in ("classic", "bankroll"):
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Kombi-Joker nur im Tippspiel- oder Bankroll-Modus.")
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Parlay only available in classic or bankroll mode.")
     if user_id not in squad.get("members", []):
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "Du bist kein Mitglied dieser Squad.")
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "You are not a member of this squad.")
 
     # Validate matchday
     matchday = await _db.db.matchdays.find_one({"_id": ObjectId(matchday_id)})
     if not matchday:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Spieltag nicht gefunden.")
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Matchday not found.")
 
     # Check exactly 3 legs
     if len(legs) != REQUIRED_LEGS:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, f"Genau {REQUIRED_LEGS} Spiele erforderlich.")
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, f"Exactly {REQUIRED_LEGS} matches required.")
 
     # Validate all legs use different matches
     match_ids = [leg["match_id"] for leg in legs]
     if len(set(match_ids)) != REQUIRED_LEGS:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Jedes Spiel darf nur einmal vorkommen.")
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Each match may only appear once.")
 
     # Check for existing parlay
     existing = await _db.db.parlays.find_one({
         "user_id": user_id, "squad_id": squad_id, "matchday_id": matchday_id,
     })
     if existing:
-        raise HTTPException(status.HTTP_409_CONFLICT, "Du hast bereits einen Kombi-Joker für diesen Spieltag.")
+        raise HTTPException(status.HTTP_409_CONFLICT, "You already have a parlay for this matchday.")
 
     # Validate each leg and lock odds
     validated_legs = []
@@ -67,30 +67,30 @@ async def create_parlay(
     for leg in legs:
         match = await _db.db.matches.find_one({"_id": ObjectId(leg["match_id"])})
         if not match:
-            raise HTTPException(status.HTTP_404_NOT_FOUND, f"Spiel {leg['match_id']} nicht gefunden.")
+            raise HTTPException(status.HTTP_404_NOT_FOUND, f"Match {leg['match_id']} not found.")
 
-        commence = ensure_utc(match["commence_time"])
-        if commence <= now or match["status"] != "upcoming":
-            raise HTTPException(status.HTTP_400_BAD_REQUEST, "Eines der Spiele hat bereits begonnen.")
+        commence = ensure_utc(match["match_date"])
+        if commence <= now or match["status"] != "scheduled":
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "One of the matches has already started.")
 
         prediction = leg["prediction"]
         displayed_odds = leg["displayed_odds"]
 
         # Determine which odds map to use
         if prediction in ("over", "under"):
-            totals = match.get("totals_odds", {})
+            totals = match.get("odds", {}).get("totals", {})
             if not totals or prediction not in totals:
-                raise HTTPException(status.HTTP_400_BAD_REQUEST, f"Keine Über/Unter-Quote für Spiel {leg['match_id']}.")
+                raise HTTPException(status.HTTP_400_BAD_REQUEST, f"No over/under odds for match {leg['match_id']}.")
             locked_odds = totals[prediction]
         else:
-            current_odds = match.get("current_odds", {})
+            current_odds = match.get("odds", {}).get("h2h", {})
             if prediction not in current_odds:
-                raise HTTPException(status.HTTP_400_BAD_REQUEST, f"Ungültige Vorhersage '{prediction}'.")
+                raise HTTPException(status.HTTP_400_BAD_REQUEST, f"Invalid prediction '{prediction}'.")
             locked_odds = current_odds[prediction]
 
         # Validate displayed odds
         if abs(displayed_odds - locked_odds) / max(locked_odds, 0.01) > 0.2:
-            raise HTTPException(status.HTTP_400_BAD_REQUEST, "Quoten haben sich geändert.")
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "Odds have changed.")
 
         combined_odds *= locked_odds
         validated_legs.append({
@@ -123,7 +123,7 @@ async def create_parlay(
             stake=stake,
             reference_type="parlay",
             reference_id="",
-            description=f"Kombi-Joker: {REQUIRED_LEGS} Spiele, Quote {combined_odds:.2f} ({stake:.0f} Coins)",
+            description=f"Parlay: {REQUIRED_LEGS} matches, odds {combined_odds:.2f} ({stake:.0f} coins)",
         )
 
     parlay_doc = {
@@ -147,7 +147,7 @@ async def create_parlay(
         result = await _db.db.parlays.insert_one(parlay_doc)
         parlay_doc["_id"] = result.inserted_id
     except DuplicateKeyError:
-        raise HTTPException(status.HTTP_409_CONFLICT, "Kombi-Joker für diesen Spieltag existiert bereits.")
+        raise HTTPException(status.HTTP_409_CONFLICT, "Parlay for this matchday already exists.")
 
     logger.info(
         "Parlay created: user=%s squad=%s matchday=%s odds=%.2f stake=%s",

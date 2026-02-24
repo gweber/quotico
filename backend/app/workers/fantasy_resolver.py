@@ -35,16 +35,17 @@ async def resolve_fantasy_picks() -> None:
 
     for pick in pending:
         match = await _db.db.matches.find_one({"_id": ObjectId(pick["match_id"])})
-        if not match or match["status"] != "completed":
+        if not match or match["status"] != "final":
             continue
-        if match.get("home_score") is None or match.get("away_score") is None:
+        result = match.get("result", {})
+        if result.get("home_score") is None or result.get("away_score") is None:
             continue
 
         team = pick["team"]
-        home = match["teams"]["home"]
-        away = match["teams"]["away"]
-        home_score = match["home_score"]
-        away_score = match["away_score"]
+        home = match["home_team"]
+        away = match["away_team"]
+        home_score = result["home_score"]
+        away_score = result["away_score"]
 
         # Determine goals scored/conceded from the picked team's perspective
         if team == home:

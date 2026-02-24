@@ -1,4 +1,4 @@
-"""Squad War Room service — per-match squad tip visibility with Shadow Logic."""
+"""Squad War Room service — per-match squad bet visibility with Shadow Logic."""
 
 from bson import ObjectId
 from fastapi import HTTPException, status
@@ -18,20 +18,20 @@ async def get_war_room(
     # 1. Fetch squad
     squad = await _db.db.squads.find_one({"_id": ObjectId(squad_id)})
     if not squad:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Squad nicht gefunden.")
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Squad not found.")
     if requesting_user_id not in squad.get("members", []):
         raise HTTPException(
-            status.HTTP_403_FORBIDDEN, "Du bist kein Mitglied dieses Squads."
+            status.HTTP_403_FORBIDDEN, "You are not a member of this squad."
         )
 
     # 2. Fetch match
     match = await _db.db.matches.find_one({"_id": ObjectId(match_id)})
     if not match:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Spiel nicht gefunden.")
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Match not found.")
 
     member_ids = squad["members"]
     now = utcnow()
-    commence = ensure_utc(match["commence_time"])
+    commence = ensure_utc(match["match_date"])
     is_post_kickoff = now >= commence
 
     # 3. Bulk alias lookup
@@ -41,15 +41,30 @@ async def get_war_room(
     ).to_list(length=len(member_ids))
     alias_map = {str(d["_id"]): d.get("alias", "Anonymous") for d in member_docs}
 
-    # 4. Squad tips for this match
-    tips = await _db.db.tips.find(
-        {"match_id": match_id, "user_id": {"$in": member_ids}}
+    # 4. Squad bets for this match (from unified betting_slips)
+    slips = await _db.db.betting_slips.find(
+        {
+            "selections.match_id": match_id,
+            "user_id": {"$in": member_ids},
+            "type": {"$in": ["single", "parlay"]},
+        }
     ).to_list(length=len(member_ids))
-    tip_map = {t["user_id"]: t for t in tips}
+    # Build bet_map: extract the matching selection for this match from each slip
+    bet_map: dict[str, dict] = {}
+    for slip in slips:
+        for sel in slip.get("selections", []):
+            if sel.get("match_id") == match_id:
+                bet_map[slip["user_id"]] = {
+                    "selection": {"type": sel.get("market", "h2h"), "value": sel["pick"]},
+                    "locked_odds": sel.get("locked_odds"),
+                    "status": slip["status"],
+                    "points_earned": sel.get("points_earned"),
+                }
+                break
 
     # 5. Build member list with Shadow Logic
     members = _build_members(
-        member_ids, alias_map, tip_map, requesting_user_id,
+        member_ids, alias_map, bet_map, requesting_user_id,
         is_post_kickoff, match,
     )
 
@@ -57,20 +72,19 @@ async def get_war_room(
     match_payload = {
         "id": str(match["_id"]),
         "sport_key": match["sport_key"],
-        "teams": match["teams"],
-        "commence_time": match["commence_time"],
+        "home_team": match["home_team"],
+        "away_team": match["away_team"],
+        "match_date": match["match_date"],
         "status": match["status"],
-        "current_odds": match.get("current_odds", {}),
-        "result": match.get("result"),
-        "home_score": match.get("home_score"),
-        "away_score": match.get("away_score"),
+        "odds": match.get("odds", {}),
+        "result": match.get("result", {}),
     }
 
     # 7. Consensus + mavericks (post-kickoff only)
     consensus = None
     mavericks = None
     if is_post_kickoff:
-        consensus, mavericks = _compute_consensus(tip_map)
+        consensus, mavericks = _compute_consensus(bet_map)
 
     return {
         "match": match_payload,
@@ -84,49 +98,49 @@ async def get_war_room(
 def _build_members(
     member_ids: list[str],
     alias_map: dict[str, str],
-    tip_map: dict[str, dict],
+    bet_map: dict[str, dict],
     requesting_user_id: str,
     is_post_kickoff: bool,
     match: dict,
 ) -> list[dict]:
     result = []
     for uid in member_ids:
-        tip = tip_map.get(uid)
-        has_tipped = tip is not None
+        bet = bet_map.get(uid)
+        has_bet = bet is not None
         alias = alias_map.get(uid, "Anonymous")
         is_self = uid == requesting_user_id
 
-        if not has_tipped:
+        if not has_bet:
             result.append({
                 "user_id": uid,
                 "alias": alias,
-                "has_tipped": False,
+                "has_bet": False,
                 "is_self": is_self,
             })
             continue
 
-        selection = tip["selection"]
-        locked_odds = tip["locked_odds"]
-        tip_status = tip["status"]
-        points_earned = tip.get("points_earned")
+        selection = bet["selection"]
+        locked_odds = bet["locked_odds"]
+        bet_status = bet["status"]
+        points_earned = bet.get("points_earned")
 
         # Shadow Logic gate
-        reveal_tip = is_post_kickoff or is_self
+        reveal_bet = is_post_kickoff or is_self
 
         is_currently_winning = None
-        if is_post_kickoff and has_tipped:
+        if is_post_kickoff and has_bet:
             is_currently_winning = _infer_winning(selection["value"], match)
 
         result.append({
             "user_id": uid,
             "alias": alias,
-            "has_tipped": True,
+            "has_bet": True,
             "is_self": is_self,
-            "selection": selection if reveal_tip else None,
-            "locked_odds": locked_odds if reveal_tip else None,
-            "tip_status": tip_status if reveal_tip else None,
-            "points_earned": points_earned if reveal_tip else None,
-            "is_currently_winning": is_currently_winning if reveal_tip else None,
+            "selection": selection if reveal_bet else None,
+            "locked_odds": locked_odds if reveal_bet else None,
+            "bet_status": bet_status if reveal_bet else None,
+            "points_earned": points_earned if reveal_bet else None,
+            "is_currently_winning": is_currently_winning if reveal_bet else None,
         })
 
     return result
@@ -134,18 +148,18 @@ def _build_members(
 
 def _infer_winning(selection_value: str, match: dict) -> bool | None:
     """Determine if a selection is currently winning based on score."""
-    home_score = match.get("home_score")
-    away_score = match.get("away_score")
-    match_status = match.get("status", "upcoming")
+    home_score = match.get("result", {}).get("home_score")
+    away_score = match.get("result", {}).get("away_score")
+    match_status = match.get("status", "scheduled")
 
-    if match_status == "upcoming":
+    if match_status == "scheduled":
         return None
     if home_score is None or away_score is None:
         return None
 
-    # For completed matches, use authoritative result
-    if match_status == "completed" and match.get("result"):
-        return selection_value == match["result"]
+    # For final matches, use authoritative result
+    if match_status == "final" and match.get("result", {}).get("outcome"):
+        return selection_value == match["result"]["outcome"]
 
     # For live matches, derive from current score
     if home_score > away_score:
@@ -159,17 +173,17 @@ def _infer_winning(selection_value: str, match: dict) -> bool | None:
 
 
 def _compute_consensus(
-    tip_map: dict[str, dict],
+    bet_map: dict[str, dict],
 ) -> tuple[dict | None, list[str]]:
     """Compute selection breakdown and identify mavericks."""
-    if not tip_map:
+    if not bet_map:
         return None, []
 
     counts: dict[str, int] = {}
     picker_map: dict[str, list[str]] = {}
 
-    for uid, tip in tip_map.items():
-        val = tip["selection"]["value"]
+    for uid, bet in bet_map.items():
+        val = bet["selection"]["value"]
         counts[val] = counts.get(val, 0) + 1
         picker_map.setdefault(val, []).append(uid)
 
@@ -185,5 +199,5 @@ def _compute_consensus(
         if val != majority_pick:
             mavericks.extend(uids)
 
-    consensus = {"percentages": percentages, "total_tippers": total}
+    consensus = {"percentages": percentages, "total_bettors": total}
     return consensus, mavericks

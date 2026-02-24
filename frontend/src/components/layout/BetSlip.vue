@@ -1,11 +1,13 @@
 <script setup lang="ts">
 import { ref } from "vue";
+import { useI18n } from "vue-i18n";
 import { useBetSlipStore } from "@/stores/betslip";
 import { useAuthStore } from "@/stores/auth";
 import { useToast } from "@/composables/useToast";
 import { useRouter } from "vue-router";
-import { cacheUserTip } from "@/composables/useUserTips";
+import { cacheUserBet } from "@/composables/useUserBets";
 
+const { t } = useI18n();
 const betslip = useBetSlipStore();
 const auth = useAuthStore();
 const toast = useToast();
@@ -14,25 +16,28 @@ const submitting = ref(false);
 
 async function handleSubmit() {
   if (!auth.isLoggedIn) {
-    toast.warning("Bitte melde dich an, um Tipps abzugeben.");
+    toast.warning(t("auth.loginRequired"));
     router.push("/login");
     return;
   }
 
   submitting.value = true;
-  const { success, errors, tips } = await betslip.submitAll();
+  const { success, errors, bets } = await betslip.submitAll();
   submitting.value = false;
 
-  // Cache returned tips so MatchCard updates immediately
-  for (const tip of tips) {
-    cacheUserTip(tip);
+  // If odds change dialog is showing, don't show toast errors
+  if (betslip.showOddsChangeDialog) return;
+
+  // Cache returned bets so MatchCard updates immediately
+  for (const bet of bets) {
+    cacheUserBet(bet);
   }
 
   if (success.length > 0) {
     toast.success(
       success.length === 1
-        ? "Tipp erfolgreich abgegeben!"
-        : `${success.length} Tipps erfolgreich abgegeben!`
+        ? t("betslip.successSingle")
+        : t("betslip.successMultiple", { count: success.length })
     );
   }
   for (const err of errors) {
@@ -44,8 +49,17 @@ async function handleSubmit() {
   }
 }
 
+async function handleAcceptAndSubmit() {
+  betslip.acceptOddsChanges();
+  await handleSubmit();
+}
+
 function closeMobile() {
   betslip.isOpen = false;
+}
+
+function isStale(addedAt: number | undefined): boolean {
+  return !!addedAt && (Date.now() - addedAt) > 10 * 60 * 1000;
 }
 </script>
 
@@ -53,12 +67,12 @@ function closeMobile() {
   <!-- Desktop: Sidebar -->
   <aside
     class="hidden lg:block w-72 shrink-0"
-    aria-label="Tippschein"
+    :aria-label="$t('betslip.title')"
   >
     <div class="sticky top-[3.75rem] p-3">
       <div class="bg-surface-2 rounded-card p-4">
         <h2 class="text-sm font-semibold text-text-primary mb-3 flex items-center justify-between">
-          <span>Tippschein</span>
+          <span>{{ $t('betslip.title') }}</span>
           <span
             v-if="betslip.itemCount > 0"
             class="bg-primary text-surface-0 text-xs font-bold px-2 py-0.5 rounded-full"
@@ -69,12 +83,48 @@ function closeMobile() {
 
         <!-- Empty state -->
         <div v-if="betslip.itemCount === 0" class="text-center py-6">
-          <p class="text-text-muted text-sm">Noch keine Tipps ausgewählt.</p>
-          <p class="text-text-muted text-xs mt-1">Klicke auf eine Quote, um einen Tipp hinzuzufügen.</p>
+          <p class="text-text-muted text-sm">{{ $t('betslip.empty') }}</p>
+          <p class="text-text-muted text-xs mt-1">{{ $t('betslip.addInstruction') }}</p>
         </div>
 
         <!-- Items -->
         <div v-else class="space-y-2">
+          <!-- Odds change confirmation dialog -->
+          <div
+            v-if="betslip.showOddsChangeDialog"
+            class="bg-warning/10 border border-warning/30 rounded-lg p-3 space-y-2"
+          >
+            <p class="text-xs font-semibold text-warning">{{ $t('betslip.oddsChanged') }}</p>
+            <div
+              v-for="change in betslip.pendingOddsChanges"
+              :key="change.matchId"
+              class="flex items-center justify-between text-xs"
+            >
+              <span class="text-text-secondary truncate">{{ change.prediction }}</span>
+              <span class="font-mono">
+                <span class="text-text-muted line-through">{{ change.oldOdds.toFixed(2) }}</span>
+                <span class="mx-1 text-text-muted">&rarr;</span>
+                <span class="font-bold" :class="change.newOdds > change.oldOdds ? 'text-success' : 'text-danger'">
+                  {{ change.newOdds.toFixed(2) }}
+                </span>
+              </span>
+            </div>
+            <div class="flex gap-2 mt-2">
+              <button
+                class="flex-1 py-2 rounded-lg bg-primary text-surface-0 text-xs font-semibold hover:bg-primary-hover transition-colors"
+                @click="handleAcceptAndSubmit"
+              >
+                {{ $t('betslip.accept') }}
+              </button>
+              <button
+                class="flex-1 py-2 rounded-lg border border-surface-3 text-xs text-text-muted hover:text-text-primary transition-colors"
+                @click="betslip.dismissOddsChanges()"
+              >
+                {{ $t('common.cancel') }}
+              </button>
+            </div>
+          </div>
+
           <!-- Expired items -->
           <div
             v-for="item in betslip.expiredItems"
@@ -83,16 +133,16 @@ function closeMobile() {
           >
             <button
               class="absolute top-2 right-2 w-6 h-6 flex items-center justify-center rounded text-text-muted hover:text-danger hover:bg-danger-muted/20 transition-colors opacity-0 group-hover:opacity-100"
-              :aria-label="`Tipp entfernen: ${item.teams.home} vs ${item.teams.away}`"
+              :aria-label="t('betslip.removeBet', { teams: item.homeTeam + ' vs ' + item.awayTeam })"
               @click="betslip.removeItem(item.matchId)"
             >
               <span aria-hidden="true">&times;</span>
             </button>
             <p class="text-xs text-text-secondary truncate pr-6 line-through">
-              {{ item.teams.home }} vs {{ item.teams.away }}
+              {{ item.homeTeam }} vs {{ item.awayTeam }}
             </p>
             <div class="flex items-center justify-between mt-1.5">
-              <span class="text-xs text-danger font-medium">Abgelaufen</span>
+              <span class="text-xs text-danger font-medium">{{ $t('betslip.expired') }}</span>
               <span class="text-sm font-mono text-text-muted line-through">{{ item.odds.toFixed(2) }}</span>
             </div>
           </div>
@@ -103,7 +153,7 @@ function closeMobile() {
             class="w-full py-1.5 rounded-lg text-xs text-danger hover:bg-danger-muted/10 transition-colors"
             @click="betslip.removeExpired()"
           >
-            Abgelaufene entfernen ({{ betslip.expiredItems.length }})
+            {{ t('betslip.removeExpired', { count: betslip.expiredItems.length }) }}
           </button>
 
           <!-- Valid items -->
@@ -111,26 +161,28 @@ function closeMobile() {
             v-for="item in betslip.validItems"
             :key="item.matchId"
             class="bg-surface-1 rounded-lg p-3 relative group"
+            :class="isStale(item.addedAt) ? 'border border-warning/20' : ''"
           >
             <button
               class="absolute top-2 right-2 w-6 h-6 flex items-center justify-center rounded text-text-muted hover:text-danger hover:bg-danger-muted/20 transition-colors opacity-0 group-hover:opacity-100"
-              :aria-label="`Tipp entfernen: ${item.teams.home} vs ${item.teams.away}`"
+              :aria-label="t('betslip.removeBet', { teams: item.homeTeam + ' vs ' + item.awayTeam })"
               @click="betslip.removeItem(item.matchId)"
             >
               <span aria-hidden="true">&times;</span>
             </button>
             <p class="text-xs text-text-secondary truncate pr-6">
-              {{ item.teams.home }} vs {{ item.teams.away }}
+              {{ item.homeTeam }} vs {{ item.awayTeam }}
             </p>
             <div class="flex items-center justify-between mt-1.5">
               <span class="text-sm text-text-primary font-medium">{{ item.predictionLabel }}</span>
               <span class="text-sm font-mono text-primary font-bold">{{ item.odds.toFixed(2) }}</span>
             </div>
+            <p v-if="isStale(item.addedAt)" class="text-[10px] text-warning mt-1">{{ $t('betslip.oddsStale') }}</p>
           </div>
 
           <!-- Total -->
           <div class="border-t border-surface-3 pt-3 mt-3 flex items-center justify-between">
-            <span class="text-sm text-text-secondary">Gesamt-Quote</span>
+            <span class="text-sm text-text-secondary">{{ $t('betslip.totalOdds') }}</span>
             <span class="text-lg font-mono text-primary font-bold">
               {{ betslip.totalOdds.toFixed(2) }}
             </span>
@@ -148,11 +200,11 @@ function closeMobile() {
                   <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4" fill="none" />
                   <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
                 </svg>
-                Wird abgegeben...
+                {{ $t('betslip.submitting') }}
               </span>
             </template>
             <template v-else>
-              Tipp abgeben
+              {{ $t('betslip.submit') }}
             </template>
           </button>
 
@@ -161,7 +213,7 @@ function closeMobile() {
             class="w-full py-2 rounded-lg text-sm text-text-muted hover:text-danger hover:bg-danger-muted/10 transition-colors"
             @click="betslip.clear()"
           >
-            Alle entfernen
+            {{ $t('betslip.clearAll') }}
           </button>
         </div>
       </div>
@@ -185,7 +237,7 @@ function closeMobile() {
         <div
           class="absolute bottom-0 left-0 right-0 bg-surface-1 rounded-t-2xl max-h-[80vh] overflow-y-auto"
           role="dialog"
-          aria-label="Tippschein"
+          :aria-label="$t('betslip.title')"
         >
           <!-- Handle -->
           <div class="flex justify-center pt-3 pb-1">
@@ -195,7 +247,7 @@ function closeMobile() {
           <div class="px-4 pb-6">
             <div class="flex items-center justify-between mb-4">
               <h2 class="text-lg font-semibold text-text-primary">
-                Tippschein
+                {{ $t('betslip.title') }}
                 <span
                   class="ml-2 bg-primary text-surface-0 text-xs font-bold px-2 py-0.5 rounded-full"
                 >
@@ -204,7 +256,7 @@ function closeMobile() {
               </h2>
               <button
                 class="w-touch h-touch flex items-center justify-center rounded-lg text-text-muted hover:text-text-primary transition-colors"
-                aria-label="Tippschein schließen"
+                :aria-label="$t('betslip.close')"
                 @click="closeMobile"
               >
                 <span aria-hidden="true" class="text-xl">&times;</span>
@@ -213,6 +265,42 @@ function closeMobile() {
 
             <!-- Items -->
             <div class="space-y-2">
+              <!-- Odds change confirmation dialog (mobile) -->
+              <div
+                v-if="betslip.showOddsChangeDialog"
+                class="bg-warning/10 border border-warning/30 rounded-lg p-3 space-y-2"
+              >
+                <p class="text-xs font-semibold text-warning">{{ $t('betslip.oddsChanged') }}</p>
+                <div
+                  v-for="change in betslip.pendingOddsChanges"
+                  :key="change.matchId"
+                  class="flex items-center justify-between text-xs"
+                >
+                  <span class="text-text-secondary truncate">{{ change.prediction }}</span>
+                  <span class="font-mono">
+                    <span class="text-text-muted line-through">{{ change.oldOdds.toFixed(2) }}</span>
+                    <span class="mx-1 text-text-muted">&rarr;</span>
+                    <span class="font-bold" :class="change.newOdds > change.oldOdds ? 'text-success' : 'text-danger'">
+                      {{ change.newOdds.toFixed(2) }}
+                    </span>
+                  </span>
+                </div>
+                <div class="flex gap-2 mt-2">
+                  <button
+                    class="flex-1 py-2.5 rounded-lg bg-primary text-surface-0 text-xs font-semibold hover:bg-primary-hover transition-colors"
+                    @click="handleAcceptAndSubmit"
+                  >
+                    {{ $t('betslip.accept') }}
+                  </button>
+                  <button
+                    class="flex-1 py-2.5 rounded-lg border border-surface-3 text-xs text-text-muted hover:text-text-primary transition-colors"
+                    @click="betslip.dismissOddsChanges()"
+                  >
+                    {{ $t('common.cancel') }}
+                  </button>
+                </div>
+              </div>
+
               <!-- Expired items -->
               <div
                 v-for="item in betslip.expiredItems"
@@ -221,17 +309,17 @@ function closeMobile() {
               >
                 <div class="min-w-0 flex-1">
                   <p class="text-xs text-text-secondary truncate line-through">
-                    {{ item.teams.home }} vs {{ item.teams.away }}
+                    {{ item.homeTeam }} vs {{ item.awayTeam }}
                   </p>
                   <p class="text-xs text-danger font-medium mt-0.5">
-                    Abgelaufen
+                    {{ $t('betslip.expired') }}
                   </p>
                 </div>
                 <div class="flex items-center gap-3 shrink-0 ml-3">
                   <span class="text-sm font-mono text-text-muted line-through">{{ item.odds.toFixed(2) }}</span>
                   <button
                     class="w-touch h-touch flex items-center justify-center rounded-lg text-text-muted hover:text-danger transition-colors"
-                    :aria-label="`Tipp entfernen: ${item.teams.home} vs ${item.teams.away}`"
+                    :aria-label="t('betslip.removeBet', { teams: item.homeTeam + ' vs ' + item.awayTeam })"
                     @click="betslip.removeItem(item.matchId)"
                   >
                     <span aria-hidden="true">&times;</span>
@@ -245,7 +333,7 @@ function closeMobile() {
                 class="w-full py-2 rounded-lg text-xs text-danger hover:bg-danger-muted/10 transition-colors"
                 @click="betslip.removeExpired()"
               >
-                Abgelaufene entfernen ({{ betslip.expiredItems.length }})
+                {{ t('betslip.removeExpired', { count: betslip.expiredItems.length }) }}
               </button>
 
               <!-- Valid items -->
@@ -253,20 +341,22 @@ function closeMobile() {
                 v-for="item in betslip.validItems"
                 :key="item.matchId"
                 class="bg-surface-2 rounded-lg p-3 flex items-center justify-between"
+                :class="isStale(item.addedAt) ? 'border border-warning/20' : ''"
               >
                 <div class="min-w-0 flex-1">
                   <p class="text-xs text-text-secondary truncate">
-                    {{ item.teams.home }} vs {{ item.teams.away }}
+                    {{ item.homeTeam }} vs {{ item.awayTeam }}
                   </p>
                   <p class="text-sm text-text-primary font-medium mt-0.5">
                     {{ item.predictionLabel }}
                   </p>
+                  <p v-if="isStale(item.addedAt)" class="text-[10px] text-warning mt-0.5">{{ $t('betslip.oddsStale') }}</p>
                 </div>
                 <div class="flex items-center gap-3 shrink-0 ml-3">
                   <span class="text-sm font-mono text-primary font-bold">{{ item.odds.toFixed(2) }}</span>
                   <button
                     class="w-touch h-touch flex items-center justify-center rounded-lg text-text-muted hover:text-danger transition-colors"
-                    :aria-label="`Tipp entfernen: ${item.teams.home} vs ${item.teams.away}`"
+                    :aria-label="t('betslip.removeBet', { teams: item.homeTeam + ' vs ' + item.awayTeam })"
                     @click="betslip.removeItem(item.matchId)"
                   >
                     <span aria-hidden="true">&times;</span>
@@ -278,7 +368,7 @@ function closeMobile() {
             <!-- Total + Submit -->
             <div class="border-t border-surface-3 pt-4 mt-4">
               <div class="flex items-center justify-between mb-4">
-                <span class="text-sm text-text-secondary">Gesamt-Quote</span>
+                <span class="text-sm text-text-secondary">{{ $t('betslip.totalOdds') }}</span>
                 <span class="text-xl font-mono text-primary font-bold">
                   {{ betslip.totalOdds.toFixed(2) }}
                 </span>
@@ -294,18 +384,18 @@ function closeMobile() {
                       <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4" fill="none" />
                       <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
                     </svg>
-                    Wird abgegeben...
+                    {{ $t('betslip.submitting') }}
                   </span>
                 </template>
                 <template v-else>
-                  Tipp abgeben
+                  {{ $t('betslip.submit') }}
                 </template>
               </button>
               <button
                 class="w-full py-2 mt-2 rounded-lg text-sm text-text-muted hover:text-danger transition-colors"
                 @click="betslip.clear()"
               >
-                Alle entfernen
+                {{ $t('betslip.clearAll') }}
               </button>
             </div>
           </div>

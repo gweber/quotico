@@ -1,16 +1,18 @@
 <script setup lang="ts">
 import { ref, computed } from "vue";
-import type { SpieltagMatch } from "@/stores/spieltag";
+import { useI18n } from "vue-i18n";
+import type { MatchdayMatch } from "@/stores/matchday";
 import { useWalletStore } from "@/stores/wallet";
 import { useToast } from "@/composables/useToast";
 
 const props = defineProps<{
-  matches: SpieltagMatch[];
+  matches: MatchdayMatch[];
   squadId: string;
   matchdayId: string;
   gameMode: string;
 }>();
 
+const { t } = useI18n();
 const walletStore = useWalletStore();
 const toast = useToast();
 
@@ -44,15 +46,19 @@ const potentialWin = computed(() => {
 const canSubmit = computed(() => legs.value.length === REQUIRED_LEGS);
 const existingParlay = computed(() => walletStore.parlay);
 
-const predictionLabels: Record<string, string> = {
-  "1": "Heim",
+const predictionLabels = computed<Record<string, string>>(() => ({
+  "1": t("match.home"),
   X: "X",
-  "2": "Auswärts",
-  over: "Über",
-  under: "Unter",
-};
+  "2": t("match.away"),
+  over: t("wallet.over"),
+  under: t("wallet.under"),
+}));
 
-function toggleLeg(match: SpieltagMatch, prediction: string) {
+function h2hOdds(match: MatchdayMatch): Record<string, number> {
+  return ((match.odds as Record<string, unknown>)?.h2h ?? {}) as Record<string, number>;
+}
+
+function toggleLeg(match: MatchdayMatch, prediction: string) {
   const existing = legs.value.findIndex((l) => l.matchId === match.id);
   if (existing >= 0) {
     if (legs.value[existing].prediction === prediction) {
@@ -64,15 +70,15 @@ function toggleLeg(match: SpieltagMatch, prediction: string) {
 
   if (legs.value.length >= REQUIRED_LEGS) return;
 
-  const odds = match.current_odds[prediction] || 0;
+  const odds = h2hOdds(match)[prediction] || 0;
   if (!odds) return;
 
   legs.value.push({
     matchId: match.id,
     prediction,
     odds,
-    homeTeam: match.teams.home,
-    awayTeam: match.teams.away,
+    homeTeam: match.home_team,
+    awayTeam: match.away_team,
   });
 }
 
@@ -98,11 +104,11 @@ async function submit() {
       })),
       props.gameMode === "bankroll" ? stake.value : null,
     );
-    toast.success("Kombi-Joker platziert!");
+    toast.success(t('parlay.placed'));
     legs.value = [];
     isOpen.value = false;
   } catch (e: unknown) {
-    toast.error(e instanceof Error ? e.message : "Fehler.");
+    toast.error(e instanceof Error ? e.message : t("common.error"));
   } finally {
     submitting.value = false;
   }
@@ -115,7 +121,7 @@ async function submit() {
     v-if="existingParlay"
     class="bg-surface-1 rounded-card p-4 border border-primary/30"
   >
-    <h3 class="text-sm font-semibold text-primary mb-2">Kombi-Joker</h3>
+    <h3 class="text-sm font-semibold text-primary mb-2">{{ $t('parlay.title') }}</h3>
     <div class="space-y-1 text-xs text-text-secondary">
       <div v-for="leg in existingParlay.legs" :key="leg.match_id" class="flex justify-between">
         <span>{{ predictionLabels[leg.prediction] || leg.prediction }}</span>
@@ -133,7 +139,7 @@ async function submit() {
     </div>
     <div class="mt-2 flex justify-between text-sm">
       <span class="text-text-muted">
-        Quote: {{ existingParlay.combined_odds.toFixed(2) }}
+        {{ $t('parlay.odds') }} {{ existingParlay.combined_odds.toFixed(2) }}
       </span>
       <span
         class="font-bold"
@@ -154,7 +160,7 @@ async function submit() {
     class="fixed bottom-20 right-4 z-40 bg-primary text-surface-0 rounded-full shadow-lg px-4 py-3 text-sm font-semibold hover:bg-primary-hover transition-colors"
     @click="isOpen = !isOpen"
   >
-    {{ isOpen ? "Schließen" : `Kombi-Joker (${legs.length}/${REQUIRED_LEGS})` }}
+    {{ isOpen ? $t('parlay.close') : `${$t('parlay.title')} (${legs.length}/${REQUIRED_LEGS})` }}
   </button>
 
   <!-- Builder slide-up -->
@@ -163,9 +169,9 @@ async function submit() {
     class="fixed inset-x-0 bottom-0 z-30 bg-surface-0 border-t border-surface-3 rounded-t-2xl shadow-xl max-h-[70vh] overflow-y-auto p-4 space-y-4"
   >
     <div class="flex items-center justify-between">
-      <h3 class="text-lg font-bold text-text-primary">Kombi-Joker</h3>
+      <h3 class="text-lg font-bold text-text-primary">{{ $t('parlay.title') }}</h3>
       <span class="text-sm text-text-muted">
-        {{ legs.length }}/{{ REQUIRED_LEGS }} Spiele
+        {{ legs.length }}/{{ REQUIRED_LEGS }} {{ $t('match.matches') }}
       </span>
     </div>
 
@@ -201,7 +207,7 @@ async function submit() {
         class="bg-surface-1 rounded-lg p-3 border border-surface-3/50"
       >
         <div class="text-xs text-text-secondary mb-1.5">
-          {{ match.teams.home }} vs {{ match.teams.away }}
+          {{ match.home_team }} vs {{ match.away_team }}
         </div>
         <div class="flex gap-1.5">
           <button
@@ -216,7 +222,7 @@ async function submit() {
             :disabled="legs.length >= REQUIRED_LEGS && !isSelected(match.id, pred)"
             @click="toggleLeg(match, pred)"
           >
-            {{ match.current_odds[pred]?.toFixed(2) || "-" }}
+            {{ h2hOdds(match)[pred]?.toFixed(2) || "-" }}
           </button>
         </div>
       </div>
@@ -225,12 +231,12 @@ async function submit() {
     <!-- Combined odds + submit -->
     <div v-if="legs.length > 0" class="border-t border-surface-3 pt-3">
       <div class="flex justify-between text-sm mb-2">
-        <span class="text-text-muted">Kombiquote:</span>
+        <span class="text-text-muted">{{ $t('parlay.combinedOdds') }}</span>
         <span class="font-bold text-text-primary">{{ combinedOdds.toFixed(2) }}</span>
       </div>
 
       <div v-if="gameMode === 'bankroll'" class="flex items-center gap-2 mb-2">
-        <label class="text-xs text-text-muted">Einsatz:</label>
+        <label class="text-xs text-text-muted">{{ $t('parlay.stake') }}</label>
         <input
           v-model.number="stake"
           type="number"
@@ -241,7 +247,7 @@ async function submit() {
       </div>
 
       <div class="flex justify-between text-sm mb-3">
-        <span class="text-text-muted">Möglicher Gewinn:</span>
+        <span class="text-text-muted">{{ $t('parlay.potentialWin') }}</span>
         <span class="font-bold text-emerald-500">{{ potentialWin.toFixed(0) }}</span>
       </div>
 
@@ -255,7 +261,7 @@ async function submit() {
         :disabled="!canSubmit || submitting"
         @click="submit"
       >
-        {{ submitting ? "Wird platziert..." : `Kombi-Joker setzen (${legs.length}/${REQUIRED_LEGS})` }}
+        {{ submitting ? $t('parlay.submitting') : `${$t('parlay.submit')} (${legs.length}/${REQUIRED_LEGS})` }}
       </button>
     </div>
   </div>

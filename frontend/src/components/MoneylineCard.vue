@@ -1,31 +1,41 @@
 <script setup lang="ts">
 import { ref, computed } from "vue";
-import type { SpieltagMatch } from "@/stores/spieltag";
-import { useSpieltagStore } from "@/stores/spieltag";
+import { useI18n } from "vue-i18n";
+import type { MatchdayMatch } from "@/stores/matchday";
+import { useMatchdayStore } from "@/stores/matchday";
 import { useToast } from "@/composables/useToast";
 import MatchHistory from "./MatchHistory.vue";
 import QuoticoTipBadge from "./QuoticoTipBadge.vue";
 import { getCachedTip } from "@/composables/useQuoticoTip";
 
 const props = defineProps<{
-  match: SpieltagMatch;
+  match: MatchdayMatch;
   sportKey?: string;
 }>();
 
+const { t } = useI18n();
 const quoticoTip = computed(() => getCachedTip(props.match.id));
 
-const spieltag = useSpieltagStore();
+const matchday = useMatchdayStore();
 const toast = useToast();
 
 const selectedPrediction = ref<string | null>(null);
 const submitting = ref(false);
 
 const existingTip = computed(() =>
-  spieltag.moneylineTips.get(props.match.id),
+  matchday.moneylineBets.get(props.match.id),
+);
+
+const h2hOdds = computed(() =>
+  (props.match.odds?.h2h ?? {}) as Record<string, number>
+);
+
+const matchResult = computed(() =>
+  (props.match.result ?? {}) as { outcome?: string; home_score?: number | null; away_score?: number | null }
 );
 
 const kickoffLabel = computed(() => {
-  const d = new Date(props.match.commence_time);
+  const d = new Date(props.match.match_date);
   return d.toLocaleString("de-DE", {
     weekday: "short",
     day: "2-digit",
@@ -35,11 +45,11 @@ const kickoffLabel = computed(() => {
   });
 });
 
-const predictionLabels: Record<string, string> = {
-  "1": "Heim",
-  X: "Unentschieden",
-  "2": "Auswärts",
-};
+const predictionLabels = computed<Record<string, string>>(() => ({
+  "1": t("match.home"),
+  X: t("match.draw"),
+  "2": t("match.away"),
+}));
 
 function selectPrediction(pred: string) {
   if (props.match.is_locked || existingTip.value) return;
@@ -48,21 +58,21 @@ function selectPrediction(pred: string) {
 
 async function submitTip() {
   if (!selectedPrediction.value) return;
-  const odds = props.match.current_odds[selectedPrediction.value];
+  const odds = h2hOdds.value[selectedPrediction.value];
   if (!odds) return;
 
   submitting.value = true;
   try {
-    const ok = await spieltag.submitMoneylineTip(
+    const ok = await matchday.submitMoneylineBet(
       props.match.id,
       selectedPrediction.value,
       odds,
     );
     if (ok) {
-      toast.success("Tipp abgegeben!");
+      toast.success(t("betslip.successSingle"));
       selectedPrediction.value = null;
     } else {
-      toast.error("Fehler beim Tippen.");
+      toast.error(t("common.genericError"));
     }
   } finally {
     submitting.value = false;
@@ -80,10 +90,10 @@ function tipStatusClass(status: string) {
 
 function tipStatusLabel(status: string) {
   switch (status) {
-    case "won": return "Gewonnen";
-    case "lost": return "Verloren";
-    case "void": return "Ungültig";
-    default: return "Offen";
+    case "won": return t("qbot.won");
+    case "lost": return t("qbot.lost");
+    case "void": return t("match.void");
+    default: return t('match.open');
   }
 }
 </script>
@@ -103,21 +113,21 @@ function tipStatusLabel(status: string) {
       >
         {{ tipStatusLabel(existingTip.status) }}
       </span>
-      <span v-else-if="match.is_locked" class="text-xs text-text-muted">Gesperrt</span>
+      <span v-else-if="match.is_locked" class="text-xs text-text-muted">{{ $t('match.locked') }}</span>
     </div>
 
     <!-- Teams + Score (mirroring classic card layout) -->
     <div class="flex items-center gap-3">
       <div class="flex-1 text-right">
         <span class="text-sm font-medium text-text-primary truncate block">
-          {{ match.teams.home }}
+          {{ match.home_team }}
         </span>
       </div>
       <div class="flex items-center gap-1.5 shrink-0">
-        <template v-if="match.status === 'completed' && match.home_score !== null">
-          <span class="w-10 text-center text-lg font-bold text-text-primary">{{ match.home_score }}</span>
+        <template v-if="match.status === 'final' && matchResult.home_score !== null">
+          <span class="w-10 text-center text-lg font-bold text-text-primary">{{ matchResult.home_score }}</span>
           <span class="text-text-muted font-bold">:</span>
-          <span class="w-10 text-center text-lg font-bold text-text-primary">{{ match.away_score }}</span>
+          <span class="w-10 text-center text-lg font-bold text-text-primary">{{ matchResult.away_score }}</span>
         </template>
         <template v-else>
           <span class="text-sm text-text-muted px-2">vs</span>
@@ -125,7 +135,7 @@ function tipStatusLabel(status: string) {
       </div>
       <div class="flex-1">
         <span class="text-sm font-medium text-text-primary truncate block">
-          {{ match.teams.away }}
+          {{ match.away_team }}
         </span>
       </div>
     </div>
@@ -154,7 +164,7 @@ function tipStatusLabel(status: string) {
           @click="selectPrediction(pred)"
         >
           <div class="text-xs opacity-70">{{ predictionLabels[pred] }}</div>
-          <div>{{ match.current_odds[pred]?.toFixed(2) || "-" }}</div>
+          <div>{{ h2hOdds[pred]?.toFixed(2) || "-" }}</div>
         </button>
       </div>
 
@@ -165,7 +175,7 @@ function tipStatusLabel(status: string) {
           :disabled="submitting"
           @click="submitTip"
         >
-          {{ submitting ? "..." : "Tippen" }}
+          {{ submitting ? "..." : $t('betslip.submit') }}
         </button>
       </div>
     </template>
@@ -173,8 +183,8 @@ function tipStatusLabel(status: string) {
     <!-- Historical context (H2H + form) -->
     <MatchHistory
       v-if="sportKey"
-      :home-team="match.teams.home"
-      :away-team="match.teams.away"
+      :home-team="match.home_team"
+      :away-team="match.away_team"
       :sport-key="sportKey"
       :context="(match.h2h_context as any) ?? undefined"
     />
@@ -183,8 +193,8 @@ function tipStatusLabel(status: string) {
     <QuoticoTipBadge
       v-if="quoticoTip"
       :tip="quoticoTip"
-      :home-team="match.teams.home"
-      :away-team="match.teams.away"
+      :home-team="match.home_team"
+      :away-team="match.away_team"
     />
   </div>
 </template>

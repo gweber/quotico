@@ -1,10 +1,12 @@
 <script setup lang="ts">
 import { ref, computed } from "vue";
 import { useRouter } from "vue-router";
+import { useI18n } from "vue-i18n";
 import { useAuthStore } from "@/stores/auth";
 import { useToast } from "@/composables/useToast";
 
 const router = useRouter();
+const { t } = useI18n();
 const auth = useAuthStore();
 const toast = useToast();
 
@@ -22,7 +24,7 @@ const ageError = computed(() => {
   if (monthDiff < 0 || (monthDiff === 0 && today.getDate() < birth.getDate())) {
     age--;
   }
-  if (age < 18) return "Du musst mindestens 18 Jahre alt sein (Jugendschutz).";
+  if (age < 18) return t('auth.ageError');
   return "";
 });
 
@@ -30,7 +32,7 @@ async function handleComplete() {
   errorMessage.value = "";
 
   if (!birthDate.value) {
-    errorMessage.value = "Bitte Geburtsdatum angeben.";
+    errorMessage.value = t('profile.enterBirthDate');
     return;
   }
 
@@ -40,19 +42,19 @@ async function handleComplete() {
   }
 
   if (!disclaimerAccepted.value) {
-    errorMessage.value = "Bitte bestätige den Haftungsausschluss.";
+    errorMessage.value = t('profile.disclaimerRequired');
     return;
   }
 
   loading.value = true;
   try {
     await auth.completeProfile(birthDate.value, disclaimerAccepted.value);
-    toast.success("Profil vervollständigt! Willkommen bei Quotico.");
+    toast.success(t('profile.completedSuccess'));
     // Check for pending invite link from before auth flow
     const pendingInvite = localStorage.getItem("pendingInvite");
     router.push(pendingInvite ? `/join/${pendingInvite}` : "/");
   } catch (e: unknown) {
-    const msg = e instanceof Error ? e.message : "Fehler beim Vervollständigen.";
+    const msg = e instanceof Error ? e.message : t('profile.completedError');
     errorMessage.value = msg;
   } finally {
     loading.value = false;
@@ -64,9 +66,9 @@ async function handleComplete() {
   <div class="min-h-screen bg-surface-0 flex items-center justify-center px-4">
     <div class="bg-surface-1 rounded-card w-full max-w-md p-8 shadow-xl">
       <div class="text-center mb-8">
-        <h1 class="text-2xl font-bold text-text-primary">Profil vervollständigen</h1>
+        <h1 class="text-2xl font-bold text-text-primary">{{ $t('profile.completeHeading') }}</h1>
         <p class="text-sm text-text-secondary mt-2">
-          Bitte bestätige dein Alter, um Quotico.de nutzen zu können.
+          {{ $t('profile.completeInstruction') }}
         </p>
       </div>
 
@@ -82,7 +84,7 @@ async function handleComplete() {
         <!-- Birth Date -->
         <div class="mb-4">
           <label for="complete-birthdate" class="block text-sm font-medium text-text-secondary mb-1.5">
-            Geburtsdatum
+            {{ $t('auth.birthDate') }}
           </label>
           <input
             id="complete-birthdate"
@@ -104,11 +106,11 @@ async function handleComplete() {
               class="mt-0.5 w-4 h-4 rounded border-surface-3 bg-surface-2 text-primary focus:ring-primary focus:ring-1"
             />
             <span class="text-xs text-text-secondary leading-relaxed">
-              Ich bestätige, dass ich mindestens 18 Jahre alt bin und akzeptiere die
-              <RouterLink to="/legal/agb" class="text-secondary underline">AGB</RouterLink>
+              {{ $t('profile.ageConfirm') }}
+              <RouterLink to="/legal/agb" class="text-secondary underline">{{ $t('legal.agb') }}</RouterLink>
               sowie die
-              <RouterLink to="/legal/datenschutz" class="text-secondary underline">Datenschutzerklärung</RouterLink>.
-              Quotico.de ist kein Echtgeld-Glücksspiel.
+              <RouterLink to="/legal/datenschutz" class="text-secondary underline">{{ $t('legal.datenschutz') }}</RouterLink>.
+              {{ $t('profile.noRealMoney') }}
             </span>
           </label>
         </div>
@@ -124,17 +126,17 @@ async function handleComplete() {
                 <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4" fill="none" />
                 <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
               </svg>
-              Wird gespeichert...
+              {{ $t('profile.saving') }}
             </span>
           </template>
           <template v-else>
-            Bestätigen und weiter
+            {{ $t('profile.confirmContinue') }}
           </template>
         </button>
       </form>
 
       <p class="text-center text-xs text-text-muted mt-6">
-        Ab 18 Jahren. Kein echtes Geld. Quotico dient nur der Unterhaltung.
+        {{ $t('profile.legalDisclaimer') }}
       </p>
     </div>
   </div>

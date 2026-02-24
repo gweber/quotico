@@ -1,43 +1,50 @@
 <script setup lang="ts">
 import { ref, onMounted, onUnmounted } from "vue";
+import { useI18n } from "vue-i18n";
 import { useMatchesStore } from "@/stores/matches";
 import { useAuthStore } from "@/stores/auth";
 import { prefetchMatchHistory } from "@/composables/useMatchHistory";
-import { prefetchQuoticoTips } from "@/composables/useQuoticoTip";
-import { prefetchUserTips } from "@/composables/useUserTips";
+import { prefetchUserBets } from "@/composables/useUserBets";
 import SportNav from "@/components/layout/SportNav.vue";
 import BetSlip from "@/components/layout/BetSlip.vue";
 import MatchCard from "@/components/MatchCard.vue";
-
+const { t } = useI18n();
 const matches = useMatchesStore();
 const auth = useAuthStore();
 const aliasBannerDismissed = ref(false);
+const error = ref(false);
 
-onMounted(async () => {
-  await matches.fetchMatches();
+async function reload() {
+  error.value = false;
+  try {
+    await matches.fetchMatches();
 
-  // Prefetch historical data, QuoticoTips, and user tips for all visible matches
-  if (matches.matches.length > 0) {
-    const prefetches: Promise<void>[] = [
-      prefetchMatchHistory(
-        matches.matches.map((m) => ({
-          home_team: m.teams.home,
-          away_team: m.teams.away,
-          sport_key: m.sport_key,
-        })),
-      ),
-      prefetchQuoticoTips(),
-    ];
+    // Prefetch historical data, QuoticoTips, and user bets for all visible matches
+    if (matches.matches.length > 0) {
+      const prefetches: Promise<void>[] = [
+        prefetchMatchHistory(
+          matches.matches.map((m) => ({
+            home_team: m.home_team,
+            away_team: m.away_team,
+            sport_key: m.sport_key,
+          })),
+        ),
+      ];
 
-    if (auth.isLoggedIn) {
-      prefetches.push(prefetchUserTips(matches.matches.map((m) => m.id)));
+      if (auth.isLoggedIn) {
+        prefetches.push(prefetchUserBets(matches.matches.map((m) => m.id)));
+      }
+
+      await Promise.all(prefetches);
     }
 
-    await Promise.all(prefetches);
+    matches.connectLive();
+  } catch {
+    error.value = true;
   }
+}
 
-  matches.connectLive();
-});
+onMounted(() => reload());
 
 onUnmounted(() => {
   matches.disconnectLive();
@@ -64,18 +71,18 @@ onUnmounted(() => {
         >
           <div class="flex items-center gap-2 min-w-0">
             <span class="text-sm text-text-primary">
-              Du tippst noch als <strong class="text-primary">{{ auth.user?.alias }}</strong>.
+              {{ t('dashboard.playingAs', { alias: auth.user?.alias }) }}
             </span>
             <RouterLink
               to="/settings"
               class="shrink-0 text-sm font-medium text-primary hover:underline"
             >
-              Spielername wählen
+              {{ $t('dashboard.choosePlayerName') }}
             </RouterLink>
           </div>
           <button
             class="shrink-0 text-text-muted hover:text-text-primary transition-colors"
-            aria-label="Banner schließen"
+            :aria-label="$t('dashboard.closeBanner')"
             @click="aliasBannerDismissed = true"
           >
             <svg class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -93,6 +100,12 @@ onUnmounted(() => {
           />
         </div>
 
+        <!-- Error state -->
+        <div v-else-if="error" class="text-center py-12">
+          <p class="text-text-muted mb-3">{{ $t('common.loadError') }}</p>
+          <button class="text-sm text-primary hover:underline" @click="reload">{{ $t('common.retry') }}</button>
+        </div>
+
         <!-- Empty state -->
         <div
           v-else-if="matches.matches.length === 0"
@@ -100,15 +113,27 @@ onUnmounted(() => {
         >
           <span class="text-4xl mb-4" aria-hidden="true">⚽</span>
           <h2 class="text-lg font-semibold text-text-primary mb-2">
-            Keine Spiele verfügbar
+            {{ $t('dashboard.noMatches') }}
           </h2>
           <p class="text-sm text-text-secondary text-center max-w-xs">
-            Aktuell sind keine Spiele für diese Sportart geplant. Schau später noch einmal vorbei.
+            {{ $t('dashboard.noMatchesMessage') }}
           </p>
         </div>
 
         <!-- Match cards -->
-        <div v-else class="space-y-3" aria-label="Spielübersicht">
+        <div v-else class="space-y-3" :aria-label="$t('dashboard.matchOverview')">
+          <!-- Refresh countdown -->
+          <div class="flex items-center justify-end gap-2 text-xs text-text-muted">
+            <span
+              class="inline-flex items-center gap-1 tabular-nums"
+              :title="$t('dashboard.oddsRefreshInfo')"
+            >
+              <svg class="w-3 h-3 opacity-60" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+              </svg>
+              {{ Math.floor(matches.refreshCountdown / 60) }}:{{ String(matches.refreshCountdown % 60).padStart(2, '0') }}
+            </span>
+          </div>
           <MatchCard
             v-for="match in matches.matches"
             :key="match.id"

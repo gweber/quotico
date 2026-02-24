@@ -1,10 +1,13 @@
 <script setup lang="ts">
 import { ref, computed } from "vue";
+import { useI18n } from "vue-i18n";
 import { useSquadsStore } from "@/stores/squads";
-import { useSpieltagStore } from "@/stores/spieltag";
+import { useMatchdayStore } from "@/stores/matchday";
 import { useToast } from "@/composables/useToast";
-import { GAME_MODE_LABELS, type GameModeType } from "@/types/league";
+import { GAME_MODE_I18N_KEYS, type GameModeType } from "@/types/league";
 import { SPORT_LABELS } from "@/types/sports";
+
+const { t } = useI18n();
 
 const props = defineProps<{
   squadId: string;
@@ -12,21 +15,21 @@ const props = defineProps<{
 }>();
 
 const squadsStore = useSquadsStore();
-const spieltag = useSpieltagStore();
+const matchday = useMatchdayStore();
 const toast = useToast();
 const saving = ref(false);
 const showAddMenu = ref(false);
 
 const sportLabels = SPORT_LABELS;
 
-const modes: { value: GameModeType; label: string }[] = [
-  { value: "classic", label: "Tippspiel" },
-  { value: "moneyline", label: "Quotentipp" },
-  { value: "bankroll", label: "Bankroll" },
-  { value: "survivor", label: "Survivor" },
-  { value: "over_under", label: "Über/Unter" },
-  { value: "fantasy", label: "Fantasy" },
-];
+const modes = computed<{ value: GameModeType; label: string }[]>(() => [
+  { value: "classic", label: t("gameModes.classic") },
+  { value: "moneyline", label: t("gameModes.moneyline") },
+  { value: "bankroll", label: t("gameModes.bankroll") },
+  { value: "survivor", label: t("gameModes.survivor") },
+  { value: "over_under", label: t("gameModes.overUnder") },
+  { value: "fantasy", label: t("gameModes.fantasy") },
+]);
 
 const activeConfigs = computed(() =>
   squadsStore.getActiveLeagueConfigs(props.squadId)
@@ -37,7 +40,7 @@ const configuredSportKeys = computed(() =>
 );
 
 const availableToAdd = computed(() =>
-  spieltag.sports.filter((s) => !configuredSportKeys.value.has(s.sport_key))
+  matchday.sports.filter((s) => !configuredSportKeys.value.has(s.sport_key))
 );
 
 async function addLeague(sportKey: string) {
@@ -45,11 +48,11 @@ async function addLeague(sportKey: string) {
   try {
     await squadsStore.setLeagueConfig(props.squadId, sportKey, "classic");
     toast.success(
-      `${sportLabels[sportKey] || sportKey} hinzugefügt!`
+      `${sportLabels[sportKey] || sportKey} ${t("common.added")}`
     );
     showAddMenu.value = false;
   } catch (e: unknown) {
-    toast.error(e instanceof Error ? e.message : "Fehler.");
+    toast.error(e instanceof Error ? e.message : t("common.error"));
   } finally {
     saving.value = false;
   }
@@ -59,9 +62,9 @@ async function changeMode(sportKey: string, newMode: GameModeType) {
   saving.value = true;
   try {
     await squadsStore.setLeagueConfig(props.squadId, sportKey, newMode);
-    toast.success("Modus geändert!");
+    toast.success(t("squadDetail.modeChanged"));
   } catch (e: unknown) {
-    toast.error(e instanceof Error ? e.message : "Fehler.");
+    toast.error(e instanceof Error ? e.message : t("common.error"));
   } finally {
     saving.value = false;
   }
@@ -70,7 +73,7 @@ async function changeMode(sportKey: string, newMode: GameModeType) {
 async function removeLeague(sportKey: string) {
   if (
     !confirm(
-      "Liga deaktivieren? Laufende Vorhersagen bleiben erhalten, neue werden nicht möglich."
+      t("squadDetail.deactivateConfirm")
     )
   )
     return;
@@ -78,9 +81,9 @@ async function removeLeague(sportKey: string) {
   saving.value = true;
   try {
     await squadsStore.removeLeagueConfig(props.squadId, sportKey);
-    toast.success("Liga deaktiviert.");
+    toast.success(t("squadDetail.deactivated"));
   } catch (e: unknown) {
-    toast.error(e instanceof Error ? e.message : "Fehler.");
+    toast.error(e instanceof Error ? e.message : t("common.error"));
   } finally {
     saving.value = false;
   }
@@ -91,14 +94,14 @@ async function removeLeague(sportKey: string) {
   <div class="space-y-3">
     <div class="flex items-center justify-between">
       <h3 class="text-sm font-semibold text-text-primary">
-        Liga-Konfiguration
+        {{ $t('squadDetail.leagueConfig') }}
       </h3>
       <button
         v-if="isAdmin && availableToAdd.length > 0"
         class="text-xs text-primary font-medium hover:underline"
         @click="showAddMenu = !showAddMenu"
       >
-        + Liga hinzufügen
+        {{ $t('squadDetail.addLeague') }}
       </button>
     </div>
 
@@ -131,14 +134,14 @@ async function removeLeague(sportKey: string) {
             v-else
             class="text-xs px-2 py-1 rounded bg-primary/10 text-primary font-medium"
           >
-            {{ GAME_MODE_LABELS[config.game_mode] || config.game_mode }}
+            {{ $t(GAME_MODE_I18N_KEYS[config.game_mode]) }}
           </span>
 
           <button
             v-if="isAdmin"
             class="text-text-muted hover:text-red-500 transition-colors p-1"
             :disabled="saving"
-            title="Liga deaktivieren"
+            :title="$t('squadDetail.deactivated')"
             @click="removeLeague(config.sport_key)"
           >
             <svg
@@ -163,7 +166,7 @@ async function removeLeague(sportKey: string) {
       v-else
       class="text-center py-6 text-text-muted text-sm"
     >
-      Keine Ligen konfiguriert. {{ isAdmin ? "Füge eine Liga hinzu!" : "" }}
+      {{ $t('squadDetail.noLeagues') }}
     </div>
 
     <!-- Add league menu -->

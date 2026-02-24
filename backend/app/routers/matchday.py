@@ -1,4 +1,4 @@
-"""Spieltag-Modus API endpoints."""
+"""Matchday mode API endpoints."""
 
 import asyncio
 import logging
@@ -8,7 +8,7 @@ from bson import ObjectId
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 
 import app.database as _db
-from app.config_spieltag import SPIELTAG_SPORTS
+from app.config_matchday import MATCHDAY_SPORTS
 from app.models.matchday import (
     AdminPredictionRequest,
     AdminUnlockRequest,
@@ -16,12 +16,13 @@ from app.models.matchday import (
     MatchdayResponse,
     PredictionResponse,
     SavePredictionsRequest,
-    SpieltagLeaderboardEntry,
-    SpieltagPredictionResponse,
+    MatchdayLeaderboardEntry,
+    MatchdayPredictionResponse,
 )
 from app.services.historical_service import build_match_context
 from app.services.auth_service import get_current_user
-from app.services.spieltag_service import (
+from app.utils import as_utc
+from app.services.matchday_service import (
     LOCK_MINUTES,
     admin_save_prediction,
     admin_unlock_match,
@@ -30,21 +31,21 @@ from app.services.spieltag_service import (
     save_predictions,
 )
 
-logger = logging.getLogger("quotico.spieltag")
+logger = logging.getLogger("quotico.matchday")
 
-router = APIRouter(prefix="/api/spieltag", tags=["spieltag"])
+router = APIRouter(prefix="/api/matchday", tags=["matchday"])
 
 
 @router.get("/sports")
-async def get_spieltag_sports():
-    """Return list of sports available for Spieltag mode."""
+async def get_matchday_sports():
+    """Return list of sports available for Matchday mode."""
     return [
         {
             "sport_key": key,
             "label": config["label_template"].replace("{n}", ""),
             "matchdays_per_season": config["matchdays_per_season"],
         }
-        for key, config in SPIELTAG_SPORTS.items()
+        for key, config in MATCHDAY_SPORTS.items()
     ]
 
 
@@ -54,8 +55,8 @@ async def get_matchdays(
     season: int | None = Query(None, description="Season year"),
 ):
     """Get all matchdays for a sport/season."""
-    if sport not in SPIELTAG_SPORTS:
-        raise HTTPException(status_code=400, detail="Ungültige Sportart.")
+    if sport not in MATCHDAY_SPORTS:
+        raise HTTPException(status_code=400, detail="Invalid sport.")
 
     query: dict = {"sport_key": sport}
     if season:
@@ -73,8 +74,8 @@ async def get_matchdays(
             matchday_number=md["matchday_number"],
             label=md["label"],
             match_count=md.get("match_count", 0),
-            first_kickoff=md.get("first_kickoff"),
-            last_kickoff=md.get("last_kickoff"),
+            first_kickoff=as_utc(md.get("first_kickoff")),
+            last_kickoff=as_utc(md.get("last_kickoff")),
             status=md.get("status", "upcoming"),
             all_resolved=md.get("all_resolved", False),
         )
@@ -90,7 +91,7 @@ async def get_matchday_detail(
     """Get matchday with all matches (teams, times, odds, scores, historical context)."""
     matchday = await _db.db.matchdays.find_one({"_id": ObjectId(matchday_id)})
     if not matchday:
-        raise HTTPException(status_code=404, detail="Spieltag nicht gefunden.")
+        raise HTTPException(status_code=404, detail="Matchday not found.")
 
     sport_key = matchday["sport_key"]
 
@@ -107,7 +108,7 @@ async def get_matchday_detail(
     match_ids = matchday.get("match_ids", [])
     matches = await _db.db.matches.find(
         {"_id": {"$in": [ObjectId(mid) for mid in match_ids]}}
-    ).sort("commence_time", 1).to_list(length=len(match_ids))
+    ).sort("match_date", 1).to_list(length=len(match_ids))
 
     # Fetch historical context for all matches in parallel (cached server-side).
     # Uses return_exceptions so one failed resolution doesn't block the response.
@@ -117,8 +118,8 @@ async def get_matchday_detail(
         *(
             asyncio.wait_for(
                 build_match_context(
-                    m.get("teams", {}).get("home", ""),
-                    m.get("teams", {}).get("away", ""),
+                    m.get("home_team", ""),
+                    m.get("away_team", ""),
                     sport_key,
                 ),
                 timeout=3.0,
@@ -129,15 +130,15 @@ async def get_matchday_detail(
     )
 
     # Fetch QuoticoTips for all matches in one query
-    async def _fetch_tips() -> dict[str, dict]:
-        tips = await _db.db.quotico_tips.find(
+    async def _fetch_bets() -> dict[str, dict]:
+        bets = await _db.db.quotico_tips.find(
             {"match_id": {"$in": match_id_strs}, "status": {"$in": ["active", "no_signal"]}},
             {"_id": 0, "actual_result": 0, "was_correct": 0},
         ).to_list(length=len(match_id_strs))
-        return {t["match_id"]: t for t in tips}
+        return {b["match_id"]: b for b in bets}
 
-    h2h_results, tips_map = await asyncio.gather(
-        h2h_task, _fetch_tips(), return_exceptions=False,
+    h2h_results, bets_map = await asyncio.gather(
+        h2h_task, _fetch_bets(), return_exceptions=False,
     )
 
     h2h_contexts = [
@@ -148,41 +149,39 @@ async def get_matchday_detail(
     match_responses = []
     for m, ctx in zip(matches, h2h_contexts):
         mid = str(m["_id"])
-        tip_doc = tips_map.get(mid)
+        bet_doc = bets_map.get(mid)
         # Reshape to match the QuoticoTipResponse format
-        qtip = None
-        if tip_doc:
-            qtip = {
-                "match_id": tip_doc["match_id"],
-                "sport_key": tip_doc["sport_key"],
-                "teams": tip_doc.get("teams", {}),
-                "commence_time": tip_doc["match_commence_time"],
-                "recommended_selection": tip_doc["recommended_selection"],
-                "confidence": tip_doc["confidence"],
-                "edge_pct": tip_doc["edge_pct"],
-                "true_probability": tip_doc["true_probability"],
-                "implied_probability": tip_doc["implied_probability"],
-                "expected_goals_home": tip_doc["expected_goals_home"],
-                "expected_goals_away": tip_doc["expected_goals_away"],
-                "tier_signals": tip_doc["tier_signals"],
-                "justification": tip_doc["justification"],
-                "generated_at": tip_doc["generated_at"],
+        qbet = None
+        if bet_doc:
+            qbet = {
+                "match_id": bet_doc["match_id"],
+                "sport_key": bet_doc["sport_key"],
+                "home_team": bet_doc["home_team"],
+                "away_team": bet_doc["away_team"],
+                "match_date": as_utc(bet_doc["match_date"]),
+                "recommended_selection": bet_doc["recommended_selection"],
+                "confidence": bet_doc["confidence"],
+                "edge_pct": bet_doc["edge_pct"],
+                "true_probability": bet_doc["true_probability"],
+                "implied_probability": bet_doc["implied_probability"],
+                "expected_goals_home": bet_doc["expected_goals_home"],
+                "expected_goals_away": bet_doc["expected_goals_away"],
+                "tier_signals": bet_doc["tier_signals"],
+                "justification": bet_doc["justification"],
+                "generated_at": as_utc(bet_doc["generated_at"]),
             }
         match_responses.append(
             MatchdayDetailMatch(
                 id=str(m["_id"]),
-                teams=m.get("teams", {}),
-                commence_time=m["commence_time"],
-                status=m.get("status", "upcoming"),
-                current_odds=m.get("current_odds", {}),
-                totals_odds=m.get("totals_odds", {}),
-                spreads_odds=m.get("spreads_odds", {}),
-                result=m.get("result"),
-                home_score=m.get("home_score"),
-                away_score=m.get("away_score"),
+                home_team=m.get("home_team", ""),
+                away_team=m.get("away_team", ""),
+                match_date=as_utc(m["match_date"]),
+                status=m.get("status", "scheduled"),
+                odds=m.get("odds", {}),
+                result=m.get("result", {}),
                 is_locked=is_match_locked(m, lock_mins),
                 h2h_context=ctx,
-                quotico_tip=qtip,
+                quotico_tip=qbet,
             )
         )
 
@@ -194,8 +193,8 @@ async def get_matchday_detail(
             matchday_number=matchday["matchday_number"],
             label=matchday["label"],
             match_count=matchday.get("match_count", 0),
-            first_kickoff=matchday.get("first_kickoff"),
-            last_kickoff=matchday.get("last_kickoff"),
+            first_kickoff=as_utc(matchday.get("first_kickoff")),
+            last_kickoff=as_utc(matchday.get("last_kickoff")),
             status=matchday.get("status", "upcoming"),
             all_resolved=matchday.get("all_resolved", False),
         ),
@@ -205,7 +204,7 @@ async def get_matchday_detail(
 
 @router.get(
     "/matchdays/{matchday_id}/predictions",
-    response_model=SpieltagPredictionResponse | None,
+    response_model=MatchdayPredictionResponse | None,
 )
 async def get_predictions(
     matchday_id: str,
@@ -218,10 +217,10 @@ async def get_predictions(
     if not pred:
         return None
 
-    return SpieltagPredictionResponse(
+    return MatchdayPredictionResponse(
         matchday_id=matchday_id,
         squad_id=pred.get("squad_id"),
-        auto_tipp_strategy=pred.get("auto_tipp_strategy", "none"),
+        auto_bet_strategy=pred.get("auto_bet_strategy", "none"),
         predictions=[
             PredictionResponse(
                 match_id=p["match_id"],
@@ -261,13 +260,13 @@ async def save_matchday_predictions(
         user_id=user_id,
         matchday_id=matchday_id,
         predictions=predictions,
-        auto_tipp_strategy=body.auto_tipp_strategy.value,
+        auto_bet_strategy=body.auto_bet_strategy.value,
         squad_id=body.squad_id,
     )
 
     return {
         "saved": len(result.get("predictions", [])),
-        "auto_tipp_strategy": result.get("auto_tipp_strategy"),
+        "auto_bet_strategy": result.get("auto_bet_strategy"),
     }
 
 
@@ -279,7 +278,7 @@ async def get_matchday_leaderboard(
     """Get leaderboard for a specific matchday (optionally squad-scoped)."""
     matchday = await _db.db.matchdays.find_one({"_id": ObjectId(matchday_id)})
     if not matchday:
-        raise HTTPException(status_code=404, detail="Spieltag nicht gefunden.")
+        raise HTTPException(status_code=404, detail="Matchday not found.")
 
     # Build match filter
     match_filter: dict = {"matchday_id": matchday_id, "status": "resolved"}
@@ -309,7 +308,7 @@ async def get_matchday_leaderboard(
         {"$unwind": {"path": "$user_info", "preserveNullAndEmptyArrays": True}},
     ]
 
-    entries = await _db.db.spieltag_predictions.aggregate(pipeline).to_list(length=100)
+    entries = await _db.db.matchday_predictions.aggregate(pipeline).to_list(length=100)
 
     leaderboard = []
     for i, entry in enumerate(entries):
@@ -321,7 +320,7 @@ async def get_matchday_leaderboard(
         leaderboard.append({
             "rank": i + 1,
             "user_id": entry["user_id"],
-            "alias": entry.get("user_info", {}).get("alias", "Anonym"),
+            "alias": entry.get("user_info", {}).get("alias", "Anonymous"),
             "total_points": entry.get("total_points", 0),
             "exact_count": exact,
             "diff_count": diff,
@@ -338,8 +337,8 @@ async def get_season_leaderboard(
     squad_id: str | None = Query(None, description="Filter by squad"),
 ):
     """Get season-wide leaderboard for a sport (optionally squad-scoped)."""
-    if sport not in SPIELTAG_SPORTS:
-        raise HTTPException(status_code=400, detail="Ungültige Sportart.")
+    if sport not in MATCHDAY_SPORTS:
+        raise HTTPException(status_code=400, detail="Invalid sport.")
 
     query: dict = {"sport_key": sport}
     if season:
@@ -347,7 +346,7 @@ async def get_season_leaderboard(
     if squad_id:
         query["squad_id"] = squad_id
 
-    entries = await _db.db.spieltag_leaderboard.find(query).sort(
+    entries = await _db.db.matchday_leaderboard.find(query).sort(
         "total_points", -1
     ).to_list(length=100)
 
@@ -355,7 +354,7 @@ async def get_season_leaderboard(
         {
             "rank": i + 1,
             "user_id": e["user_id"],
-            "alias": e.get("alias", "Anonym"),
+            "alias": e.get("alias", "Anonymous"),
             "total_points": e.get("total_points", 0),
             "matchdays_played": e.get("matchdays_played", 0),
             "exact_count": e.get("exact_count", 0),
@@ -378,9 +377,9 @@ async def get_squad_members_for_admin(
     user_id = str(user["_id"])
     squad = await _db.db.squads.find_one({"_id": ObjectId(squad_id)})
     if not squad:
-        raise HTTPException(status_code=404, detail="Squad nicht gefunden.")
+        raise HTTPException(status_code=404, detail="Squad not found.")
     if squad["admin_id"] != user_id:
-        raise HTTPException(status_code=403, detail="Nur der Squad-Admin kann das.")
+        raise HTTPException(status_code=403, detail="Only the squad admin can do this.")
 
     member_ids = squad.get("members", [])
     users = await _db.db.users.find(
@@ -389,7 +388,7 @@ async def get_squad_members_for_admin(
     ).to_list(length=len(member_ids))
 
     return [
-        {"user_id": str(u["_id"]), "alias": u.get("alias", "Anonym")}
+        {"user_id": str(u["_id"]), "alias": u.get("alias", "Anonymous")}
         for u in users
     ]
 
@@ -405,18 +404,18 @@ async def get_admin_user_predictions(
     admin_id = str(admin["_id"])
     squad = await _db.db.squads.find_one({"_id": ObjectId(squad_id)})
     if not squad:
-        raise HTTPException(status_code=404, detail="Squad nicht gefunden.")
+        raise HTTPException(status_code=404, detail="Squad not found.")
     if squad["admin_id"] != admin_id:
-        raise HTTPException(status_code=403, detail="Nur der Squad-Admin kann das.")
+        raise HTTPException(status_code=403, detail="Only the squad admin can do this.")
 
     pred = await get_user_predictions(user_id, matchday_id, squad_id=squad_id)
     if not pred:
         return None
 
-    return SpieltagPredictionResponse(
+    return MatchdayPredictionResponse(
         matchday_id=matchday_id,
         squad_id=pred.get("squad_id"),
-        auto_tipp_strategy=pred.get("auto_tipp_strategy", "none"),
+        auto_bet_strategy=pred.get("auto_bet_strategy", "none"),
         predictions=[
             PredictionResponse(
                 match_id=p["match_id"],

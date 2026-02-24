@@ -69,7 +69,7 @@ async def seed_initial_user() -> None:
     else:
         squad_doc = {
             "name": SEED_SQUAD_NAME,
-            "description": "Die offizielle Beta-Tester-Gruppe von Quotico.de",
+            "description": "The official beta tester group of Quotico.de",
             "invite_code": SEED_SQUAD_CODE,
             "admin_id": user_id,
             "members": [user_id],

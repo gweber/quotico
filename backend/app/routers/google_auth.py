@@ -39,9 +39,9 @@ async def google_login(request: Request):
     state = secrets.token_urlsafe(32)
     request.session["oauth_state"] = state
 
-    # Preserve redirect target through the OAuth flow
+    # Preserve redirect target through the OAuth flow (block protocol-relative URLs)
     redirect = request.query_params.get("redirect", "")
-    if redirect and redirect.startswith("/"):
+    if redirect and redirect.startswith("/") and not redirect.startswith("//"):
         request.session["oauth_redirect"] = redirect
 
     params = {
@@ -68,6 +68,15 @@ async def google_callback(request: Request, code: str = "", state: str = "", err
         logger.warning("Google OAuth state mismatch")
         return RedirectResponse("/login?error=invalid_state")
 
+    try:
+        return await _handle_google_callback(request, code)
+    except Exception:
+        logger.exception("Google OAuth callback failed")
+        return RedirectResponse("/login?error=google_failed")
+
+
+async def _handle_google_callback(request: Request, code: str) -> RedirectResponse:
+    """Inner callback logic — separated so the outer handler can catch all errors."""
     # Exchange code for tokens
     async with httpx.AsyncClient(timeout=15.0) as client:
         token_resp = await client.post(GOOGLE_TOKEN_URL, data={
@@ -79,7 +88,7 @@ async def google_callback(request: Request, code: str = "", state: str = "", err
         })
 
     if token_resp.status_code != 200:
-        logger.error("Google token exchange failed: %s", token_resp.text)
+        logger.error("Google token exchange failed (HTTP %s)", token_resp.status_code)
         return RedirectResponse("/login?error=google_failed")
 
     tokens = token_resp.json()
@@ -93,7 +102,7 @@ async def google_callback(request: Request, code: str = "", state: str = "", err
         )
 
     if userinfo_resp.status_code != 200:
-        logger.error("Google userinfo failed: %s", userinfo_resp.text)
+        logger.error("Google userinfo failed (HTTP %s)", userinfo_resp.status_code)
         return RedirectResponse("/login?error=google_failed")
 
     userinfo = userinfo_resp.json()
@@ -112,9 +121,16 @@ async def google_callback(request: Request, code: str = "", state: str = "", err
     if user:
         # Link Google sub if not already linked
         if not user.get("google_sub"):
+            # Clear password + TOTP — Google is now the sole auth method
             await db.users.update_one(
                 {"_id": user["_id"]},
-                {"$set": {"google_sub": google_sub, "updated_at": now}},
+                {"$set": {
+                    "google_sub": google_sub,
+                    "hashed_password": "",
+                    "is_2fa_enabled": False,
+                    "encrypted_2fa_secret": None,
+                    "updated_at": now,
+                }},
             )
         if user.get("is_banned"):
             return RedirectResponse("/login?error=banned")
@@ -161,7 +177,7 @@ async def google_callback(request: Request, code: str = "", state: str = "", err
     saved_redirect = request.session.pop("oauth_redirect", None)
     if not user.get("is_adult"):
         redirect_to = "/complete-profile"
-    elif saved_redirect and saved_redirect.startswith("/"):
+    elif saved_redirect and saved_redirect.startswith("/") and not saved_redirect.startswith("//"):
         redirect_to = saved_redirect
     else:
         redirect_to = "/"

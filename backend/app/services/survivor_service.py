@@ -7,7 +7,7 @@ from fastapi import HTTPException, status
 from pymongo.errors import DuplicateKeyError
 
 import app.database as _db
-from app.services.spieltag_service import is_match_locked
+from app.services.matchday_service import is_match_locked
 from app.utils import utcnow
 
 logger = logging.getLogger("quotico.survivor_service")
@@ -30,30 +30,30 @@ async def make_pick(
     # Validate match first (need sport_key for league config check)
     match = await _db.db.matches.find_one({"_id": ObjectId(match_id)})
     if not match:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Spiel nicht gefunden.")
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Match not found.")
 
     # Validate squad
     squad = await _db.db.squads.find_one({"_id": ObjectId(squad_id)})
     if not squad:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Squad nicht gefunden.")
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Squad not found.")
     if user_id not in squad.get("members", []):
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "Du bist kein Mitglied dieser Squad.")
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "You are not a member of this squad.")
     from app.services.squad_league_service import require_active_league_config
     require_active_league_config(squad, match["sport_key"], "survivor")
     if is_match_locked(match):
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Spiel ist gesperrt.")
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Match is locked.")
 
     # Validate team is part of this match
-    home = match["teams"]["home"]
-    away = match["teams"]["away"]
+    home = match["home_team"]
+    away = match["away_team"]
     if team not in (home, away):
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, f"Team muss '{home}' oder '{away}' sein.")
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, f"Team must be '{home}' or '{away}'.")
 
     sport_key = match["sport_key"]
     season = match.get("matchday_season") or now.year
     matchday_number = match.get("matchday_number")
     if not matchday_number:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Spiel ist keinem Spieltag zugeordnet.")
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Match is not assigned to a matchday.")
 
     # Get or create survivor entry
     entry = await _db.db.survivor_entries.find_one({
@@ -65,13 +65,13 @@ async def make_pick(
 
     if entry:
         if entry["status"] == "eliminated":
-            raise HTTPException(status.HTTP_400_BAD_REQUEST, "Du bist ausgeschieden.")
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "You have been eliminated.")
 
         # Check team not already used
         if team in entry.get("used_teams", []):
             raise HTTPException(
                 status.HTTP_400_BAD_REQUEST,
-                f"'{team}' wurde bereits verwendet. Wähle ein anderes Team.",
+                f"'{team}' has already been used. Choose a different team.",
             )
 
         # Check no pick for this matchday already
@@ -79,7 +79,7 @@ async def make_pick(
             if pick["matchday_number"] == matchday_number:
                 raise HTTPException(
                     status.HTTP_409_CONFLICT,
-                    "Du hast bereits einen Pick für diesen Spieltag.",
+                    "You already have a pick for this matchday.",
                 )
 
         # Add pick to existing entry
@@ -125,7 +125,7 @@ async def make_pick(
             result = await _db.db.survivor_entries.insert_one(entry)
             entry["_id"] = result.inserted_id
         except DuplicateKeyError:
-            raise HTTPException(status.HTTP_409_CONFLICT, "Survivor-Eintrag existiert bereits.")
+            raise HTTPException(status.HTTP_409_CONFLICT, "Survivor entry already exists.")
 
     logger.info(
         "Survivor pick: user=%s squad=%s team=%s matchday=%d",

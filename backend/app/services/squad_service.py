@@ -32,7 +32,7 @@ async def create_squad(admin_id: str, name: str, description: Optional[str] = No
     else:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Konnte keinen Einladungscode generieren.",
+            detail="Could not generate an invite code.",
         )
 
     now = utcnow()
@@ -58,19 +58,19 @@ async def join_squad(user_id: str, invite_code: str) -> dict:
     if not squad:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail="Ungültiger Einladungscode.",
+            detail="Invalid invite code.",
         )
 
     if user_id in squad["members"]:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail="Du bist bereits Mitglied dieser Gruppe.",
+            detail="You are already a member of this squad.",
         )
 
     if len(squad["members"]) >= MAX_SQUAD_MEMBERS:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Diese Gruppe hat die maximale Mitgliederzahl ({MAX_SQUAD_MEMBERS}) erreicht.",
+            detail=f"This squad has reached the maximum member count ({MAX_SQUAD_MEMBERS}).",
         )
 
     await _db.db.squads.update_one(
@@ -89,12 +89,12 @@ async def leave_squad(user_id: str, squad_id: str) -> None:
     """Leave a squad. Admin cannot leave (must transfer or delete)."""
     squad = await _db.db.squads.find_one({"_id": ObjectId(squad_id)})
     if not squad:
-        raise HTTPException(status_code=404, detail="Gruppe nicht gefunden.")
+        raise HTTPException(status_code=404, detail="Squad not found.")
 
     if squad["admin_id"] == user_id:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Als Admin kannst du die Gruppe nicht verlassen. Lösche sie oder übertrage die Admin-Rolle.",
+            detail="As admin you cannot leave the squad. Delete it or transfer the admin role.",
         )
 
     await _db.db.squads.update_one(
@@ -110,13 +110,13 @@ async def remove_member(admin_id: str, squad_id: str, member_id: str) -> None:
     """Admin removes a member from the squad."""
     squad = await _db.db.squads.find_one({"_id": ObjectId(squad_id)})
     if not squad:
-        raise HTTPException(status_code=404, detail="Gruppe nicht gefunden.")
+        raise HTTPException(status_code=404, detail="Squad not found.")
 
     if squad["admin_id"] != admin_id:
-        raise HTTPException(status_code=403, detail="Nur der Admin kann Mitglieder entfernen.")
+        raise HTTPException(status_code=403, detail="Only the admin can remove members.")
 
     if member_id == admin_id:
-        raise HTTPException(status_code=400, detail="Du kannst dich nicht selbst entfernen.")
+        raise HTTPException(status_code=400, detail="You cannot remove yourself.")
 
     await _db.db.squads.update_one(
         {"_id": ObjectId(squad_id)},
@@ -131,12 +131,12 @@ async def delete_squad(admin_id: str, squad_id: str) -> None:
     """Delete a squad. Only the admin can delete it."""
     squad = await _db.db.squads.find_one({"_id": ObjectId(squad_id)})
     if not squad:
-        raise HTTPException(status_code=404, detail="Gruppe nicht gefunden.")
+        raise HTTPException(status_code=404, detail="Squad not found.")
 
     if squad["admin_id"] != admin_id:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Nur der Admin kann die Gruppe löschen.",
+            detail="Only the admin can delete the squad.",
         )
 
     await _db.db.squads.delete_one({"_id": ObjectId(squad_id)})
@@ -147,12 +147,12 @@ async def update_squad(admin_id: str, squad_id: str, description: str | None) ->
     """Update squad details. Only the admin can edit."""
     squad = await _db.db.squads.find_one({"_id": ObjectId(squad_id)})
     if not squad:
-        raise HTTPException(status_code=404, detail="Gruppe nicht gefunden.")
+        raise HTTPException(status_code=404, detail="Squad not found.")
 
     if squad["admin_id"] != admin_id:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Nur der Admin kann die Gruppe bearbeiten.",
+            detail="Only the admin can edit the squad.",
         )
 
     await _db.db.squads.update_one(
@@ -172,28 +172,33 @@ async def get_user_squads(user_id: str) -> list[dict]:
 async def get_squad_leaderboard(squad_id: str, requesting_user_id: str) -> list[dict]:
     """Calculate leaderboard for a squad using aggregation pipeline.
 
-    Privacy rule: tips are only included for matches that have started.
+    Privacy rule: bets are only included for matches that have started.
     """
     squad = await _db.db.squads.find_one({"_id": ObjectId(squad_id)})
     if not squad:
-        raise HTTPException(status_code=404, detail="Gruppe nicht gefunden.")
+        raise HTTPException(status_code=404, detail="Squad not found.")
 
     if requesting_user_id not in squad["members"]:
-        raise HTTPException(status_code=403, detail="Du bist kein Mitglied dieser Gruppe.")
+        raise HTTPException(status_code=403, detail="You are not a member of this squad.")
 
     member_ids = squad["members"]
 
     pipeline = [
-        # Only tips from squad members
-        {"$match": {"user_id": {"$in": member_ids}}},
-        # Only tips for matches that have started (privacy rule)
+        # Only single/parlay slips from squad members
+        {"$match": {
+            "user_id": {"$in": member_ids},
+            "type": {"$in": ["single", "parlay"]},
+        }},
+        # Unwind selections to get per-match data
+        {"$unwind": "$selections"},
+        # Only bets for matches that have started (privacy rule)
         {
             "$lookup": {
                 "from": "matches",
-                "let": {"mid": {"$toObjectId": "$match_id"}},
+                "let": {"mid": {"$toObjectId": "$selections.match_id"}},
                 "pipeline": [
                     {"$match": {"$expr": {"$eq": ["$_id", "$$mid"]}}},
-                    {"$match": {"status": {"$in": ["live", "completed"]}}},
+                    {"$match": {"status": {"$in": ["live", "final"]}}},
                 ],
                 "as": "match",
             }
@@ -204,10 +209,10 @@ async def get_squad_leaderboard(squad_id: str, requesting_user_id: str) -> list[
             "$group": {
                 "_id": "$user_id",
                 "points": {
-                    "$sum": {"$cond": [{"$eq": ["$status", "won"]}, "$locked_odds", 0]}
+                    "$sum": {"$cond": [{"$eq": ["$status", "won"]}, "$total_odds", 0]}
                 },
-                "tip_count": {"$sum": 1},
-                "avg_odds": {"$avg": "$locked_odds"},
+                "bet_count": {"$sum": 1},
+                "avg_odds": {"$avg": "$selections.locked_odds"},
             }
         },
         {"$sort": {"points": -1}},
@@ -226,14 +231,14 @@ async def get_squad_leaderboard(squad_id: str, requesting_user_id: str) -> list[
         {"$unwind": "$user"},
     ]
 
-    results = await _db.db.tips.aggregate(pipeline).to_list(length=MAX_SQUAD_MEMBERS)
+    results = await _db.db.betting_slips.aggregate(pipeline).to_list(length=MAX_SQUAD_MEMBERS)
 
     return [
         {
             "user_id": r["_id"],
             "alias": r["user"].get("alias", "Anonymous"),
             "points": round(r["points"], 2),
-            "tip_count": r["tip_count"],
+            "bet_count": r["bet_count"],
             "avg_odds": round(r["avg_odds"], 2) if r["avg_odds"] else 0,
         }
         for r in results
@@ -245,19 +250,23 @@ async def get_squad_battle(squad_a_id: str, squad_b_id: str) -> dict:
     async def squad_avg(sid: str) -> dict:
         squad = await _db.db.squads.find_one({"_id": ObjectId(sid)})
         if not squad:
-            raise HTTPException(status_code=404, detail=f"Gruppe {sid} nicht gefunden.")
+            raise HTTPException(status_code=404, detail=f"Squad {sid} not found.")
 
         pipeline = [
-            {"$match": {"user_id": {"$in": squad["members"]}, "status": "won"}},
+            {"$match": {
+                "user_id": {"$in": squad["members"]},
+                "status": "won",
+                "type": {"$in": ["single", "parlay"]},
+            }},
             {
                 "$group": {
                     "_id": None,
-                    "total_points": {"$sum": "$locked_odds"},
+                    "total_points": {"$sum": "$total_odds"},
                     "member_count": {"$addToSet": "$user_id"},
                 }
             },
         ]
-        result = await _db.db.tips.aggregate(pipeline).to_list(length=1)
+        result = await _db.db.betting_slips.aggregate(pipeline).to_list(length=1)
         if result:
             total = result[0]["total_points"]
             members = len(result[0]["member_count"])

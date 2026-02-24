@@ -1,12 +1,12 @@
 <script setup lang="ts">
 import { ref, computed } from "vue";
-import type { SpieltagMatch } from "@/stores/spieltag";
+import type { MatchdayMatch } from "@/stores/matchday";
 import { useWalletStore } from "@/stores/wallet";
 import { useToast } from "@/composables/useToast";
 import { scoreUnitLabel } from "@/types/sports";
 
 const props = defineProps<{
-  match: SpieltagMatch & { totals_odds?: { over: number; under: number; line: number } };
+  match: MatchdayMatch;
   sportKey?: string;
 }>();
 
@@ -16,15 +16,21 @@ const walletStore = useWalletStore();
 const toast = useToast();
 const submitting = ref(false);
 
-const totals = computed(() => props.match.totals_odds);
+const totals = computed(() =>
+  (props.match.odds?.totals ?? null) as { over: number; under: number; line: number } | null
+);
 const line = computed(() => totals.value?.line ?? 2.5);
+
+const matchResult = computed(() =>
+  (props.match.result ?? {}) as { outcome?: string; home_score?: number | null; away_score?: number | null }
+);
 
 const existingBet = computed(() =>
   walletStore.overUnderBets.find((b) => b.match_id === props.match.id),
 );
 
 const kickoffLabel = computed(() => {
-  const d = new Date(props.match.commence_time);
+  const d = new Date(props.match.match_date);
   return d.toLocaleString("de-DE", {
     weekday: "short",
     day: "2-digit",
@@ -35,8 +41,8 @@ const kickoffLabel = computed(() => {
 });
 
 const totalGoals = computed(() => {
-  if (props.match.home_score === null || props.match.away_score === null) return null;
-  return props.match.home_score + props.match.away_score;
+  if (matchResult.value.home_score == null || matchResult.value.away_score == null) return null;
+  return matchResult.value.home_score + matchResult.value.away_score;
 });
 
 async function placeBet(prediction: "over" | "under") {
@@ -89,17 +95,17 @@ function betResultClass(status: string) {
     <!-- Teams + Score -->
     <div class="flex items-center justify-between mb-2">
       <span class="text-sm font-medium text-text-primary truncate flex-1">
-        {{ match.teams.home }}
+        {{ match.home_team }}
       </span>
       <span
-        v-if="match.home_score !== null"
+        v-if="matchResult.home_score != null"
         class="text-lg font-bold text-text-primary px-2"
       >
-        {{ match.home_score }} : {{ match.away_score }}
+        {{ matchResult.home_score }} : {{ matchResult.away_score }}
       </span>
       <span v-else class="text-sm text-text-muted px-2">vs</span>
       <span class="text-sm font-medium text-text-primary truncate flex-1 text-right">
-        {{ match.teams.away }}
+        {{ match.away_team }}
       </span>
     </div>
 

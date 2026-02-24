@@ -1,3 +1,4 @@
+import re
 from typing import Any
 
 from bson import ObjectId
@@ -27,7 +28,7 @@ from app.services.squad_service import (
 )
 from app.services.war_room_service import get_war_room
 import app.database as _db
-from app.utils import utcnow
+from app.utils import as_utc, ensure_utc, utcnow
 
 router = APIRouter(prefix="/api/squads", tags=["squads"])
 
@@ -40,7 +41,7 @@ async def preview(invite_code: str):
         {"name": 1, "description": 1, "members": 1},
     )
     if not squad:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Squad nicht gefunden.")
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Squad not found.")
 
     member_count = len(squad.get("members", []))
     return {
@@ -81,7 +82,7 @@ async def public_squads(
         "members": {"$nin": [user_id]},
     }
     if q.strip():
-        filt["name"] = {"$regex": q.strip(), "$options": "i"}
+        filt["name"] = {"$regex": re.escape(q.strip()), "$options": "i"}
 
     pipeline = [
         {"$match": filt},
@@ -135,7 +136,7 @@ async def squad_leaderboard(
 ) -> list[dict[str, Any]]:
     """Get the leaderboard for a specific squad.
 
-    Privacy: only shows tips for matches that have started.
+    Privacy: only shows bets for matches that have started.
     """
     user_id = str(user["_id"])
     entries = await get_squad_leaderboard(squad_id, user_id)
@@ -204,33 +205,33 @@ async def battle(
     return await get_squad_battle(squad_a, squad_b)
 
 
-# ---------- Auto-Tipp ----------
+# ---------- Auto-Bet ----------
 
-class AutoTippUpdate(BaseModel):
+class AutoBetUpdate(BaseModel):
     blocked: bool
 
 
-@router.patch("/{squad_id}/auto-tipp")
-async def toggle_auto_tipp(
+@router.patch("/{squad_id}/auto-bet")
+async def toggle_auto_bet(
     squad_id: str,
-    body: AutoTippUpdate,
+    body: AutoBetUpdate,
     user=Depends(get_current_user),
 ):
-    """Toggle auto-tipp blocking for a squad (admin only)."""
+    """Toggle auto-bet blocking for a squad (admin only)."""
     user_id = str(user["_id"])
     squad = await _db.db.squads.find_one({"_id": ObjectId(squad_id)})
     if not squad:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Squad nicht gefunden.")
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Squad not found.")
     if squad["admin_id"] != user_id:
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "Nur der Admin kann Auto-Tipp-Einstellungen ändern.")
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Only the admin can change auto-bet settings.")
 
     now = utcnow()
     await _db.db.squads.update_one(
         {"_id": squad["_id"]},
-        {"$set": {"auto_tipp_blocked": body.blocked, "updated_at": now}},
+        {"$set": {"auto_bet_blocked": body.blocked, "updated_at": now}},
     )
 
-    return {"auto_tipp_blocked": body.blocked}
+    return {"auto_bet_blocked": body.blocked}
 
 
 # ---------- Lock Deadline ----------
@@ -247,17 +248,17 @@ async def set_lock_minutes(
 ):
     """Set the prediction lock deadline for a squad (admin only).
 
-    Minutes before kickoff when predictions lock. Range: 0–120.
+    Minutes before kickoff when predictions lock. Range: 0-120.
     """
     user_id = str(user["_id"])
     if not 0 <= body.minutes <= 120:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Wert muss zwischen 0 und 120 Minuten liegen.")
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Value must be between 0 and 120 minutes.")
 
     squad = await _db.db.squads.find_one({"_id": ObjectId(squad_id)})
     if not squad:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Squad nicht gefunden.")
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Squad not found.")
     if squad["admin_id"] != user_id:
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "Nur der Admin kann die Tippfrist ändern.")
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Only the admin can change the bet deadline.")
 
     now = utcnow()
     await _db.db.squads.update_one(
@@ -282,9 +283,9 @@ async def set_visibility(
     user_id = str(user["_id"])
     squad = await _db.db.squads.find_one({"_id": ObjectId(squad_id)})
     if not squad:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Squad nicht gefunden.")
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Squad not found.")
     if squad["admin_id"] != user_id:
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "Nur der Admin kann die Sichtbarkeit ändern.")
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Only the admin can change visibility.")
 
     now = utcnow()
     await _db.db.squads.update_one(
@@ -309,9 +310,9 @@ async def set_invite_visible(
     user_id = str(user["_id"])
     squad = await _db.db.squads.find_one({"_id": ObjectId(squad_id)})
     if not squad:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Squad nicht gefunden.")
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Squad not found.")
     if squad["admin_id"] != user_id:
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "Nur der Admin kann das ändern.")
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Only the admin can change this.")
 
     now = utcnow()
     await _db.db.squads.update_one(
@@ -338,9 +339,9 @@ async def set_open(
     user_id = str(user["_id"])
     squad = await _db.db.squads.find_one({"_id": ObjectId(squad_id)})
     if not squad:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Squad nicht gefunden.")
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Squad not found.")
     if squad["admin_id"] != user_id:
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "Nur der Admin kann das ändern.")
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Only the admin can change this.")
 
     now = utcnow()
     await _db.db.squads.update_one(
@@ -361,22 +362,22 @@ async def request_join(squad_id: str, user=Depends(get_current_user)):
 
     squad = await _db.db.squads.find_one({"_id": ObjectId(squad_id)})
     if not squad:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Squad nicht gefunden.")
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Squad not found.")
     if not squad.get("is_public", True):
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "Dieser Squad ist privat.")
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "This squad is private.")
     if not squad.get("is_open", True):
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "Dieser Squad nimmt gerade keine Anfragen an.")
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "This squad is not accepting requests right now.")
     if user_id in squad.get("members", []):
-        raise HTTPException(status.HTTP_409_CONFLICT, "Du bist bereits Mitglied.")
+        raise HTTPException(status.HTTP_409_CONFLICT, "You are already a member.")
     if len(squad.get("members", [])) >= 50:
-        raise HTTPException(status.HTTP_409_CONFLICT, "Squad ist voll (max. 50).")
+        raise HTTPException(status.HTTP_409_CONFLICT, "Squad is full (max 50).")
 
     # Check for existing pending request
     existing = await _db.db.join_requests.find_one({
         "squad_id": squad_id, "user_id": user_id, "status": "pending",
     })
     if existing:
-        raise HTTPException(status.HTTP_409_CONFLICT, "Du hast bereits eine offene Anfrage.")
+        raise HTTPException(status.HTTP_409_CONFLICT, "You already have a pending request.")
 
     now = utcnow()
     doc = {
@@ -398,9 +399,9 @@ async def get_join_requests(squad_id: str, user=Depends(get_current_user)):
 
     squad = await _db.db.squads.find_one({"_id": ObjectId(squad_id)})
     if not squad:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Squad nicht gefunden.")
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Squad not found.")
     if squad["admin_id"] != user_id:
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "Nur der Admin kann Anfragen einsehen.")
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Only the admin can view requests.")
 
     requests = await _db.db.join_requests.find(
         {"squad_id": squad_id, "status": "pending"}
@@ -423,7 +424,7 @@ async def get_join_requests(squad_id: str, user=Depends(get_current_user)):
             user_id=r["user_id"],
             alias=users.get(r["user_id"], "?"),
             status=r["status"],
-            created_at=r["created_at"],
+            created_at=ensure_utc(r["created_at"]),
         )
         for r in requests
     ]
@@ -438,15 +439,15 @@ async def approve_join_request(
 
     squad = await _db.db.squads.find_one({"_id": ObjectId(squad_id)})
     if not squad:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Squad nicht gefunden.")
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Squad not found.")
     if squad["admin_id"] != admin_id:
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "Nur der Admin kann Anfragen genehmigen.")
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Only the admin can approve requests.")
     if len(squad.get("members", [])) >= 50:
-        raise HTTPException(status.HTTP_409_CONFLICT, "Squad ist voll (max. 50).")
+        raise HTTPException(status.HTTP_409_CONFLICT, "Squad is full (max 50).")
 
     jr = await _db.db.join_requests.find_one({"_id": ObjectId(request_id), "squad_id": squad_id})
     if not jr or jr["status"] != "pending":
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Anfrage nicht gefunden oder bereits bearbeitet.")
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Request not found or already processed.")
 
     now = utcnow()
     # Add user to squad
@@ -472,13 +473,13 @@ async def decline_join_request(
 
     squad = await _db.db.squads.find_one({"_id": ObjectId(squad_id)})
     if not squad:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Squad nicht gefunden.")
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Squad not found.")
     if squad["admin_id"] != admin_id:
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "Nur der Admin kann Anfragen ablehnen.")
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Only the admin can decline requests.")
 
     jr = await _db.db.join_requests.find_one({"_id": ObjectId(request_id), "squad_id": squad_id})
     if not jr or jr["status"] != "pending":
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Anfrage nicht gefunden oder bereits bearbeitet.")
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Request not found or already processed.")
 
     now = utcnow()
     await _db.db.join_requests.update_one(
@@ -506,9 +507,9 @@ async def update_game_mode(
     user_id = str(user["_id"])
     squad = await _db.db.squads.find_one({"_id": ObjectId(squad_id)})
     if not squad:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Squad nicht gefunden.")
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Squad not found.")
     if squad["admin_id"] != user_id:
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "Nur der Admin kann den Spielmodus ändern.")
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Only the admin can change the game mode.")
 
     mode = body.game_mode.value
     defaults = GAME_MODE_DEFAULTS.get(mode, {})
@@ -528,7 +529,7 @@ async def update_game_mode(
     return {"game_mode": mode, "game_mode_config": config}
 
 
-# ---------- League Configuration (Multi-Liga, Multi-Modus) ----------
+# ---------- League Configuration (Multi-League, Multi-Mode) ----------
 
 class LeagueConfigUpdate(BaseModel):
     sport_key: str
@@ -549,9 +550,9 @@ async def upsert_league_config(
     user_id = str(user["_id"])
     squad = await _db.db.squads.find_one({"_id": ObjectId(squad_id)})
     if not squad:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Squad nicht gefunden.")
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Squad not found.")
     if squad["admin_id"] != user_id:
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "Nur der Admin kann Liga-Konfigurationen ändern.")
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Only the admin can change league configurations.")
 
     now = utcnow()
     mode = body.game_mode.value
@@ -607,9 +608,9 @@ async def deactivate_league_config(
     user_id = str(user["_id"])
     squad = await _db.db.squads.find_one({"_id": ObjectId(squad_id)})
     if not squad:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Squad nicht gefunden.")
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Squad not found.")
     if squad["admin_id"] != user_id:
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "Nur der Admin kann Liga-Konfigurationen ändern.")
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Only the admin can change league configurations.")
 
     now = utcnow()
     result = await _db.db.squads.update_one(
@@ -621,7 +622,7 @@ async def deactivate_league_config(
     )
 
     if result.modified_count == 0:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Liga-Konfiguration nicht gefunden.")
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "League configuration not found.")
 
     return {"status": "deactivated", "sport_key": sport_key}
 
@@ -634,11 +635,11 @@ async def get_league_configs(
     """Get all league configs for a squad."""
     squad = await _db.db.squads.find_one({"_id": ObjectId(squad_id)})
     if not squad:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Squad nicht gefunden.")
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Squad not found.")
 
     user_id = str(user["_id"])
     if user_id not in squad.get("members", []):
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "Du bist kein Mitglied dieses Squads.")
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "You are not a member of this squad.")
 
     raw_configs = squad.get("league_configs", [])
     return [
@@ -646,8 +647,8 @@ async def get_league_configs(
             sport_key=lc["sport_key"],
             game_mode=lc["game_mode"],
             config=lc.get("config", {}),
-            activated_at=lc["activated_at"],
-            deactivated_at=lc.get("deactivated_at"),
+            activated_at=ensure_utc(lc["activated_at"]),
+            deactivated_at=as_utc(lc.get("deactivated_at")),
         )
         for lc in raw_configs
     ]
@@ -663,8 +664,8 @@ def _squad_response(squad: dict, is_admin: bool = False) -> SquadResponse:
             sport_key=lc["sport_key"],
             game_mode=lc["game_mode"],
             config=lc.get("config", {}),
-            activated_at=lc["activated_at"],
-            deactivated_at=lc.get("deactivated_at"),
+            activated_at=ensure_utc(lc["activated_at"]),
+            deactivated_at=as_utc(lc.get("deactivated_at")),
         )
         for lc in raw_configs
     ]
@@ -681,7 +682,7 @@ def _squad_response(squad: dict, is_admin: bool = False) -> SquadResponse:
         member_count=len(squad.get("members", [])),
         is_admin=is_admin,
         league_configs=league_configs,
-        auto_tipp_blocked=squad.get("auto_tipp_blocked", False),
+        auto_bet_blocked=squad.get("auto_bet_blocked", False),
         lock_minutes=squad.get("lock_minutes", 15),
         is_public=squad.get("is_public", True),
         is_open=squad.get("is_open", True),
@@ -689,5 +690,5 @@ def _squad_response(squad: dict, is_admin: bool = False) -> SquadResponse:
         pending_requests=squad.get("_pending_requests", 0),
         game_mode=squad.get("game_mode", "classic"),
         game_mode_config=squad.get("game_mode_config", {}),
-        created_at=squad["created_at"],
+        created_at=ensure_utc(squad["created_at"]),
     )

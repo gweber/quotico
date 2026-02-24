@@ -1,4 +1,4 @@
-"""Device fingerprint service — DSGVO-compliant, hash-only storage."""
+"""Device fingerprint service — GDPR-compliant, hash-only storage."""
 
 import logging
 from typing import Optional
@@ -19,7 +19,7 @@ HARD_LIMIT = 6   # accounts per IP triggering captcha on registration
 async def record_fingerprint(
     user_id: str, fingerprint_hash: str, ip_address: str,
 ) -> None:
-    """Record a device fingerprint (hash-only, DSGVO-compliant).
+    """Record a device fingerprint (hash-only, GDPR-compliant).
 
     Raw components (user-agent, screen resolution etc.) are hashed client-side
     and never transmitted or stored.  The IP address is truncated (last octet

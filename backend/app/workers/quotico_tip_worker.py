@@ -1,7 +1,7 @@
 """QuoticoTip pre-computation worker.
 
-Runs every 30 minutes to generate/refresh value-bet tips for all upcoming
-soccer matches. Uses smart sleep to skip when no odds have been updated.
+Runs every 30 minutes to generate/refresh value-bet recommendations for all
+upcoming soccer matches. Uses smart sleep to skip when no odds have been updated.
 """
 
 import logging
@@ -19,24 +19,39 @@ _STATE_KEY = "quotico_tips"
 async def generate_quotico_tips() -> None:
     """Pre-compute QuoticoTips for all upcoming matches.
 
-    Smart sleep: only runs if odds have been updated since last tip generation.
+    Smart sleep: only runs if odds have been updated since last bet generation.
     """
     now = utcnow()
 
     # Smart sleep: check if any odds were polled since our last run
+    target_statuses = ["scheduled", "live"]
     last_run = await get_synced_at(_STATE_KEY)
     if last_run:
         last_run = ensure_utc(last_run)
         recent_odds_update = await _db.db.matches.find_one(
-            {"odds_updated_at": {"$gte": last_run}, "status": "upcoming"},
+            {"odds.updated_at": {"$gte": last_run}, "status": {"$in": target_statuses}},
         )
         if not recent_odds_update:
-            logger.debug("Smart sleep: no odds updates since last tip generation")
-            return
+            # Still generate tips for live matches that have none
+            missing_tip = await _db.db.matches.find_one(
+                {"status": "live", "odds.h2h": {"$ne": {}}},
+            )
+            if missing_tip:
+                existing_tip = await _db.db.quotico_tips.find_one(
+                    {"match_id": str(missing_tip["_id"])},
+                )
+                if not existing_tip:
+                    logger.info("Smart sleep bypassed: live match without tip found")
+                else:
+                    logger.debug("Smart sleep: no odds updates since last bet generation")
+                    return
+            else:
+                logger.debug("Smart sleep: no odds updates since last bet generation")
+                return
 
-    # Fetch all upcoming matches
+    # Fetch all scheduled and live matches
     matches = await _db.db.matches.find(
-        {"status": "upcoming"},
+        {"status": {"$in": target_statuses}},
     ).to_list(length=500)
 
     if not matches:
@@ -50,35 +65,39 @@ async def generate_quotico_tips() -> None:
     for match in matches:
         match_id = str(match["_id"])
 
-        # Check if existing tip is still fresh (generated after last odds update)
+        # Check if existing bet is still fresh (generated after last odds update)
         existing = await _db.db.quotico_tips.find_one(
             {"match_id": match_id},
             {"generated_at": 1},
         )
         if existing:
-            odds_updated = ensure_utc(match.get("odds_updated_at", now))
-            tip_generated = ensure_utc(existing["generated_at"])
-            if tip_generated >= odds_updated:
+            odds_updated = ensure_utc(match.get("odds", {}).get("updated_at") or now)
+            bet_generated = ensure_utc(existing["generated_at"])
+            if bet_generated >= odds_updated:
                 fresh += 1
                 continue
 
         try:
-            tip = await generate_quotico_tip(match)
+            bet = await generate_quotico_tip(match)
             await _db.db.quotico_tips.update_one(
                 {"match_id": match_id},
-                {"$set": tip},
+                {"$set": bet},
                 upsert=True,
             )
-            if tip.get("status") == "active":
+            if bet.get("status") == "active":
                 generated += 1
             else:
                 no_signal += 1
         except Exception as e:
-            logger.error("Failed to generate tip for %s: %s", match_id, e)
+            logger.error("Failed to generate bet for %s: %s", match_id, e)
 
-    # Expire stale tips (match has started)
+    # Expire tips only for matches that reached a terminal state (final/cancelled)
+    final_match_ids = await _db.db.matches.distinct(
+        "_id", {"status": {"$in": ["final", "cancelled"]}},
+    )
+    final_match_id_strs = [str(mid) for mid in final_match_ids]
     expired = await _db.db.quotico_tips.update_many(
-        {"status": "active", "match_commence_time": {"$lte": now}},
+        {"status": {"$in": ["active", "no_signal"]}, "match_id": {"$in": final_match_id_strs}},
         {"$set": {"status": "expired"}},
     )
 

@@ -1,10 +1,12 @@
 <script setup lang="ts">
 import { ref, computed, onUnmounted } from "vue";
 import { useRouter } from "vue-router";
+import { useI18n } from "vue-i18n";
 import { useAuthStore } from "@/stores/auth";
 import { useBetSlipStore } from "@/stores/betslip";
 import { useToast } from "@/composables/useToast";
 
+const { t } = useI18n();
 const router = useRouter();
 const auth = useAuthStore();
 const betslip = useBetSlipStore();
@@ -12,13 +14,15 @@ const toast = useToast();
 const mobileMenuOpen = ref(false);
 
 const navLinks = [
-  { to: "/", label: "Tipps", icon: "\u26BD" },
-  { to: "/teams", label: "Teams", icon: "\uD83C\uDFDF\uFE0F" },
-  { to: "/spieltag", label: "Spieltag", icon: "\uD83D\uDCCB" },
-  { to: "/squads", label: "Squads", icon: "\uD83D\uDC65" },
-  { to: "/battles", label: "Battles", icon: "\u2694\uFE0F" },
-  { to: "/leaderboard", label: "Rangliste", icon: "\uD83C\uDFC6" },
-  { to: "/settings", label: "Einstellungen", icon: "\u2699\uFE0F" },
+  { to: "/", labelKey: "nav.bets", icon: "\u26BD" },
+  { to: "/teams", labelKey: "nav.teams", icon: "\uD83C\uDFDF\uFE0F" },
+  { to: "/matchday", labelKey: "nav.matchday", icon: "\uD83D\uDCCB" },
+  { to: "/squads", labelKey: "nav.squads", icon: "\uD83D\uDC65" },
+  { to: "/battles", labelKey: "nav.battles", icon: "\u2694\uFE0F" },
+  { to: "/qbot", labelKey: "nav.qbot", icon: "\uD83E\uDD16" },
+  { to: "/qtip-performance", labelKey: "nav.qtipPerformance", icon: "\uD83D\uDCC8" },
+  { to: "/leaderboard", labelKey: "nav.leaderboard", icon: "\uD83C\uDFC6" },
+  { to: "/settings", labelKey: "nav.settings", icon: "\u2699\uFE0F" },
 ];
 
 // Filter links if profile is incomplete
@@ -26,7 +30,11 @@ const visibleNavLinks = computed(() => {
   if (auth.isLoggedIn && auth.needsProfileCompletion) {
     return [];
   }
-  return navLinks;
+  return navLinks.filter((link) => {
+    // Settings requires login
+    if (link.to === "/settings" && !auth.isLoggedIn) return false;
+    return true;
+  });
 });
 
 // Auto-close mobile menu on window resize to desktop
@@ -45,7 +53,7 @@ onUnmounted(() => {
 async function handleLogout() {
   await auth.logout();
   betslip.$reset();
-  toast.success("Erfolgreich abgemeldet.");
+  toast.success(t("auth.logoutSuccess"));
   router.push("/login");
 }
 
@@ -62,7 +70,7 @@ async function handleLogout() {
         <span
           class="hidden sm:inline-flex items-center px-2 py-0.5 text-xs font-medium bg-surface-2 text-text-secondary rounded-full border border-surface-3"
         >
-          Tippspiel &mdash; kein Echtgeld
+          {{ $t("nav.disclaimer") }}
         </span>
       </div>
 
@@ -76,7 +84,7 @@ async function handleLogout() {
           active-class="!text-primary !bg-primary-muted/20"
         >
           <span aria-hidden="true">{{ link.icon }}</span>
-          <span>{{ link.label }}</span>
+          <span>{{ $t(link.labelKey) }}</span>
         </RouterLink>
       </nav>
 
@@ -86,7 +94,7 @@ async function handleLogout() {
         <button
           v-if="betslip.itemCount > 0"
           class="md:hidden relative flex items-center justify-center w-touch h-touch rounded-lg bg-surface-2 text-text-primary hover:bg-surface-3 transition-colors"
-          aria-label="Tippschein anzeigen"
+          :aria-label="$t('betslip.show')"
           @click="betslip.isOpen = !betslip.isOpen"
         >
           <span aria-hidden="true" class="text-lg">📋</span>
@@ -117,7 +125,7 @@ async function handleLogout() {
             :disabled="auth.loading"
             @click="handleLogout"
           >
-            {{ auth.loading ? '...' : 'Abmelden' }}
+            {{ auth.loading ? '...' : $t('auth.logout') }}
           </button>
         </template>
         <template v-else>
@@ -125,13 +133,13 @@ async function handleLogout() {
             to="/login"
             class="text-sm px-3 py-1.5 rounded-lg text-text-secondary hover:text-text-primary hover:bg-surface-2 transition-colors"
           >
-            Anmelden
+            {{ $t("auth.login") }}
           </RouterLink>
           <RouterLink
             to="/register"
             class="text-sm px-3 py-1.5 rounded-lg bg-primary text-surface-0 hover:bg-primary-hover transition-colors"
           >
-            Registrieren
+            {{ $t("auth.register") }}
           </RouterLink>
         </template>
 
@@ -139,7 +147,7 @@ async function handleLogout() {
         <button
           class="md:hidden flex items-center justify-center w-touch h-touch rounded-lg hover:bg-surface-2 transition-colors"
           :aria-expanded="mobileMenuOpen"
-          aria-label="Menü öffnen"
+          :aria-label="$t('common.openMenu')"
           @click="mobileMenuOpen = !mobileMenuOpen"
         >
           <svg class="w-5 h-5 text-text-primary" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -178,11 +186,11 @@ async function handleLogout() {
           @click="mobileMenuOpen = false"
         >
           <span aria-hidden="true">{{ link.icon }}</span>
-          <span>{{ link.label }}</span>
+          <span>{{ $t(link.labelKey) }}</span>
         </RouterLink>
         <!-- Mobile badge -->
         <div class="sm:hidden px-3 py-2 text-xs text-text-muted">
-          Tippspiel &mdash; kein Echtgeld
+          {{ $t("nav.disclaimer") }}
         </div>
       </nav>
     </Transition>

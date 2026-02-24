@@ -62,14 +62,24 @@ const router = createRouter({
       meta: { requiresAuth: true },
     },
     {
-      path: "/spieltag/:sport?/:matchday?",
-      name: "spieltag",
-      component: () => import("@/views/SpieltagView.vue"),
+      path: "/matchday/:sport?/:matchday?",
+      name: "matchday",
+      component: () => import("@/views/MatchdayView.vue"),
     },
     {
       path: "/teams",
       name: "teams",
       component: () => import("@/views/TeamsView.vue"),
+    },
+    {
+      path: "/qbot",
+      name: "qbot",
+      component: () => import("@/views/QBotView.vue"),
+    },
+    {
+      path: "/qtip-performance",
+      name: "qtip-performance",
+      component: () => import("@/views/QTipPerformanceView.vue"),
     },
     {
       path: "/team/:teamSlug",
@@ -172,7 +182,9 @@ router.beforeEach(async (to) => {
     to.name !== "legal" &&
     to.name !== "join-squad" &&
     to.name !== "teams" &&
-    to.name !== "team-detail"
+    to.name !== "team-detail" &&
+    to.name !== "qbot" &&
+    to.name !== "qtip-performance"
   ) {
     return { name: "complete-profile" };
   }

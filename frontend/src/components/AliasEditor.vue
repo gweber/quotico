@@ -1,9 +1,11 @@
 <script setup lang="ts">
 import { ref, watch, onUnmounted } from "vue";
+import { useI18n } from "vue-i18n";
 import { useApi } from "@/composables/useApi";
 import { useAuthStore } from "@/stores/auth";
 import { useToast } from "@/composables/useToast";
 
+const { t } = useI18n();
 const api = useApi();
 const auth = useAuthStore();
 const toast = useToast();
@@ -30,7 +32,7 @@ watch(alias, (val) => {
   if (trimmed.length < 3) return;
 
   if (!/^[a-zA-Z0-9_]+$/.test(trimmed)) {
-    checkResult.value = { available: false, reason: "Ungültige Zeichen." };
+    checkResult.value = { available: false, reason: t('alias.invalidChars') };
     return;
   }
 
@@ -57,13 +59,13 @@ async function saveAlias() {
   saving.value = true;
   try {
     await api.patch("/user/alias", { alias: alias.value });
-    toast.success("Alias gespeichert!");
+    toast.success(t('alias.savedSuccess'));
     await auth.fetchUser();
     alias.value = "";
     checkResult.value = null;
     showConfirm.value = false;
   } catch (e: unknown) {
-    const msg = e instanceof Error ? e.message : "Alias konnte nicht gespeichert werden.";
+    const msg = e instanceof Error ? e.message : t('alias.savedError');
     toast.error(msg);
   } finally {
     saving.value = false;
@@ -73,27 +75,27 @@ async function saveAlias() {
 
 <template>
   <div class="bg-surface-1 rounded-card p-6">
-    <h2 class="text-lg font-semibold text-text-primary mb-1">Spielername</h2>
+    <h2 class="text-lg font-semibold text-text-primary mb-1">{{ $t('alias.heading') }}</h2>
     <p class="text-sm text-text-secondary mb-4">
-      Wähle einen einzigartigen Namen, der in Ranglisten und Squads angezeigt wird.
+      {{ $t('alias.description') }}
     </p>
 
     <!-- Current alias -->
     <div class="flex items-center gap-3 mb-4 p-3 bg-surface-2 rounded-lg">
-      <span class="text-sm text-text-secondary">Aktuell:</span>
+      <span class="text-sm text-text-secondary">{{ $t('alias.current') }}</span>
       <span class="text-sm font-medium text-text-primary">{{ auth.user?.alias }}</span>
       <span
         v-if="!auth.user?.has_custom_alias"
         class="text-xs px-2 py-0.5 rounded-full bg-warning/10 text-warning"
       >
-        Standard
+        {{ $t('alias.standard') }}
       </span>
     </div>
 
     <!-- Already custom — locked -->
     <div v-if="auth.user?.has_custom_alias" class="flex items-center gap-2">
       <span class="w-2 h-2 rounded-full bg-primary" />
-      <span class="text-sm text-primary font-medium">Dein Spielername ist gesetzt.</span>
+      <span class="text-sm text-primary font-medium">{{ $t('alias.locked') }}</span>
     </div>
 
     <!-- Editor -->
@@ -112,7 +114,7 @@ async function saveAlias() {
               'border-primary focus:border-primary focus:ring-primary': checkResult?.available,
               'border-danger focus:border-danger focus:ring-danger': checkResult && !checkResult.available,
             }"
-            placeholder="Dein Spielername (3-20 Zeichen)"
+            :placeholder="$t('alias.placeholder')"
             :aria-invalid="checkResult && !checkResult.available ? true : undefined"
             aria-describedby="alias-feedback"
           />
@@ -120,7 +122,7 @@ async function saveAlias() {
           <div
             v-if="checking"
             class="absolute right-3 top-1/2 -translate-y-1/2"
-            aria-label="Prüfe Verfügbarkeit"
+            :aria-label="$t('alias.checkAvailability')"
           >
             <svg class="animate-spin h-4 w-4 text-text-muted" viewBox="0 0 24 24">
               <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4" fill="none" />
@@ -138,7 +140,7 @@ async function saveAlias() {
           role="status"
           aria-live="polite"
         >
-          {{ checkResult.available ? "Verfügbar!" : checkResult.reason }}
+          {{ checkResult.available ? $t('alias.available') : checkResult.reason }}
         </p>
 
         <!-- Leaderboard preview -->
@@ -146,7 +148,7 @@ async function saveAlias() {
           v-if="checkResult?.available && alias"
           class="p-3 bg-surface-2 rounded-lg border border-surface-3/50"
         >
-          <p class="text-xs text-text-muted mb-2">Vorschau in der Rangliste:</p>
+          <p class="text-xs text-text-muted mb-2">{{ $t('alias.leaderboardPreview') }}</p>
           <div class="flex items-center gap-3">
             <span class="inline-flex items-center justify-center w-7 h-7 rounded-full text-sm font-bold bg-yellow-500/20 text-yellow-400">1</span>
             <span class="text-sm font-medium text-text-primary">{{ alias }}</span>
@@ -159,13 +161,13 @@ async function saveAlias() {
             class="px-4 py-2 rounded-lg text-sm bg-primary text-surface-0 hover:bg-primary-hover transition-colors"
             @click="showConfirm = true"
           >
-            Spielername übernehmen
+            {{ $t('alias.accept') }}
           </button>
         </div>
 
         <div v-if="showConfirm" class="p-4 bg-warning/5 border border-warning/20 rounded-lg">
           <p class="text-sm text-text-primary mb-3">
-            Bist du sicher? Der Spielername <strong class="text-primary">{{ alias }}</strong> kann danach nicht mehr geändert werden.
+            {{ t('alias.confirmPrompt', { alias: alias }) }}
           </p>
           <div class="flex gap-2">
             <button
@@ -173,21 +175,21 @@ async function saveAlias() {
               class="px-4 py-2 rounded-lg text-sm bg-primary text-surface-0 hover:bg-primary-hover transition-colors disabled:opacity-50"
               @click="saveAlias"
             >
-              <template v-if="saving">Speichern...</template>
-              <template v-else>Ja, bestätigen</template>
+              <template v-if="saving">{{ $t('alias.saving') }}</template>
+              <template v-else>{{ $t('alias.confirmYes') }}</template>
             </button>
             <button
               class="px-4 py-2 rounded-lg text-sm text-text-secondary hover:bg-surface-2 transition-colors"
               @click="showConfirm = false"
             >
-              Abbrechen
+              {{ $t('common.cancel') }}
             </button>
           </div>
         </div>
       </div>
 
       <p class="text-xs text-text-muted mt-3">
-        Erlaubt: Buchstaben (A-Z), Ziffern (0-9) und Unterstriche (_). Mindestens 3, maximal 20 Zeichen.
+        {{ $t('alias.rules') }}
       </p>
     </template>
   </div>

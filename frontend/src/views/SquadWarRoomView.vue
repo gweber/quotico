@@ -18,7 +18,7 @@ const {
   countdown,
   phase,
   liveScore,
-  isTipWinning,
+  isBetWinning,
 } = useWarRoom(squadId.value, matchId.value);
 
 // Per-member winning/losing state (computed from live WS score)
@@ -31,7 +31,7 @@ const tipStates = computed(() => {
       map.set(member.user_id, { winning: false, losing: false });
       continue;
     }
-    const winning = isTipWinning(member.selection.value);
+    const winning = isBetWinning(member.selection.value);
     map.set(member.user_id, { winning, losing: !winning });
   }
   return map;
@@ -94,8 +94,8 @@ const tipStates = computed(() => {
         <WarRoomConsensusBar
           v-if="phase !== 'pre_kickoff' && data.consensus"
           :consensus="data.consensus"
-          :home-team="data.match.teams.home"
-          :away-team="data.match.teams.away"
+          :home-team="data.match.home_team"
+          :away-team="data.match.away_team"
         />
       </Transition>
 
@@ -104,8 +104,8 @@ const tipStates = computed(() => {
         :members="data.members"
         :phase="phase"
         :maverick-ids="data.mavericks ?? []"
-        :home-team="data.match.teams.home"
-        :away-team="data.match.teams.away"
+        :home-team="data.match.home_team"
+        :away-team="data.match.away_team"
         :tip-states="tipStates"
       />
     </template>

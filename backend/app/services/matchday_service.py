@@ -1,4 +1,4 @@
-"""Spieltag-Modus: scoring, predictions, and auto-tipp logic."""
+"""Matchday mode: scoring, predictions, and auto-bet logic."""
 
 import logging
 from datetime import timedelta
@@ -11,45 +11,52 @@ from pymongo.errors import DuplicateKeyError
 import app.database as _db
 from app.utils import ensure_utc, utcnow
 
-logger = logging.getLogger("quotico.spieltag_service")
+logger = logging.getLogger("quotico.matchday_service")
 
 # Deadline: predictions lock 15 minutes before kickoff
 LOCK_MINUTES = 15
 
 
+DEFAULT_POINT_WEIGHTS = {"exact": 3, "diff": 2, "tendency": 1, "miss": 0}
+
+
 def calculate_points(
-    pred_home: int, pred_away: int, actual_home: int, actual_away: int
+    pred_home: int, pred_away: int, actual_home: int, actual_away: int,
+    weights: dict | None = None,
 ) -> int:
-    """Calculate Spieltag points for a single match prediction.
+    """Calculate matchday points for a single match prediction.
+
+    Args:
+        weights: Optional dict with keys "exact", "diff", "tendency", "miss".
+                 Defaults to {exact: 3, diff: 2, tendency: 1, miss: 0}.
 
     Returns:
-        3 — exact score match
-        2 — correct goal difference (e.g. predicted 2:0, actual 3:1)
-        1 — correct tendency (home win / draw / away win)
-        0 — wrong
+        Points based on prediction accuracy tier.
     """
+    w = weights or DEFAULT_POINT_WEIGHTS
+
     # Exact match
     if pred_home == actual_home and pred_away == actual_away:
-        return 3
+        return w.get("exact", 3)
 
     # Goal difference
     pred_diff = pred_home - pred_away
     actual_diff = actual_home - actual_away
     if pred_diff == actual_diff:
-        return 2
+        return w.get("diff", 2)
 
     # Tendency (sign of difference: positive=home win, 0=draw, negative=away win)
     pred_sign = (pred_home > pred_away) - (pred_home < pred_away)
     actual_sign = (actual_home > actual_away) - (actual_home < actual_away)
     if pred_sign == actual_sign:
-        return 1
+        return w.get("tendency", 1)
 
-    return 0
+    return w.get("miss", 0)
 
 
 def _favorite_prediction(match: dict) -> tuple[int, int]:
     """Predict based on odds favorite, fallback to 1:1."""
-    odds = match.get("current_odds", {})
+    odds = match.get("odds", {}).get("h2h", {})
     home_odds = odds.get("1", 0)
     away_odds = odds.get("2", 0)
 
@@ -82,7 +89,7 @@ def _qbot_prediction(quotico_tip: dict | None) -> tuple[int, int] | None:
 def generate_auto_prediction(
     strategy: str, match: dict, *, quotico_tip: dict | None = None,
 ) -> Optional[tuple[int, int]]:
-    """Generate an auto-tipp prediction for a match.
+    """Generate an auto-bet prediction for a match.
 
     Args:
         strategy: "q_bot" | "draw" | "favorite" | "none"
@@ -117,7 +124,7 @@ def is_match_locked(match: dict, lock_minutes: int = LOCK_MINUTES) -> bool:
     Locked when current time >= (kickoff - lock_minutes) or match has started.
     """
     now = utcnow()
-    commence_time = match.get("commence_time")
+    commence_time = match.get("match_date")
     if not commence_time:
         return True
     commence_time = ensure_utc(commence_time)
@@ -128,27 +135,27 @@ def is_match_locked(match: dict, lock_minutes: int = LOCK_MINUTES) -> bool:
 
 async def save_predictions(
     user_id: str, matchday_id: str, predictions: list[dict],
-    auto_tipp_strategy: str = "none",
+    auto_bet_strategy: str = "none",
     squad_id: str | None = None,
 ) -> dict:
     """Save or update predictions for a matchday.
 
     Only saves predictions for matches that aren't locked.
     Merges with any existing locked predictions.
-    If squad_id is set, validates the squad has spieltag mode for this sport.
+    If squad_id is set, validates the squad has matchday mode for this sport.
     """
     # Get matchday
     matchday = await _db.db.matchdays.find_one({"_id": ObjectId(matchday_id)})
     if not matchday:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail="Spieltag nicht gefunden.",
+            detail="Matchday not found.",
         )
 
     if matchday.get("all_resolved"):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Dieser Spieltag ist bereits abgeschlossen.",
+            detail="This matchday is already resolved.",
         )
 
     # Validate squad context if provided
@@ -158,19 +165,19 @@ async def save_predictions(
         if not squad:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
-                detail="Squad nicht gefunden.",
+                detail="Squad not found.",
             )
         if user_id not in squad.get("members", []):
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
-                detail="Du bist kein Mitglied dieses Squads.",
+                detail="You are not a member of this squad.",
             )
         from app.services.squad_league_service import require_active_league_config
         require_active_league_config(squad, matchday["sport_key"], "classic")
-        if auto_tipp_strategy != "none" and squad.get("auto_tipp_blocked", False):
+        if auto_bet_strategy != "none" and squad.get("auto_bet_blocked", False):
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Auto-Tipp ist in diesem Squad deaktiviert.",
+                detail="Auto-bet is disabled in this squad.",
             )
         lock_mins = squad.get("lock_minutes", LOCK_MINUTES)
 
@@ -182,7 +189,7 @@ async def save_predictions(
     matches_by_id = {str(m["_id"]): m for m in matches}
 
     # Get existing prediction doc (squad-scoped)
-    existing = await _db.db.spieltag_predictions.find_one({
+    existing = await _db.db.matchday_predictions.find_one({
         "user_id": user_id,
         "matchday_id": matchday_id,
         "squad_id": squad_id,
@@ -251,7 +258,7 @@ async def save_predictions(
         "sport_key": matchday["sport_key"],
         "season": matchday["season"],
         "matchday_number": matchday["matchday_number"],
-        "auto_tipp_strategy": auto_tipp_strategy,
+        "auto_bet_strategy": auto_bet_strategy,
         "predictions": final_predictions,
         "total_points": None,
         "status": pred_status,
@@ -260,21 +267,21 @@ async def save_predictions(
 
     filter_key = {"user_id": user_id, "matchday_id": matchday_id, "squad_id": squad_id}
     try:
-        await _db.db.spieltag_predictions.update_one(
+        await _db.db.matchday_predictions.update_one(
             filter_key,
             {"$set": doc, "$setOnInsert": {"created_at": now}},
             upsert=True,
         )
     except DuplicateKeyError:
         # Race condition — retry as update
-        await _db.db.spieltag_predictions.update_one(
+        await _db.db.matchday_predictions.update_one(
             filter_key,
             {"$set": doc},
         )
 
     logger.info(
-        "Saved %d predictions for user=%s matchday=%s (auto=%s)",
-        len(final_predictions), user_id, matchday_id, auto_tipp_strategy,
+        "Saved %d predictions for user=%s matchday=%s (auto_bet=%s)",
+        len(final_predictions), user_id, matchday_id, auto_bet_strategy,
     )
 
     return doc
@@ -284,7 +291,7 @@ async def get_user_predictions(
     user_id: str, matchday_id: str, squad_id: str | None = None,
 ) -> Optional[dict]:
     """Get a user's predictions for a matchday (optionally squad-scoped)."""
-    return await _db.db.spieltag_predictions.find_one({
+    return await _db.db.matchday_predictions.find_one({
         "user_id": user_id,
         "matchday_id": matchday_id,
         "squad_id": squad_id,
@@ -302,21 +309,21 @@ async def _validate_squad_admin(
     """
     squad = await _db.db.squads.find_one({"_id": ObjectId(squad_id)})
     if not squad:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Squad nicht gefunden.")
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Squad not found.")
     if squad["admin_id"] != admin_id:
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "Nur der Squad-Admin kann das.")
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Only the squad admin can do this.")
     if user_id not in squad.get("members", []):
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, "User ist kein Mitglied dieses Squads.")
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "User is not a member of this squad.")
 
     matchday = await _db.db.matchdays.find_one({"_id": ObjectId(matchday_id)})
     if not matchday:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Spieltag nicht gefunden.")
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Matchday not found.")
     if match_id not in matchday.get("match_ids", []):
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Spiel gehört nicht zu diesem Spieltag.")
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Match does not belong to this matchday.")
 
     match = await _db.db.matches.find_one({"_id": ObjectId(match_id)})
     if not match:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Spiel nicht gefunden.")
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Match not found.")
 
     return squad, matchday, match
 
@@ -332,7 +339,7 @@ async def admin_unlock_match(
     now = utcnow()
     filter_key = {"user_id": user_id, "matchday_id": matchday_id, "squad_id": squad_id}
 
-    await _db.db.spieltag_predictions.update_one(
+    await _db.db.matchday_predictions.update_one(
         filter_key,
         {
             "$addToSet": {"admin_unlocked_matches": match_id},
@@ -341,7 +348,7 @@ async def admin_unlock_match(
                 "sport_key": matchday["sport_key"],
                 "season": matchday["season"],
                 "matchday_number": matchday["matchday_number"],
-                "auto_tipp_strategy": "none",
+                "auto_bet_strategy": "none",
                 "predictions": [],
                 "total_points": None,
                 "status": "open",
@@ -377,14 +384,15 @@ async def admin_save_prediction(
 
     # Score immediately if match is completed
     points_earned = None
+    match_result = match.get("result", {})
     if (
-        match.get("status") == "completed"
-        and match.get("home_score") is not None
-        and match.get("away_score") is not None
+        match.get("status") == "final"
+        and match_result.get("home_score") is not None
+        and match_result.get("away_score") is not None
     ):
         points_earned = calculate_points(
             home_score, away_score,
-            match["home_score"], match["away_score"],
+            match_result["home_score"], match_result["away_score"],
         )
 
     new_pred = {
@@ -397,7 +405,7 @@ async def admin_save_prediction(
     }
 
     # Get existing prediction doc
-    existing = await _db.db.spieltag_predictions.find_one(filter_key)
+    existing = await _db.db.matchday_predictions.find_one(filter_key)
 
     if existing:
         # Replace or append the prediction for this match
@@ -412,12 +420,12 @@ async def admin_save_prediction(
         match_ids = matchday.get("match_ids", [])
         all_matches_done = await _db.db.matches.count_documents({
             "_id": {"$in": [ObjectId(mid) for mid in match_ids]},
-            "status": "completed",
+            "status": "final",
         }) == len(match_ids)
 
         new_status = "resolved" if (all_matches_done and all_scored) else "partial"
 
-        await _db.db.spieltag_predictions.update_one(
+        await _db.db.matchday_predictions.update_one(
             {"_id": existing["_id"]},
             {"$set": {
                 "predictions": preds,
@@ -435,7 +443,7 @@ async def admin_save_prediction(
             "sport_key": matchday["sport_key"],
             "season": matchday["season"],
             "matchday_number": matchday["matchday_number"],
-            "auto_tipp_strategy": "none",
+            "auto_bet_strategy": "none",
             "predictions": [new_pred],
             "admin_unlocked_matches": [],
             "total_points": None,
@@ -443,7 +451,7 @@ async def admin_save_prediction(
             "created_at": now,
             "updated_at": now,
         }
-        await _db.db.spieltag_predictions.insert_one(doc)
+        await _db.db.matchday_predictions.insert_one(doc)
 
     logger.info(
         "Admin %s saved prediction %d:%d for match %s user %s (squad=%s, pts=%s)",

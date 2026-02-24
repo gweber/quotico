@@ -27,7 +27,7 @@ class Settings(BaseSettings):
 
     # Odds provider settings
     ODDS_CACHE_TTL_SECONDS: int = 300  # 5 minutes
-    ODDS_STALENESS_MAX_SECONDS: int = 600  # 10 minutes
+    ODDS_STALENESS_MAX_SECONDS: int = 1500  # 25 minutes (must exceed polling interval of 15 min)
 
     # Seed admin user (leave empty to skip seeding)
     SEED_ADMIN_EMAIL: str = ""
@@ -39,7 +39,7 @@ class Settings(BaseSettings):
     # API key for local tools (scraper import etc.)
     IMPORT_API_KEY: str = ""
 
-    # Q-Bot: minimum QuoticoTip confidence to auto-tip
+    # Q-Bot: minimum QuoticoTip confidence to auto-bet
     QBOT_MIN_CONFIDENCE: float = 0.55
 
     model_config = {"env_file": str(_ENV_FILE), "extra": "ignore"}

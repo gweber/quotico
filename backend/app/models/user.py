@@ -41,11 +41,11 @@ class UserCreate(BaseModel):
     @classmethod
     def password_strength(cls, v: str) -> str:
         if len(v) < 10:
-            raise ValueError("Passwort muss mindestens 10 Zeichen lang sein.")
+            raise ValueError("Password must be at least 10 characters long.")
         if not any(c.isupper() for c in v):
-            raise ValueError("Passwort muss mindestens einen Großbuchstaben enthalten.")
+            raise ValueError("Password must contain at least one uppercase letter.")
         if not any(c.isdigit() for c in v):
-            raise ValueError("Passwort muss mindestens eine Ziffer enthalten.")
+            raise ValueError("Password must contain at least one digit.")
         return v
 
 
@@ -60,6 +60,45 @@ class AliasUpdate(BaseModel):
     alias: str
 
 
+class SetPasswordRequest(BaseModel):
+    """Set a password on a Google-only account."""
+    password: str
+
+    @field_validator("password")
+    @classmethod
+    def password_strength(cls, v: str) -> str:
+        if len(v) < 10:
+            raise ValueError("Password must be at least 10 characters long.")
+        if not any(c.isupper() for c in v):
+            raise ValueError("Password must contain at least one uppercase letter.")
+        if not any(c.isdigit() for c in v):
+            raise ValueError("Password must contain at least one digit.")
+        return v
+
+
+class ChangePasswordRequest(BaseModel):
+    """Change password for users who already have one."""
+    current_password: str
+    new_password: str
+    totp_code: Optional[str] = None
+
+    @field_validator("new_password")
+    @classmethod
+    def password_strength(cls, v: str) -> str:
+        if len(v) < 10:
+            raise ValueError("Password must be at least 10 characters long.")
+        if not any(c.isupper() for c in v):
+            raise ValueError("Password must contain at least one uppercase letter.")
+        if not any(c.isdigit() for c in v):
+            raise ValueError("Password must contain at least one digit.")
+        return v
+
+
+class UnlinkGoogleRequest(BaseModel):
+    """Unlink Google — requires current password as proof."""
+    password: str
+
+
 class UserResponse(BaseModel):
     """Public user data returned to the client."""
     email: str
@@ -70,5 +109,7 @@ class UserResponse(BaseModel):
     is_admin: bool = False
     is_2fa_enabled: bool
     is_adult: bool = True
+    google_linked: bool = False
+    has_password: bool = True
     terms_accepted_version: Optional[str] = None
     created_at: datetime

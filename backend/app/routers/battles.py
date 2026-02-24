@@ -1,3 +1,4 @@
+import re
 from typing import Any
 
 from bson import ObjectId
@@ -12,6 +13,7 @@ from app.models.battle import (
     ChallengeCreate,
 )
 from app.services.auth_service import get_current_user
+from app.utils import ensure_utc
 from app.services.battle_service import (
     accept_challenge,
     commit_to_battle,
@@ -28,12 +30,12 @@ router = APIRouter(prefix="/api/battles", tags=["battles"])
 
 @router.post("/", status_code=status.HTTP_201_CREATED)
 async def create(body: BattleCreate, user=Depends(get_current_user)):
-    """Create a new Squad Battle (classic — both squads known)."""
+    """Create a new Squad Battle (classic -- both squads known)."""
     admin_id = str(user["_id"])
     battle = await create_battle(
         admin_id, body.squad_a_id, body.squad_b_id, body.start_time, body.end_time
     )
-    return {"id": str(battle["_id"]), "message": "Battle erstellt."}
+    return {"id": str(battle["_id"]), "message": "Battle created."}
 
 
 @router.post("/challenge", status_code=status.HTTP_201_CREATED)
@@ -48,7 +50,7 @@ async def create_challenge_endpoint(
     return {
         "id": str(battle["_id"]),
         "status": battle["status"],
-        "message": "Herausforderung erstellt.",
+        "message": "Challenge created.",
     }
 
 
@@ -80,7 +82,7 @@ async def commit(
     """
     user_id = str(user["_id"])
     await commit_to_battle(user_id, battle_id, body.squad_id)
-    return {"message": "Commitment bestätigt."}
+    return {"message": "Commitment confirmed."}
 
 
 @router.get("/squads/search")
@@ -96,7 +98,7 @@ async def search_squads(
 
     squads = await _db.db.squads.find(
         {
-            "name": {"$regex": q, "$options": "i"},
+            "name": {"$regex": re.escape(q), "$options": "i"},
             "_id": {"$nin": my_squad_ids},
             "is_public": {"$ne": False},  # Public by default (missing field = public)
         },
@@ -133,8 +135,8 @@ async def get_lobby(user=Depends(get_current_user)) -> list[dict[str, Any]]:
             "squad_a": {"id": b["squad_a_id"], "name": squad_a["name"] if squad_a else "?"},
             "squad_b": {"id": squad_b_id, "name": squad_b["name"]} if squad_b else None,
             "challenge_type": b.get("challenge_type", "classic"),
-            "start_time": b["start_time"].isoformat(),
-            "end_time": b["end_time"].isoformat(),
+            "start_time": ensure_utc(b["start_time"]).isoformat(),
+            "end_time": ensure_utc(b["end_time"]).isoformat(),
             "status": b["status"],
             "can_accept": bool(admin_squad_ids),  # user is admin of at least one squad
         })
@@ -184,8 +186,8 @@ async def my_battles(user=Depends(get_current_user)) -> list[dict[str, Any]]:
             "squad_a": {"id": b["squad_a_id"], "name": squad_a["name"] if squad_a else "?"},
             "squad_b": {"id": squad_b_id, "name": squad_b["name"]} if squad_b else None,
             "challenge_type": b.get("challenge_type", "classic"),
-            "start_time": b["start_time"].isoformat(),
-            "end_time": b["end_time"].isoformat(),
+            "start_time": ensure_utc(b["start_time"]).isoformat(),
+            "end_time": ensure_utc(b["end_time"]).isoformat(),
             "status": b["status"],
             "my_commitment": commitment,
             "needs_commitment": commitment is None and b["status"] in ("upcoming", "active"),
@@ -200,7 +202,7 @@ async def get_battle(battle_id: str, user=Depends(get_current_user)):
     user_id = str(user["_id"])
     battle = await _db.db.battles.find_one({"_id": ObjectId(battle_id)})
     if not battle:
-        raise HTTPException(status_code=404, detail="Battle nicht gefunden.")
+        raise HTTPException(status_code=404, detail="Battle not found.")
 
     # For open/pending challenges, don't compute scores yet
     if battle["status"] in ("open", "pending"):
@@ -213,8 +215,8 @@ async def get_battle(battle_id: str, user=Depends(get_current_user)):
             squad_a={"id": battle["squad_a_id"], "name": squad_a["name"] if squad_a else "?"},
             squad_b={"id": squad_b_id, "name": squad_b["name"]} if squad_b else None,
             challenge_type=battle.get("challenge_type", "classic"),
-            start_time=battle["start_time"],
-            end_time=battle["end_time"],
+            start_time=ensure_utc(battle["start_time"]),
+            end_time=ensure_utc(battle["end_time"]),
             status=battle["status"],
         )
 
@@ -226,8 +228,8 @@ async def get_battle(battle_id: str, user=Depends(get_current_user)):
         squad_a=results["squad_a"],
         squad_b=results["squad_b"],
         challenge_type=battle.get("challenge_type", "classic"),
-        start_time=battle["start_time"],
-        end_time=battle["end_time"],
+        start_time=ensure_utc(battle["start_time"]),
+        end_time=ensure_utc(battle["end_time"]),
         status=battle["status"],
         my_commitment=commitment,
         result=results if battle["status"] == "finished" else None,

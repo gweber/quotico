@@ -26,6 +26,7 @@ interface AuditResponse {
 const entries = ref<AuditEntry[]>([]);
 const total = ref(0);
 const loading = ref(true);
+const error = ref(false);
 const exporting = ref(false);
 
 // Filters
@@ -50,6 +51,7 @@ async function fetchActions() {
 
 async function fetchLogs() {
   loading.value = true;
+  error.value = false;
   try {
     const params: Record<string, string> = {
       limit: String(pageSize),
@@ -65,7 +67,7 @@ async function fetchLogs() {
     entries.value = data.items;
     total.value = data.total;
   } catch {
-    toast.error("Audit-Logs konnten nicht geladen werden.");
+    error.value = true;
   } finally {
     loading.value = false;
   }
@@ -232,6 +234,11 @@ onMounted(() => {
     <div class="bg-surface-1 rounded-card overflow-hidden">
       <div v-if="loading" class="p-8 text-center text-text-muted text-sm">
         Lade Audit-Logs...
+      </div>
+
+      <div v-else-if="error" class="text-center py-12">
+        <p class="text-text-muted mb-3">Error loading.</p>
+        <button class="text-sm text-primary hover:underline" @click="fetchLogs">Try again</button>
       </div>
 
       <div v-else-if="entries.length === 0" class="p-8 text-center text-text-muted text-sm">

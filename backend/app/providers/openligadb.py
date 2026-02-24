@@ -2,7 +2,7 @@ import logging
 import time
 from datetime import datetime
 
-from app.utils import utcnow
+from app.utils import parse_utc, utcnow
 from typing import Any, Optional
 
 from app.providers.http_client import ResilientClient
@@ -142,7 +142,7 @@ class OpenLigaDBProvider:
                 if not match_dt:
                     continue
                 try:
-                    mt = datetime.fromisoformat(match_dt.replace("Z", "+00:00"))
+                    mt = parse_utc(match_dt)
                 except (ValueError, TypeError):
                     continue
 

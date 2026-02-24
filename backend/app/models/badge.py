@@ -4,66 +4,66 @@ from typing import Optional
 from pydantic import BaseModel
 
 
-# Badge definitions — each badge has a key, name, description, icon, and criteria
+# Badge definitions -- each badge has a key, name, description, icon, and criteria
 BADGE_DEFINITIONS = {
-    "first_tip": {
-        "name": "Erster Tipp",
-        "description": "Deinen ersten Tipp abgegeben",
+    "first_bet": {
+        "name": "First Bet",
+        "description": "Placed your first bet",
         "icon": "\uD83C\uDF1F",
     },
-    "ten_tips": {
-        "name": "Stammtipper",
-        "description": "10 Tipps abgegeben",
+    "ten_bets": {
+        "name": "Regular",
+        "description": "Placed 10 bets",
         "icon": "\uD83C\uDFAF",
     },
-    "fifty_tips": {
-        "name": "Tipp-Maschine",
-        "description": "50 Tipps abgegeben",
+    "fifty_bets": {
+        "name": "Bet Machine",
+        "description": "Placed 50 bets",
         "icon": "\uD83D\uDD25",
     },
     "first_win": {
-        "name": "Erster Treffer",
-        "description": "Deinen ersten Tipp gewonnen",
+        "name": "First Win",
+        "description": "Won your first bet",
         "icon": "\u2705",
     },
     "underdog_king": {
         "name": "Underdog King",
-        "description": "Einen Tipp mit Quote > 4.0 gewonnen",
+        "description": "Won a bet with odds > 4.0",
         "icon": "\uD83D\uDC51",
     },
     "hot_streak_3": {
         "name": "Hot Streak",
-        "description": "3 Tipps in Folge gewonnen",
+        "description": "Won 3 bets in a row",
         "icon": "\uD83D\uDD25",
     },
     "squad_leader": {
-        "name": "Anführer",
-        "description": "Einen Squad erstellt",
+        "name": "Squad Leader",
+        "description": "Created a squad",
         "icon": "\uD83D\uDEE1\uFE0F",
     },
     "battle_victor": {
-        "name": "Schlachtenbummler",
-        "description": "An einem Battle teilgenommen",
+        "name": "Battle Victor",
+        "description": "Participated in a battle",
         "icon": "\u2694\uFE0F",
     },
     "century_points": {
         "name": "Triple Digits",
-        "description": "100 Punkte erreicht",
+        "description": "Reached 100 points",
         "icon": "\uD83D\uDCAF",
     },
-    "spieltag_debut": {
-        "name": "Tippspiel-Debüt",
-        "description": "Dein erstes Tippspiel abgeschlossen",
+    "matchday_debut": {
+        "name": "Matchday Debut",
+        "description": "Completed your first matchday",
         "icon": "\uD83D\uDCCB",
     },
-    "hellseher": {
-        "name": "Hellseher",
-        "description": "Ein exaktes Ergebnis vorhergesagt (3 Punkte)",
+    "oracle": {
+        "name": "Oracle",
+        "description": "Predicted an exact score (3 points)",
         "icon": "\uD83D\uDD2E",
     },
-    "perfekter_spieltag": {
-        "name": "Perfekter Spieltag",
-        "description": "Alle Spiele eines Spieltags exakt getippt",
+    "perfect_matchday": {
+        "name": "Perfect Matchday",
+        "description": "Predicted all matches of a matchday correctly",
         "icon": "\u2B50",
     },
 }

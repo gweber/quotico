@@ -1,10 +1,12 @@
 <script setup lang="ts">
 import { onMounted, computed, ref, watch } from "vue";
+import { useI18n } from "vue-i18n";
 import { useBattlesStore, type Battle, type SquadSearchResult } from "@/stores/battles";
 import { useSquadsStore } from "@/stores/squads";
 import { useToast } from "@/composables/useToast";
 import BattleCard from "@/components/BattleCard.vue";
 
+const { t } = useI18n();
 const battles = useBattlesStore();
 const squadsStore = useSquadsStore();
 const toast = useToast();
@@ -45,6 +47,7 @@ const targetResults = ref<SquadSearchResult[]>([]);
 const selectedTarget = ref<SquadSearchResult | null>(null);
 const targetIdManual = ref("");
 const targetInputMode = ref<"search" | "id">("search");
+const error = ref(false);
 let searchTimeout: ReturnType<typeof setTimeout> | null = null;
 
 watch(targetQuery, (q) => {
@@ -82,33 +85,40 @@ const resolvedTargetId = computed(() => {
   return targetIdManual.value || undefined;
 });
 
-onMounted(async () => {
-  await Promise.all([
-    battles.fetchMyBattles(),
-    battles.fetchLobby(),
-    squadsStore.squads.length === 0 ? squadsStore.fetchMySquads() : Promise.resolve(),
-  ]);
-  // Pre-select first admin squad
-  if (adminSquads.value.length > 0 && !createSquadId.value) {
-    createSquadId.value = adminSquads.value[0].id;
+async function reload() {
+  error.value = false;
+  try {
+    await Promise.all([
+      battles.fetchMyBattles(),
+      battles.fetchLobby(),
+      squadsStore.squads.length === 0 ? squadsStore.fetchMySquads() : Promise.resolve(),
+    ]);
+    // Pre-select first admin squad
+    if (adminSquads.value.length > 0 && !createSquadId.value) {
+      createSquadId.value = adminSquads.value[0].id;
+    }
+  } catch {
+    error.value = true;
   }
-});
+}
+
+onMounted(() => reload());
 
 async function handleCommit(battle: Battle, squadId: string) {
   try {
     await battles.commitToBattle(battle.id, squadId);
   } catch (e: any) {
-    toast.error(e.message || "Commitment fehlgeschlagen.");
+    toast.error(e.message || t('battles.commitmentFailed'));
   }
 }
 
 async function handleCreate() {
   if (!createSquadId.value || !createStartDate.value || !createEndDate.value) {
-    toast.error("Bitte alle Felder ausfüllen.");
+    toast.error(t('battles.fillAllFields'));
     return;
   }
   if (createMode.value === "direct" && !resolvedTargetId.value) {
-    toast.error("Bitte einen Ziel-Squad auswählen.");
+    toast.error(t('battles.selectTarget'));
     return;
   }
   creating.value = true;
@@ -130,25 +140,25 @@ async function handleCreate() {
 
 async function handleAccept(battle: Battle, squadId: string) {
   const ok = await battles.acceptChallenge(battle.id, squadId);
-  if (!ok) toast.error("Annehmen fehlgeschlagen.");
+  if (!ok) toast.error(t('battles.acceptFailed'));
 }
 
 async function handleDecline(battle: Battle) {
   const ok = await battles.declineChallenge(battle.id);
-  if (!ok) toast.error("Ablehnen fehlgeschlagen.");
+  if (!ok) toast.error(t('battles.declineFailed'));
 }
 </script>
 
 <template>
   <div class="max-w-2xl mx-auto p-4">
     <div class="flex items-center justify-between mb-6">
-      <h1 class="text-xl font-bold text-text-primary">Battle Center</h1>
+      <h1 class="text-xl font-bold text-text-primary">{{ $t('battles.heading') }}</h1>
       <button
         v-if="adminSquads.length > 0 && !showCreateForm"
         class="text-sm px-3 py-1.5 rounded-lg bg-primary/10 text-primary border border-primary/30 hover:bg-primary/20 transition-colors font-medium"
         @click="showCreateForm = true"
       >
-        + Herausforderung
+        {{ $t('battles.challenge') }}
       </button>
     </div>
 
@@ -157,12 +167,12 @@ async function handleDecline(battle: Battle) {
       v-if="showCreateForm"
       class="bg-surface-1 rounded-card border border-surface-3/50 p-4 mb-6"
     >
-      <h2 class="text-sm font-semibold text-text-primary mb-3">Neue Herausforderung</h2>
+      <h2 class="text-sm font-semibold text-text-primary mb-3">{{ $t('battles.newChallenge') }}</h2>
 
       <div class="space-y-3">
         <!-- Squad selector -->
         <div>
-          <label class="text-xs text-text-muted block mb-1">Dein Squad</label>
+          <label class="text-xs text-text-muted block mb-1">{{ $t('battles.yourSquad') }}</label>
           <select
             v-model="createSquadId"
             class="w-full bg-surface-2 border border-surface-3 rounded-lg px-3 py-2 text-sm text-text-primary"
@@ -180,7 +190,7 @@ async function handleDecline(battle: Battle) {
               : 'bg-surface-2 text-text-muted border-surface-3 hover:border-surface-3/80'"
             @click="createMode = 'open'"
           >
-            Offene Herausforderung
+            {{ $t('battles.openChallenge') }}
           </button>
           <button
             class="flex-1 py-2 text-sm rounded-lg border transition-colors font-medium"
@@ -189,19 +199,19 @@ async function handleDecline(battle: Battle) {
               : 'bg-surface-2 text-text-muted border-surface-3 hover:border-surface-3/80'"
             @click="createMode = 'direct'"
           >
-            Direkte Herausforderung
+            {{ $t('battles.directChallenge') }}
           </button>
         </div>
 
         <!-- Target squad (direct only) -->
         <div v-if="createMode === 'direct'">
           <div class="flex items-center justify-between mb-1">
-            <label class="text-xs text-text-muted">Ziel-Squad</label>
+            <label class="text-xs text-text-muted">{{ $t('battles.targetSquad') }}</label>
             <button
               class="text-xs text-text-muted hover:text-text-secondary transition-colors"
               @click="targetInputMode = targetInputMode === 'search' ? 'id' : 'search'; clearTarget()"
             >
-              {{ targetInputMode === "search" ? "Per ID eingeben" : "Per Name suchen" }}
+              {{ targetInputMode === "search" ? $t('battles.enterById') : $t('battles.searchByName') }}
             </button>
           </div>
 
@@ -209,7 +219,7 @@ async function handleDecline(battle: Battle) {
           <div v-if="targetInputMode === 'search'" class="relative">
             <div v-if="selectedTarget" class="flex items-center gap-2 bg-surface-2 border border-primary/30 rounded-lg px-3 py-2">
               <span class="text-sm text-text-primary flex-1">{{ selectedTarget.name }}</span>
-              <span class="text-xs text-text-muted">{{ selectedTarget.member_count }} Mitglieder</span>
+              <span class="text-xs text-text-muted">{{ selectedTarget.member_count }} {{ $t('squads.members') }}</span>
               <button
                 class="text-text-muted hover:text-text-primary text-sm"
                 @click="clearTarget"
@@ -221,7 +231,7 @@ async function handleDecline(battle: Battle) {
               <input
                 v-model="targetQuery"
                 type="text"
-                placeholder="Squad-Name suchen..."
+                :placeholder="$t('battles.searchSquadPlaceholder')"
                 class="w-full bg-surface-2 border border-surface-3 rounded-lg px-3 py-2 text-sm text-text-primary placeholder:text-text-muted/50"
               />
               <div
@@ -235,7 +245,7 @@ async function handleDecline(battle: Battle) {
                   @click="selectTarget(s)"
                 >
                   <span class="text-sm text-text-primary">{{ s.name }}</span>
-                  <span class="text-xs text-text-muted">{{ s.member_count }} Mitgl.</span>
+                  <span class="text-xs text-text-muted">{{ s.member_count }} {{ $t('battles.membersShort') }}</span>
                 </button>
               </div>
             </template>
@@ -246,7 +256,7 @@ async function handleDecline(battle: Battle) {
             v-else
             v-model="targetIdManual"
             type="text"
-            placeholder="Squad-ID eingeben"
+            :placeholder="$t('battles.squadIdPlaceholder')"
             class="w-full bg-surface-2 border border-surface-3 rounded-lg px-3 py-2 text-sm text-text-primary placeholder:text-text-muted/50"
           />
         </div>
@@ -254,7 +264,7 @@ async function handleDecline(battle: Battle) {
         <!-- Date range -->
         <div class="grid grid-cols-2 gap-3">
           <div>
-            <label class="text-xs text-text-muted block mb-1">Start</label>
+            <label class="text-xs text-text-muted block mb-1">{{ $t('battles.start') }}</label>
             <input
               v-model="createStartDate"
               type="datetime-local"
@@ -262,7 +272,7 @@ async function handleDecline(battle: Battle) {
             />
           </div>
           <div>
-            <label class="text-xs text-text-muted block mb-1">Ende</label>
+            <label class="text-xs text-text-muted block mb-1">{{ $t('battles.end') }}</label>
             <input
               v-model="createEndDate"
               type="datetime-local"
@@ -278,13 +288,13 @@ async function handleDecline(battle: Battle) {
             :disabled="creating"
             @click="handleCreate"
           >
-            {{ creating ? "Erstelle..." : "Erstellen" }}
+            {{ creating ? $t('battles.creating') : $t('battles.create') }}
           </button>
           <button
             class="py-2 px-4 text-sm rounded-lg bg-surface-2 text-text-muted border border-surface-3 hover:bg-surface-3/50 transition-colors"
             @click="showCreateForm = false"
           >
-            Abbrechen
+            {{ $t('common.cancel') }}
           </button>
         </div>
       </div>
@@ -295,10 +305,16 @@ async function handleDecline(battle: Battle) {
       <div v-for="n in 2" :key="n" class="bg-surface-1 rounded-card h-40 animate-pulse" />
     </div>
 
+    <!-- Error -->
+    <div v-else-if="error" class="text-center py-12">
+      <p class="text-text-muted mb-3">{{ $t('common.loadError') }}</p>
+      <button class="text-sm text-primary hover:underline" @click="reload">{{ $t('common.retry') }}</button>
+    </div>
+
     <!-- Incoming Challenges (direct) -->
     <section v-if="incomingChallenges.length > 0" class="mb-8">
       <h2 class="text-sm font-semibold text-text-muted uppercase tracking-wider mb-3">
-        Eingehende Herausforderungen
+        {{ $t('battles.incoming') }}
       </h2>
       <div class="space-y-4">
         <BattleCard
@@ -315,7 +331,7 @@ async function handleDecline(battle: Battle) {
     <!-- Open Challenges (lobby) -->
     <section v-if="openChallenges.length > 0" class="mb-8">
       <h2 class="text-sm font-semibold text-text-muted uppercase tracking-wider mb-3">
-        Offene Herausforderungen
+        {{ $t('battles.openChallenges') }}
       </h2>
       <div class="space-y-4">
         <BattleCard
@@ -331,7 +347,7 @@ async function handleDecline(battle: Battle) {
     <!-- Outgoing challenges (my open/pending) -->
     <section v-if="outgoingChallenges.length > 0" class="mb-8">
       <h2 class="text-sm font-semibold text-text-muted uppercase tracking-wider mb-3">
-        Meine Herausforderungen
+        {{ $t('battles.myChallenges') }}
       </h2>
       <div class="space-y-4">
         <BattleCard
@@ -345,7 +361,7 @@ async function handleDecline(battle: Battle) {
     <!-- Active Battles -->
     <section v-if="activeBattles.length > 0" class="mb-8">
       <h2 class="text-sm font-semibold text-text-muted uppercase tracking-wider mb-3">
-        Laufende Battles
+        {{ $t('battles.activeBattles') }}
       </h2>
       <div class="space-y-4">
         <BattleCard
@@ -360,7 +376,7 @@ async function handleDecline(battle: Battle) {
     <!-- Upcoming Battles -->
     <section v-if="upcomingBattles.length > 0" class="mb-8">
       <h2 class="text-sm font-semibold text-text-muted uppercase tracking-wider mb-3">
-        Geplante Battles
+        {{ $t('battles.upcomingBattles') }}
       </h2>
       <div class="space-y-4">
         <BattleCard
@@ -378,9 +394,9 @@ async function handleDecline(battle: Battle) {
       class="text-center py-16"
     >
       <p class="text-4xl mb-4" aria-hidden="true">&#x2694;&#xFE0F;</p>
-      <h2 class="text-lg font-semibold text-text-primary mb-2">Keine Battles</h2>
+      <h2 class="text-lg font-semibold text-text-primary mb-2">{{ $t('battles.noBattles') }}</h2>
       <p class="text-sm text-text-secondary max-w-xs mx-auto">
-        Tritt einem Squad bei und starte ein Battle gegen ein anderes Team.
+        {{ $t('battles.noBattlesMessage') }}
       </p>
     </div>
   </div>

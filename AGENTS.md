@@ -1,5 +1,5 @@
 - keep CLAUDE.md up to date
-- never expose emails in the public frontend, only in user's own backend view allowed and in admin view. 
+- never expose emails in the public frontend, only in user's own backend view allowed and in admin view.
 - greenfield development, no shims, no migration paths
 - mongo datetime awareness
-- text on the page is german, use umlauts
+- use i18n system: frontend uses vue-i18n with `de.ts` and `en.ts` locale files in `frontend/src/locales/`. All user-facing strings go through `$t('key')` in templates or `t('key')` in script setup. Default locale is German (`de`). Backend error messages and code are in English.

@@ -14,8 +14,8 @@ from app.services.historical_service import (
     build_match_context,
     clear_context_cache,
     sport_keys_for,
-    team_name_key,
 )
+from app.services.team_mapping_service import normalize_match_date, team_name_key
 from app.utils import utcnow
 
 logger = logging.getLogger("quotico.historical")
@@ -132,6 +132,38 @@ async def import_matches(batch: ImportBatch, _=Depends(verify_import_key)):
 
     for m in batch.matches:
         doc = m.model_dump(exclude_none=True)
+
+        # --- Transform to unified matches schema ---
+        # Convert home_goals/away_goals/result → result.{home_score, away_score, outcome}
+        home_goals = doc.pop("home_goals", 0)
+        away_goals = doc.pop("away_goals", 0)
+        outcome = doc.pop("result", None)
+        if outcome is None:
+            # Derive outcome from score
+            if home_goals > away_goals:
+                outcome = "1"
+            elif home_goals < away_goals:
+                outcome = "2"
+            else:
+                outcome = "X"
+        doc["result"] = {
+            "home_score": home_goals,
+            "away_score": away_goals,
+            "outcome": outcome,
+        }
+
+        # Half-time results stored under result as well
+        if "ht_home_goals" in doc or "ht_away_goals" in doc:
+            doc["result"]["ht_home_score"] = doc.pop("ht_home_goals", None)
+            doc["result"]["ht_away_score"] = doc.pop("ht_away_goals", None)
+            doc["result"]["ht_outcome"] = doc.pop("ht_result", None)
+        else:
+            doc.pop("ht_result", None)
+
+        # All imported historical matches are final
+        doc["status"] = "final"
+        doc["source"] = "scraper"
+
         # Flatten nested Pydantic models to dicts for MongoDB
         if doc.get("stats"):
             doc["stats"] = {k: v for k, v in doc["stats"].items() if v is not None}
@@ -141,6 +173,9 @@ async def import_matches(batch: ImportBatch, _=Depends(verify_import_key)):
             doc["over_under_odds"] = {bk: dict(v) for bk, v in doc["over_under_odds"].items()}
 
         doc["updated_at"] = now
+
+        # match_date_hour: floored to hour for compound unique index dedup
+        doc["match_date_hour"] = normalize_match_date(doc["match_date"])
 
         # Dedup by normalized team keys + date — matches unique index
         # (date needed for NBA playoffs: same home/away pair, different dates)
@@ -165,7 +200,7 @@ async def import_matches(batch: ImportBatch, _=Depends(verify_import_key)):
     if not ops:
         return ImportResult(received=0, upserted=0, modified=0)
 
-    result = await _db.db.historical_matches.bulk_write(ops, ordered=False)
+    result = await _db.db.matches.bulk_write(ops, ordered=False)
     logger.info(
         "Historical import: %d received, %d upserted, %d modified",
         len(batch.matches), result.upserted_count, result.modified_count,
@@ -182,26 +217,33 @@ async def import_matches(batch: ImportBatch, _=Depends(verify_import_key)):
 
 @router.post("/aliases", response_model=dict)
 async def import_aliases(batch: AliasBatch, _=Depends(verify_import_key)):
-    """Bulk upsert team aliases. Called after match import."""
+    """Bulk upsert team name variants into team_mappings.
+
+    For each alias, finds or creates a team_mapping by canonical_id
+    (derived from team_key) and adds the team_name to its names array.
+    """
+    from app.services.team_mapping_service import make_canonical_id
     from pymongo import UpdateOne
 
     now = utcnow()
     ops = []
 
     for alias in batch.aliases:
+        canonical_id = make_canonical_id(alias.team_name)
         ops.append(UpdateOne(
-            {"sport_key": alias.sport_key, "team_name": alias.team_name},
+            {"canonical_id": canonical_id},
             {
-                "$set": {
-                    "team_key": alias.team_key,
-                    "updated_at": now,
+                "$addToSet": {
+                    "names": alias.team_name,
+                    "sport_keys": alias.sport_key,
                 },
                 "$setOnInsert": {
-                    "sport_key": alias.sport_key,
-                    "team_name": alias.team_name,
-                    "canonical_name": None,
-                    "imported_at": now,
+                    "canonical_id": canonical_id,
+                    "display_name": alias.team_name,
+                    "external_ids": {},
+                    "created_at": now,
                 },
+                "$set": {"updated_at": now},
             },
             upsert=True,
         ))
@@ -209,7 +251,7 @@ async def import_aliases(batch: AliasBatch, _=Depends(verify_import_key)):
     if not ops:
         return {"received": 0, "upserted": 0}
 
-    result = await _db.db.team_aliases.bulk_write(ops, ordered=False)
+    result = await _db.db.team_mappings.bulk_write(ops, ordered=False)
     return {
         "received": len(batch.aliases),
         "upserted": result.upserted_count,
@@ -231,9 +273,10 @@ async def head_to_head(
 ):
     """Get head-to-head history between two teams (either direction)."""
     related_keys = sport_keys_for(sport_key)
-    matches = await _db.db.historical_matches.find(
+    matches = await _db.db.matches.find(
         {
             "sport_key": {"$in": related_keys},
+            "status": "final",
             "$or": [
                 {"home_team_key": home_team_key, "away_team_key": away_team_key},
                 {"home_team_key": away_team_key, "away_team_key": home_team_key},
@@ -243,7 +286,7 @@ async def head_to_head(
             "_id": 0,
             "match_date": 1, "home_team": 1, "away_team": 1,
             "home_team_key": 1, "away_team_key": 1,
-            "home_goals": 1, "away_goals": 1, "result": 1,
+            "result.home_score": 1, "result.away_score": 1, "result.outcome": 1,
             "season_label": 1,
         },
     ).sort("match_date", -1).skip(skip).to_list(length=limit)
@@ -258,9 +301,10 @@ async def team_form(
     limit: int = Query(10, ge=1, le=50),
 ):
     """Get recent form for a team (last N matches)."""
-    matches = await _db.db.historical_matches.find(
+    matches = await _db.db.matches.find(
         {
             "sport_key": sport_key,
+            "status": "final",
             "$or": [
                 {"home_team_key": team_key},
                 {"away_team_key": team_key},
@@ -269,7 +313,7 @@ async def team_form(
         {
             "_id": 0,
             "match_date": 1, "home_team": 1, "away_team": 1,
-            "home_goals": 1, "away_goals": 1, "result": 1,
+            "result.home_score": 1, "result.away_score": 1, "result.outcome": 1,
             "season_label": 1,
         },
     ).sort("match_date", -1).to_list(length=limit)
@@ -296,7 +340,7 @@ class BulkFixture(BaseModel):
 
 
 class BulkContextRequest(BaseModel):
-    fixtures: list[BulkFixture] = Field(..., max_length=20)
+    fixtures: list[BulkFixture] = Field(..., max_length=50)
     h2h_limit: int = Field(10, ge=1, le=20)
     form_limit: int = Field(10, ge=1, le=20)
 
@@ -322,7 +366,10 @@ async def match_context_bulk(req: BulkContextRequest):
 @router.get("/stats")
 async def collection_stats(admin=Depends(get_admin_user)):
     """Admin: overview of historical data in the database."""
+    final_filter = {"status": "final"}
+
     pipeline = [
+        {"$match": final_filter},
         {"$group": {
             "_id": {"sport_key": "$sport_key", "season": "$season_label"},
             "count": {"$sum": 1},
@@ -332,9 +379,9 @@ async def collection_stats(admin=Depends(get_admin_user)):
         {"$sort": {"_id.sport_key": 1, "_id.season": 1}},
     ]
 
-    results = await _db.db.historical_matches.aggregate(pipeline).to_list(length=500)
-    total = await _db.db.historical_matches.count_documents({})
-    aliases = await _db.db.team_aliases.count_documents({})
+    results = await _db.db.matches.aggregate(pipeline).to_list(length=500)
+    total = await _db.db.matches.count_documents(final_filter)
+    aliases = await _db.db.team_mappings.count_documents({})
 
     return {
         "total_matches": total,

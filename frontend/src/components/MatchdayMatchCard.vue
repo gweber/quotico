@@ -1,29 +1,33 @@
 <script setup lang="ts">
 import { computed } from "vue";
+import { useI18n } from "vue-i18n";
 import { RouterLink } from "vue-router";
-import type { SpieltagMatch } from "@/stores/spieltag";
-import { useSpieltagStore } from "@/stores/spieltag";
+import type { MatchdayMatch } from "@/stores/matchday";
+import { useMatchdayStore } from "@/stores/matchday";
 import MatchHistory from "./MatchHistory.vue";
 import QuoticoTipBadge from "./QuoticoTipBadge.vue";
 import { getCachedTip } from "@/composables/useQuoticoTip";
 import { teamSlug } from "@/composables/useTeam";
 
 const props = defineProps<{
-  match: SpieltagMatch;
+  match: MatchdayMatch;
   sportKey?: string;
 }>();
 
+const { t, locale } = useI18n();
+const localeTag = computed(() => (locale.value === "en" ? "en-US" : "de-DE"));
+
 const quoticoTip = computed(() => getCachedTip(props.match.id));
 
-const spieltag = useSpieltagStore();
+const matchday = useMatchdayStore();
 
-const draft = computed(() => spieltag.draftPredictions.get(props.match.id));
-const isAdminUnlocked = computed(() => spieltag.adminUnlockedSet.has(props.match.id));
+const draft = computed(() => matchday.draftPredictions.get(props.match.id));
+const isAdminUnlocked = computed(() => matchday.adminUnlockedSet.has(props.match.id));
 const isEditable = computed(() => !props.match.is_locked || isAdminUnlocked.value);
 
 const pointsEarned = computed(() => {
-  if (!spieltag.predictions) return null;
-  const pred = spieltag.predictions.predictions.find(
+  if (!matchday.predictions) return null;
+  const pred = matchday.predictions.predictions.find(
     (p) => p.match_id === props.match.id
   );
   return pred?.points_earned ?? null;
@@ -44,9 +48,23 @@ const pointsColor = computed(() => {
   }
 });
 
+// For final matches, prefer closing line (frozen at kickoff) over last-polled odds
+const displayOdds = computed(() => {
+  const odds = props.match.odds as any;
+  if (!odds) return null;
+  if (props.match.status === "final" && odds.closing_line?.h2h) {
+    return odds.closing_line.h2h as Record<string, number>;
+  }
+  return odds.h2h as Record<string, number> | null;
+});
+
+const isClosingLine = computed(
+  () => props.match.status === "final" && !!(props.match.odds as any)?.closing_line?.h2h
+);
+
 const kickoffLabel = computed(() => {
-  const d = new Date(props.match.commence_time);
-  return d.toLocaleString("de-DE", {
+  const d = new Date(props.match.match_date);
+  return d.toLocaleString(localeTag.value, {
     weekday: "short",
     day: "2-digit",
     month: "2-digit",
@@ -58,7 +76,7 @@ const kickoffLabel = computed(() => {
 const countdown = computed(() => {
   if (props.match.is_locked && !isAdminUnlocked.value) return null;
   const now = Date.now();
-  const kickoff = new Date(props.match.commence_time).getTime();
+  const kickoff = new Date(props.match.match_date).getTime();
   const diff = kickoff - now;
   if (diff <= 0) return null;
 
@@ -71,7 +89,7 @@ const countdown = computed(() => {
 
 function updateHome(e: Event) {
   const val = parseInt((e.target as HTMLInputElement).value) || 0;
-  spieltag.setDraftPrediction(
+  matchday.setDraftPrediction(
     props.match.id,
     Math.max(0, Math.min(99, val)),
     draft.value?.away ?? 0
@@ -80,7 +98,7 @@ function updateHome(e: Event) {
 
 function updateAway(e: Event) {
   const val = parseInt((e.target as HTMLInputElement).value) || 0;
-  spieltag.setDraftPrediction(
+  matchday.setDraftPrediction(
     props.match.id,
     draft.value?.home ?? 0,
     Math.max(0, Math.min(99, val))
@@ -113,13 +131,13 @@ function updateAway(e: Event) {
         v-else-if="isAdminUnlocked"
         class="text-xs text-amber-500 font-medium"
       >
-        Vom Admin entsperrt
+        {{ t('match.adminUnlocked') }}
       </span>
       <span
         v-else-if="match.is_locked"
         class="text-xs text-text-muted"
       >
-        Gesperrt
+        {{ t('match.locked') }}
       </span>
     </div>
 
@@ -128,23 +146,23 @@ function updateAway(e: Event) {
       <!-- Home team -->
       <div class="flex-1 text-right">
         <RouterLink
-          :to="{ name: 'team-detail', params: { teamSlug: teamSlug(match.teams.home) }, query: sportKey ? { sport: sportKey } : {} }"
+          :to="{ name: 'team-detail', params: { teamSlug: teamSlug(match.home_team) }, query: sportKey ? { sport: sportKey } : {} }"
           class="text-sm font-medium text-text-primary truncate block hover:text-primary transition-colors"
         >
-          {{ match.teams.home }}
+          {{ match.home_team }}
         </RouterLink>
       </div>
 
       <!-- Score inputs or result -->
       <div class="flex items-center gap-1.5 shrink-0">
-        <template v-if="match.status === 'completed' && match.home_score !== null">
+        <template v-if="match.status === 'final' && (match.result as any)?.home_score !== null && (match.result as any)?.home_score !== undefined">
           <!-- Final score display -->
           <span class="w-10 text-center text-lg font-bold text-text-primary">
-            {{ match.home_score }}
+            {{ (match.result as any)?.home_score }}
           </span>
           <span class="text-text-muted font-bold">:</span>
           <span class="w-10 text-center text-lg font-bold text-text-primary">
-            {{ match.away_score }}
+            {{ (match.result as any)?.away_score }}
           </span>
         </template>
         <template v-else-if="isEditable">
@@ -184,48 +202,50 @@ function updateAway(e: Event) {
       <!-- Away team -->
       <div class="flex-1">
         <RouterLink
-          :to="{ name: 'team-detail', params: { teamSlug: teamSlug(match.teams.away) }, query: sportKey ? { sport: sportKey } : {} }"
+          :to="{ name: 'team-detail', params: { teamSlug: teamSlug(match.away_team) }, query: sportKey ? { sport: sportKey } : {} }"
           class="text-sm font-medium text-text-primary truncate block hover:text-primary transition-colors"
         >
-          {{ match.teams.away }}
+          {{ match.away_team }}
         </RouterLink>
       </div>
     </div>
 
     <!-- Odds context (read-only, visually subordinate) -->
     <div
-      v-if="match.current_odds && Object.keys(match.current_odds).length > 0"
-      class="mt-2 flex items-center justify-center gap-2"
+      v-if="displayOdds && Object.keys(displayOdds).length > 0"
+      class="mt-2 flex items-center justify-center gap-3 text-text-muted"
       role="group"
-      aria-label="Quoten"
+      :aria-label="$t('match.oddsLabel')"
     >
       <span
-        class="flex flex-col items-center min-w-[3rem] py-1 px-1.5 bg-surface-2 border border-surface-3/50 rounded-lg"
-        :title="`Heimsieg: ${match.current_odds['1']?.toFixed(2) ?? '-'}`"
+        v-if="isClosingLine"
+        class="text-[10px] text-text-muted/60"
+        :title="$t('match.closingLineHint')"
+      >{{ $t('match.closingLine') }}</span>
+      <span
+        class="inline-flex items-baseline gap-1"
+        :aria-label="t('match.homeWinOdds', { odds: displayOdds['1']?.toFixed(2) ?? '-' })"
+        :title="t('match.homeWinOdds', { odds: displayOdds['1']?.toFixed(2) ?? '-' })"
       >
-        <span class="text-[10px] leading-none text-text-muted">1</span>
-        <span class="text-xs font-mono font-semibold tabular-nums text-text-muted mt-0.5">
-          {{ match.current_odds['1']?.toFixed(2) ?? '-' }}
-        </span>
+        <span class="text-[10px] leading-none text-text-secondary" aria-hidden="true">1</span>
+        <span class="text-xs font-mono tabular-nums">{{ displayOdds['1']?.toFixed(2) ?? '-' }}</span>
       </span>
       <span
-        v-if="match.current_odds['X'] !== undefined"
-        class="flex flex-col items-center min-w-[3rem] py-1 px-1.5 bg-surface-2 border border-surface-3/50 rounded-lg"
-        :title="`Unentschieden: ${match.current_odds['X'].toFixed(2)}`"
+        v-if="displayOdds['X'] !== undefined"
+        class="inline-flex items-baseline gap-1"
+        :aria-label="t('match.drawOdds', { odds: displayOdds['X'].toFixed(2) })"
+        :title="t('match.drawOdds', { odds: displayOdds['X'].toFixed(2) })"
       >
-        <span class="text-[10px] leading-none text-text-muted">X</span>
-        <span class="text-xs font-mono font-semibold tabular-nums text-text-muted mt-0.5">
-          {{ match.current_odds['X'].toFixed(2) }}
-        </span>
+        <span class="text-[10px] leading-none text-text-secondary" aria-hidden="true">X</span>
+        <span class="text-xs font-mono tabular-nums">{{ displayOdds['X'].toFixed(2) }}</span>
       </span>
       <span
-        class="flex flex-col items-center min-w-[3rem] py-1 px-1.5 bg-surface-2 border border-surface-3/50 rounded-lg"
-        :title="`Auswärtssieg: ${match.current_odds['2']?.toFixed(2) ?? '-'}`"
+        class="inline-flex items-baseline gap-1"
+        :aria-label="t('match.awayWinOdds', { odds: displayOdds['2']?.toFixed(2) ?? '-' })"
+        :title="t('match.awayWinOdds', { odds: displayOdds['2']?.toFixed(2) ?? '-' })"
       >
-        <span class="text-[10px] leading-none text-text-muted">2</span>
-        <span class="text-xs font-mono font-semibold tabular-nums text-text-muted mt-0.5">
-          {{ match.current_odds['2']?.toFixed(2) ?? '-' }}
-        </span>
+        <span class="text-[10px] leading-none text-text-secondary" aria-hidden="true">2</span>
+        <span class="text-xs font-mono tabular-nums">{{ displayOdds['2']?.toFixed(2) ?? '-' }}</span>
       </span>
     </div>
 
@@ -234,14 +254,14 @@ function updateAway(e: Event) {
       v-if="pointsEarned !== null && draft"
       class="mt-2 text-xs text-text-muted text-center"
     >
-      Dein Tipp: {{ draft.home }}:{{ draft.away }}
+      {{ t('match.yourPrediction', { home: draft.home, away: draft.away }) }}
     </div>
 
     <!-- Historical context (embedded from API response) -->
     <MatchHistory
       v-if="sportKey"
-      :home-team="match.teams.home"
-      :away-team="match.teams.away"
+      :home-team="match.home_team"
+      :away-team="match.away_team"
       :sport-key="sportKey"
       :context="(match.h2h_context as any) ?? undefined"
     />
@@ -250,8 +270,8 @@ function updateAway(e: Event) {
     <QuoticoTipBadge
       v-if="quoticoTip"
       :tip="quoticoTip"
-      :home-team="match.teams.home"
-      :away-team="match.teams.away"
+      :home-team="match.home_team"
+      :away-team="match.away_team"
     />
   </div>
 </template>

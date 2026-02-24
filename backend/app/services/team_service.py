@@ -1,21 +1,19 @@
 """Team profile service.
 
-Aggregates team data from historical_matches, matches, and team_aliases
-for the team detail page.
+Aggregates team data from the unified ``matches`` collection and
+``team_mappings`` for the team detail page.
 """
 
 import logging
 import re
 
 import app.database as _db
-from app.services.historical_service import (
-    get_canonical_cache,
-    resolve_team_key,
-    sport_keys_for,
+from app.services.historical_service import sport_keys_for
+from app.services.team_mapping_service import (
     team_name_key,
-    _derive_season_year,
-    _season_label,
-    _season_code,
+    derive_season_year,
+    season_code,
+    season_label,
 )
 from app.utils import utcnow
 
@@ -27,46 +25,31 @@ async def search_teams(
     sport_key: str | None = None,
     limit: int = 20,
 ) -> list[dict]:
-    """Search teams by name across team_aliases, deduplicated by team_key."""
+    """Search teams by name across team_mappings."""
     escaped = re.escape(query)
-    filt: dict = {"team_name": {"$regex": escaped, "$options": "i"}}
+    filt: dict = {
+        "$or": [
+            {"display_name": {"$regex": escaped, "$options": "i"}},
+            {"names": {"$regex": escaped, "$options": "i"}},
+        ],
+    }
     if sport_key:
-        filt["sport_key"] = sport_key
+        filt["sport_keys"] = sport_key
 
-    pipeline = [
-        {"$match": filt},
-        {"$sort": {"updated_at": -1}},
+    docs = await _db.db.team_mappings.find(filt).sort(
+        "display_name", 1,
+    ).limit(limit).to_list(length=limit)
+
+    return [
         {
-            "$group": {
-                "_id": "$team_key",
-                "team_name": {"$first": "$team_name"},
-                "sport_keys": {"$addToSet": "$sport_key"},
-                "current_sport_key": {"$first": "$sport_key"},
-            },
-        },
-        {"$sort": {"team_name": 1}},
-        {"$limit": limit},
+            "team_key": team_name_key(doc["display_name"]),
+            "display_name": doc["display_name"],
+            "slug": team_name_key(doc["display_name"]).replace(" ", "-"),
+            "sport_keys": doc.get("sport_keys", []),
+            "current_league": doc.get("sport_keys", [None])[0],
+        }
+        for doc in docs
     ]
-    raw = await _db.db.team_aliases.aggregate(pipeline).to_list(length=limit)
-
-    canonical_cache = get_canonical_cache()
-    results = []
-    for doc in raw:
-        tk = doc["_id"]
-        # Best display name: canonical cache first, then alias name
-        display = doc["team_name"]
-        for _provider, canonical in canonical_cache.items():
-            if team_name_key(canonical) == tk:
-                display = canonical
-                break
-        results.append({
-            "team_key": tk,
-            "display_name": display,
-            "slug": tk.replace(" ", "-"),
-            "sport_keys": doc["sport_keys"],
-            "current_league": doc.get("current_sport_key", doc["sport_keys"][0] if doc["sport_keys"] else None),
-        })
-    return results
 
 
 async def get_team_profile(team_slug: str, sport_key: str | None = None) -> dict | None:
@@ -75,47 +58,41 @@ async def get_team_profile(team_slug: str, sport_key: str | None = None) -> dict
     Slug format: lowercase, hyphens (e.g. "bayern-munich").
     Backend converts hyphens to spaces for team_name_key resolution.
     """
-    # Convert slug to searchable key
     search_key = team_slug.replace("-", " ").strip()
 
-    # Determine sport keys to search across
     if sport_key:
         related_keys = sport_keys_for(sport_key)
     else:
-        # Default to all soccer leagues
         related_keys = sport_keys_for("soccer_germany_bundesliga")
 
-    # Try to resolve via the alias system first
-    team_key = await resolve_team_key(search_key, related_keys)
-    if not team_key:
-        # Fallback: treat slug as a direct team_name_key
-        team_key = team_name_key(search_key)
-        # Verify it exists in the DB
-        exists = await _db.db.team_aliases.find_one(
-            {"sport_key": {"$in": related_keys}, "team_key": team_key},
+    # Try to find a mapping whose team_name_key matches
+    team_key = team_name_key(search_key)
+    display_name = await _get_display_name(team_key)
+
+    if not display_name:
+        # No team mapping found — check if any match uses this key
+        exists = await _db.db.matches.find_one(
+            {
+                "$or": [{"home_team_key": team_key}, {"away_team_key": team_key}],
+            },
+            {"_id": 1},
         )
         if not exists:
             return None
-
-    # Get display name from canonical map or aliases
-    display_name = await _get_display_name(team_key, related_keys)
+        display_name = team_key.title()
 
     # Determine which sport_keys this team appears in
-    team_sport_keys = await _db.db.historical_matches.distinct(
+    team_sport_keys = await _db.db.matches.distinct(
         "sport_key",
-        {"$or": [{"home_team_key": team_key}, {"away_team_key": team_key}]},
+        {
+            "status": "final",
+            "$or": [{"home_team_key": team_key}, {"away_team_key": team_key}],
+        },
     )
 
-    # Get season stats
     season_stats = await get_team_season_stats(team_key, related_keys)
-
-    # Get recent results (last 15)
     recent = await _get_recent_results(team_key, related_keys, limit=15)
-
-    # Compute form from recent results
     form = _compute_form(recent, team_key)
-
-    # Get upcoming matches
     upcoming = await get_team_upcoming_matches(team_key, related_keys)
 
     return {
@@ -129,42 +106,35 @@ async def get_team_profile(team_slug: str, sport_key: str | None = None) -> dict
     }
 
 
-async def _get_display_name(team_key: str, related_keys: list[str]) -> str:
-    """Find the best display name for a team_key."""
-    # Check canonical map first (most readable names)
-    canonical_cache = get_canonical_cache()
-    # Reverse lookup: find canonical name whose team_name_key matches
-    for _provider, canonical in canonical_cache.items():
-        if team_name_key(canonical) == team_key:
-            return canonical
+async def _get_display_name(team_key: str) -> str | None:
+    """Find the best display name for a team_key from team_mappings."""
+    # Fetch all mappings and find the one whose display_name normalizes to team_key
+    docs = await _db.db.team_mappings.find(
+        {}, {"display_name": 1},
+    ).to_list(length=5000)
 
-    # Fallback: use the most recent team_name from aliases
-    alias = await _db.db.team_aliases.find_one(
-        {"sport_key": {"$in": related_keys}, "team_key": team_key},
-        {"team_name": 1},
-        sort=[("updated_at", -1)],
-    )
-    if alias:
-        return alias["team_name"]
+    for doc in docs:
+        if team_name_key(doc["display_name"]) == team_key:
+            return doc["display_name"]
 
-    # Last resort: capitalize the key
-    return team_key.title()
+    return None
 
 
 async def _get_recent_results(
     team_key: str, related_keys: list[str], limit: int = 15,
 ) -> list[dict]:
-    """Fetch recent historical matches for a team."""
+    """Fetch recent finalized matches for a team."""
     proj = {
         "_id": 0,
         "match_date": 1, "home_team": 1, "away_team": 1,
         "home_team_key": 1, "away_team_key": 1,
-        "home_goals": 1, "away_goals": 1, "result": 1,
+        "result.home_score": 1, "result.away_score": 1, "result.outcome": 1,
         "season_label": 1, "sport_key": 1,
     }
-    return await _db.db.historical_matches.find(
+    return await _db.db.matches.find(
         {
             "sport_key": {"$in": related_keys},
+            "status": "final",
             "$or": [
                 {"home_team_key": team_key},
                 {"away_team_key": team_key},
@@ -178,8 +148,9 @@ def _compute_form(matches: list[dict], team_key: str) -> list[str]:
     """Derive W/D/L form string from recent results."""
     form: list[str] = []
     for m in matches:
-        hg = m.get("home_goals", 0)
-        ag = m.get("away_goals", 0)
+        r = m.get("result", {})
+        hg = r.get("home_score", 0) or 0
+        ag = r.get("away_score", 0) or 0
         is_home = m.get("home_team_key") == team_key
 
         if hg == ag:
@@ -194,23 +165,25 @@ def _compute_form(matches: list[dict], team_key: str) -> list[str]:
 async def get_team_season_stats(
     team_key: str, related_keys: list[str],
 ) -> dict | None:
-    """Aggregate season stats from historical_matches for the current season."""
+    """Aggregate season stats from finalized matches for the current season."""
     now = utcnow()
-    season_year = _derive_season_year(now)
-    season = _season_code(season_year)
+    sy = derive_season_year(now)
+    sc = season_code(sy)
 
-    matches = await _db.db.historical_matches.find(
+    matches = await _db.db.matches.find(
         {
             "sport_key": {"$in": related_keys},
-            "season": season,
+            "status": "final",
+            "season": sc,
             "$or": [
                 {"home_team_key": team_key},
                 {"away_team_key": team_key},
             ],
         },
         {
-            "_id": 0, "home_team_key": 1, "home_goals": 1,
-            "away_goals": 1, "sport_key": 1,
+            "_id": 0, "home_team_key": 1,
+            "result.home_score": 1, "result.away_score": 1,
+            "sport_key": 1,
         },
     ).to_list(length=500)
 
@@ -222,8 +195,9 @@ async def get_team_season_stats(
     away_w = away_d = away_l = 0
 
     for m in matches:
-        hg = m["home_goals"]
-        ag = m["away_goals"]
+        r = m.get("result", {})
+        hg = r.get("home_score", 0) or 0
+        ag = r.get("away_score", 0) or 0
         is_home = m["home_team_key"] == team_key
 
         if is_home:
@@ -246,7 +220,7 @@ async def get_team_season_stats(
                 losses += 1; away_l += 1
 
     return {
-        "season_label": _season_label(season_year),
+        "season_label": season_label(sy),
         "matches_played": len(matches),
         "wins": wins,
         "draws": draws,
@@ -265,41 +239,30 @@ async def get_team_upcoming_matches(
 ) -> list[dict]:
     """Find upcoming matches where this team is playing.
 
-    Reverse-lookups team_key → known display names from team_aliases,
-    then searches the matches collection by those names.
+    Uses home_team_key/away_team_key directly — no alias lookup needed.
     """
-    # Get all known display names for this team
-    aliases = await _db.db.team_aliases.find(
-        {"sport_key": {"$in": related_keys}, "team_key": team_key},
-        {"team_name": 1, "_id": 0},
-    ).to_list(length=50)
-
-    team_names = list({a["team_name"] for a in aliases})
-    if not team_names:
-        return []
-
-    # Search matches by display names
     matches = await _db.db.matches.find(
         {
-            "status": "upcoming",
+            "status": "scheduled",
             "$or": [
-                {"teams.home": {"$in": team_names}},
-                {"teams.away": {"$in": team_names}},
+                {"home_team_key": team_key},
+                {"away_team_key": team_key},
             ],
         },
         {
-            "_id": 1, "sport_key": 1, "teams": 1,
-            "commence_time": 1, "current_odds": 1, "status": 1,
+            "_id": 1, "sport_key": 1, "home_team": 1, "away_team": 1,
+            "match_date": 1, "odds": 1, "status": 1,
         },
-    ).sort("commence_time", 1).to_list(length=limit)
+    ).sort("match_date", 1).to_list(length=limit)
 
     return [
         {
             "id": str(m["_id"]),
             "sport_key": m["sport_key"],
-            "teams": m["teams"],
-            "commence_time": m["commence_time"],
-            "current_odds": m.get("current_odds", {}),
+            "home_team": m["home_team"],
+            "away_team": m["away_team"],
+            "match_date": m["match_date"],
+            "odds": m.get("odds", {}),
             "status": m["status"],
         }
         for m in matches

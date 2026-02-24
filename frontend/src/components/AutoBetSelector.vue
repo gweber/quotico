@@ -1,37 +1,40 @@
 <script setup lang="ts">
-import { useSpieltagStore } from "@/stores/spieltag";
+import { computed } from "vue";
+import { useI18n } from "vue-i18n";
+import { useMatchdayStore } from "@/stores/matchday";
 
-const spieltag = useSpieltagStore();
+const { t } = useI18n();
+const matchday = useMatchdayStore();
 
-const options = [
+const options = computed(() => [
   {
     value: "none",
-    label: "Kein Auto-Tipp",
-    desc: "Nur manuell getippte Spiele werden gewertet.",
+    label: t("matchday.autoBetNone"),
+    desc: t("matchday.autoBetNoneDesc"),
   },
   {
     value: "q_bot",
-    label: "Q-Bot",
-    desc: "Folgt der QuoticoTip-Empfehlung. Ohne Empfehlung: Quoten-Favorit. Ohne Quoten: 1:1.",
+    label: t("matchday.autoBetQBot"),
+    desc: t("matchday.autoBetQBotDesc"),
   },
   {
     value: "favorite",
-    label: "Quoten-Favorit",
-    desc: "Nicht getippte Spiele werden auf den Quoten-Favoriten gesetzt. Ohne Quoten: 1:1.",
+    label: t("matchday.autoBetFavorite"),
+    desc: t("matchday.autoBetFavoriteDesc"),
   },
   {
     value: "draw",
-    label: "1:1 (Unentschieden)",
-    desc: "Nicht getippte Spiele werden automatisch mit 1:1 getippt.",
+    label: t("matchday.autoBetDraw"),
+    desc: t("matchday.autoBetDrawDesc"),
   },
-];
+]);
 </script>
 
 <template>
   <div class="bg-surface-1 rounded-card p-4 border border-surface-3/50">
-    <h3 id="auto-tipp-label" class="text-sm font-semibold text-text-primary mb-2">Auto-Tipp</h3>
+    <h3 id="auto-tipp-label" class="text-sm font-semibold text-text-primary mb-2">{{ $t('matchday.autoBetTitle') }}</h3>
     <p class="text-xs text-text-muted mb-3">
-      Wird für nicht getippte Spiele nach Abschluss des Spieltags angewendet.
+      {{ $t('matchday.autoBetApplied') }}
     </p>
     <div role="radiogroup" aria-labelledby="auto-tipp-label" class="space-y-2">
       <label
@@ -40,7 +43,7 @@ const options = [
         :for="`auto-tipp-${opt.value}`"
         class="flex items-start gap-3 p-3 rounded-lg cursor-pointer transition-all border border-transparent"
         :class="
-          spieltag.draftAutoStrategy === opt.value
+          matchday.draftAutoStrategy === opt.value
             ? 'bg-primary-muted/10 border-primary/20'
             : 'hover:bg-surface-2'
         "
@@ -50,9 +53,9 @@ const options = [
           type="radio"
           name="auto-tipp"
           :value="opt.value"
-          :checked="spieltag.draftAutoStrategy === opt.value"
+          :checked="matchday.draftAutoStrategy === opt.value"
           class="mt-1 h-4 w-4 accent-primary"
-          @change="spieltag.draftAutoStrategy = opt.value"
+          @change="matchday.draftAutoStrategy = opt.value"
         />
         <div class="select-none">
           <span class="text-sm font-medium text-text-primary">{{ opt.label }}</span>

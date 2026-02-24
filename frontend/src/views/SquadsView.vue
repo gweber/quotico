@@ -1,13 +1,16 @@
 <script setup lang="ts">
 import { ref, watch, onMounted } from "vue";
 import { useRouter } from "vue-router";
+import { useI18n } from "vue-i18n";
 import { useSquadsStore } from "@/stores/squads";
 import { useToast } from "@/composables/useToast";
 
+const { t } = useI18n();
 const router = useRouter();
 const squads = useSquadsStore();
 const toast = useToast();
 
+const error = ref(false);
 const showCreateModal = ref(false);
 const showJoinModal = ref(false);
 const createName = ref("");
@@ -28,10 +31,16 @@ watch(searchQuery, (q) => {
   }, 300);
 });
 
-onMounted(() => {
-  squads.fetchMySquads();
-  squads.fetchPublicSquads();
-});
+async function reload() {
+  error.value = false;
+  try {
+    await Promise.all([squads.fetchMySquads(), squads.fetchPublicSquads()]);
+  } catch {
+    error.value = true;
+  }
+}
+
+onMounted(() => reload());
 
 async function handleCreate() {
   if (!createName.value.trim()) return;
@@ -43,7 +52,7 @@ async function handleCreate() {
     createDesc.value = "";
     router.push(`/squads/${squad.id}`);
   } catch (e: any) {
-    toast.error(e.message || "Squad konnte nicht erstellt werden.");
+    toast.error(e.message || t('squads.createError'));
   } finally {
     submitting.value = false;
   }
@@ -58,7 +67,7 @@ async function handleJoin() {
     joinCode.value = "";
     router.push(`/squads/${squad.id}`);
   } catch (e: any) {
-    toast.error(e.message || "Ungültiger Einladungscode.");
+    toast.error(e.message || t('squads.invalidCode'));
   } finally {
     submitting.value = false;
   }
@@ -70,7 +79,7 @@ async function handleRequestJoin(squadId: string) {
     await squads.requestJoin(squadId);
     requestedSquadIds.value.add(squadId);
   } catch (e: any) {
-    toast.error(e.message || "Anfrage fehlgeschlagen.");
+    toast.error(e.message || t('squads.requestFailed'));
   } finally {
     requestingId.value = null;
   }
@@ -80,19 +89,19 @@ async function handleRequestJoin(squadId: string) {
 <template>
   <div class="max-w-2xl mx-auto p-4">
     <div class="flex items-center justify-between mb-6">
-      <h1 class="text-xl font-bold text-text-primary">Meine Squads</h1>
+      <h1 class="text-xl font-bold text-text-primary">{{ $t('squads.mySquads') }}</h1>
       <div class="flex gap-2">
         <button
           class="px-4 py-2 text-sm rounded-lg bg-surface-2 text-text-primary hover:bg-surface-3 transition-colors"
           @click="showJoinModal = true"
         >
-          Beitreten
+          {{ $t('squads.join') }}
         </button>
         <button
           class="px-4 py-2 text-sm rounded-lg bg-primary text-surface-0 hover:bg-primary-hover transition-colors"
           @click="showCreateModal = true"
         >
-          Erstellen
+          {{ $t('squads.create') }}
         </button>
       </div>
     </div>
@@ -102,25 +111,31 @@ async function handleRequestJoin(squadId: string) {
       <div v-for="n in 3" :key="n" class="bg-surface-1 rounded-card h-24 animate-pulse" />
     </div>
 
+    <!-- Error -->
+    <div v-else-if="error" class="text-center py-12">
+      <p class="text-text-muted mb-3">{{ $t('common.loadError') }}</p>
+      <button class="text-sm text-primary hover:underline" @click="reload">{{ $t('common.retry') }}</button>
+    </div>
+
     <!-- Empty -->
     <div v-else-if="squads.squads.length === 0" class="text-center py-16">
       <p class="text-4xl mb-4" aria-hidden="true">&#x1F465;</p>
-      <h2 class="text-lg font-semibold text-text-primary mb-2">Noch kein Squad</h2>
+      <h2 class="text-lg font-semibold text-text-primary mb-2">{{ $t('squads.noSquads') }}</h2>
       <p class="text-sm text-text-secondary mb-6">
-        Erstelle einen Squad oder tritt einem bei, um gemeinsam zu tippen.
+        {{ $t('squads.noSquadsDescription') }}
       </p>
       <div class="flex gap-3 justify-center">
         <button
           class="px-4 py-2 text-sm rounded-lg bg-surface-2 text-text-primary hover:bg-surface-3 transition-colors"
           @click="showJoinModal = true"
         >
-          Code eingeben
+          {{ $t('squads.enterCode') }}
         </button>
         <button
           class="px-4 py-2 text-sm rounded-lg bg-primary text-surface-0 hover:bg-primary-hover transition-colors"
           @click="showCreateModal = true"
         >
-          Squad erstellen
+          {{ $t('squads.createSquad') }}
         </button>
       </div>
     </div>
@@ -139,11 +154,11 @@ async function handleRequestJoin(squadId: string) {
             <p v-if="squad.description" class="text-xs text-text-muted mt-0.5">{{ squad.description }}</p>
           </div>
           <div class="text-right shrink-0">
-            <span class="text-xs text-text-muted">{{ squad.member_count }} Mitglieder</span>
+            <span class="text-xs text-text-muted">{{ squad.member_count }} {{ $t('squads.members') }}</span>
             <span
               v-if="squad.is_admin"
               class="block text-xs text-primary font-medium"
-            >Admin</span>
+            >{{ $t('squads.admin') }}</span>
           </div>
         </div>
       </RouterLink>
@@ -151,7 +166,7 @@ async function handleRequestJoin(squadId: string) {
 
     <!-- Public Squads -->
     <div class="mt-10">
-      <h2 class="text-lg font-bold text-text-primary mb-4">Squads entdecken</h2>
+      <h2 class="text-lg font-bold text-text-primary mb-4">{{ $t('squads.discover') }}</h2>
 
       <!-- Search -->
       <input
@@ -176,7 +191,7 @@ async function handleRequestJoin(squadId: string) {
           <div class="min-w-0 flex-1">
             <h3 class="text-sm font-semibold text-text-primary">{{ ps.name }}</h3>
             <p v-if="ps.description" class="text-xs text-text-muted mt-0.5 truncate">{{ ps.description }}</p>
-            <span class="text-xs text-text-muted">{{ ps.member_count }} Mitglieder</span>
+            <span class="text-xs text-text-muted">{{ ps.member_count }} {{ $t('squads.members') }}</span>
           </div>
           <div class="shrink-0 ml-4">
             <button
@@ -206,7 +221,7 @@ async function handleRequestJoin(squadId: string) {
       <!-- Empty -->
       <div v-else class="text-center py-8">
         <p class="text-sm text-text-muted">
-          {{ searchQuery.trim() ? "Keine Squads gefunden." : "Keine öffentlichen Squads verfügbar." }}
+          {{ searchQuery.trim() ? $t('squads.noResults') : $t('squads.noPublic') }}
         </p>
       </div>
     </div>
@@ -220,10 +235,10 @@ async function handleRequestJoin(squadId: string) {
           @click.self="showCreateModal = false"
         >
           <div class="bg-surface-1 rounded-card p-6 w-full max-w-sm border border-surface-3">
-            <h2 class="text-lg font-semibold text-text-primary mb-4">Squad erstellen</h2>
+            <h2 class="text-lg font-semibold text-text-primary mb-4">{{ $t('squads.createSquad') }}</h2>
             <form @submit.prevent="handleCreate" class="space-y-4">
               <div>
-                <label class="block text-sm text-text-secondary mb-1">Name</label>
+                <label class="block text-sm text-text-secondary mb-1">{{ $t('squads.name') }}</label>
                 <input
                   v-model="createName"
                   type="text"
@@ -234,7 +249,7 @@ async function handleRequestJoin(squadId: string) {
                 />
               </div>
               <div>
-                <label class="block text-sm text-text-secondary mb-1">Beschreibung (optional)</label>
+                <label class="block text-sm text-text-secondary mb-1">{{ $t('squads.descriptionOptional') }}</label>
                 <input
                   v-model="createDesc"
                   type="text"
@@ -248,12 +263,12 @@ async function handleRequestJoin(squadId: string) {
                   type="button"
                   class="px-4 py-2 text-sm rounded-lg text-text-secondary hover:bg-surface-2 transition-colors"
                   @click="showCreateModal = false"
-                >Abbrechen</button>
+                >{{ $t('common.cancel') }}</button>
                 <button
                   type="submit"
                   :disabled="submitting || !createName.trim()"
                   class="px-4 py-2 text-sm rounded-lg bg-primary text-surface-0 hover:bg-primary-hover transition-colors disabled:opacity-50"
-                >{{ submitting ? "..." : "Erstellen" }}</button>
+                >{{ submitting ? "..." : $t('squads.create') }}</button>
               </div>
             </form>
           </div>
@@ -270,10 +285,10 @@ async function handleRequestJoin(squadId: string) {
           @click.self="showJoinModal = false"
         >
           <div class="bg-surface-1 rounded-card p-6 w-full max-w-sm border border-surface-3">
-            <h2 class="text-lg font-semibold text-text-primary mb-4">Squad beitreten</h2>
+            <h2 class="text-lg font-semibold text-text-primary mb-4">{{ $t('squads.joinSquad') }}</h2>
             <form @submit.prevent="handleJoin" class="space-y-4">
               <div>
-                <label class="block text-sm text-text-secondary mb-1">Einladungscode</label>
+                <label class="block text-sm text-text-secondary mb-1">{{ $t('squads.inviteCode') }}</label>
                 <input
                   v-model="joinCode"
                   type="text"
@@ -287,12 +302,12 @@ async function handleRequestJoin(squadId: string) {
                   type="button"
                   class="px-4 py-2 text-sm rounded-lg text-text-secondary hover:bg-surface-2 transition-colors"
                   @click="showJoinModal = false"
-                >Abbrechen</button>
+                >{{ $t('common.cancel') }}</button>
                 <button
                   type="submit"
                   :disabled="submitting || !joinCode.trim()"
                   class="px-4 py-2 text-sm rounded-lg bg-primary text-surface-0 hover:bg-primary-hover transition-colors disabled:opacity-50"
-                >{{ submitting ? "..." : "Beitreten" }}</button>
+                >{{ submitting ? "..." : $t('squads.join') }}</button>
               </div>
             </form>
           </div>

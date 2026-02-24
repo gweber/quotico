@@ -11,10 +11,10 @@ const props = defineProps<{
 }>();
 
 const homeScore = computed(
-  () => props.liveScore?.home_score ?? props.match.home_score ?? 0
+  () => props.liveScore?.home_score ?? (props.match.result as any)?.home_score ?? 0
 );
 const awayScore = computed(
-  () => props.liveScore?.away_score ?? props.match.away_score ?? 0
+  () => props.liveScore?.away_score ?? (props.match.result as any)?.away_score ?? 0
 );
 const liveMinute = computed(() => props.liveScore?.minute);
 
@@ -57,7 +57,7 @@ const phaseClass = computed(() => {
     <div class="flex items-center justify-center gap-4">
       <div class="flex-1 text-right">
         <p class="font-semibold text-text-primary text-sm truncate">
-          {{ match.teams.home }}
+          {{ match.home_team }}
         </p>
       </div>
 
@@ -79,7 +79,7 @@ const phaseClass = computed(() => {
 
       <div class="flex-1 text-left">
         <p class="font-semibold text-text-primary text-sm truncate">
-          {{ match.teams.away }}
+          {{ match.away_team }}
         </p>
       </div>
     </div>

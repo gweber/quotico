@@ -1,6 +1,7 @@
 <script setup lang="ts">
-import { ref, watch } from "vue";
+import { ref, watch, computed } from "vue";
 import { useRoute, useRouter } from "vue-router";
+import { useI18n } from "vue-i18n";
 import { useApi } from "@/composables/useApi";
 
 interface LegalDoc {
@@ -12,16 +13,17 @@ interface LegalDoc {
   updated_at: string;
 }
 
+const { t } = useI18n();
 const route = useRoute();
 const router = useRouter();
 const api = useApi();
 
-const tabs = [
-  { key: "imprint", slug: "impressum", label: "Impressum" },
-  { key: "privacy", slug: "datenschutz", label: "Datenschutz" },
-  { key: "terms", slug: "agb", label: "AGB" },
-  { key: "youth-protection", slug: "jugendschutz", label: "Jugendschutz" },
-];
+const tabs = computed(() => [
+  { key: "imprint", slug: "impressum", label: t('legal.impressum') },
+  { key: "privacy", slug: "datenschutz", label: t('legal.datenschutz') },
+  { key: "terms", slug: "agb", label: t('legal.agb') },
+  { key: "youth-protection", slug: "jugendschutz", label: t('legal.jugendschutz') },
+]);
 
 const slugToKey: Record<string, string> = {
   impressum: "imprint",
@@ -62,7 +64,7 @@ watch(
 
 <template>
   <main id="main-content" class="max-w-3xl mx-auto px-4 py-8">
-    <h1 class="text-2xl font-bold text-text-primary mb-6">Rechtliches</h1>
+    <h1 class="text-2xl font-bold text-text-primary mb-6">{{ $t('legal.heading') }}</h1>
 
     <!-- Tab navigation -->
     <nav
@@ -101,7 +103,7 @@ watch(
       <div v-html="doc.content_html" />
     </article>
 
-    <div v-else class="text-text-muted text-sm">Dokument nicht gefunden.</div>
+    <div v-else class="text-text-muted text-sm">{{ $t('legal.notFound') }}</div>
   </main>
 </template>
 

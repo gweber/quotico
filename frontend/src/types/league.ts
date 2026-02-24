@@ -14,11 +14,12 @@ export interface LeagueConfig {
   deactivated_at: string | null;
 }
 
-export const GAME_MODE_LABELS: Record<GameModeType, string> = {
-  classic: "Tippspiel",
-  bankroll: "Bankroll",
-  survivor: "Survivor",
-  over_under: "Über/Unter",
-  fantasy: "Fantasy",
-  moneyline: "Quotentipp",
+/** i18n key mapping for game mode labels — resolve with t() at call sites */
+export const GAME_MODE_I18N_KEYS: Record<GameModeType, string> = {
+  classic: "gameModes.classic",
+  bankroll: "gameModes.bankroll",
+  survivor: "gameModes.survivor",
+  over_under: "gameModes.overUnder",
+  fantasy: "gameModes.fantasy",
+  moneyline: "gameModes.moneyline",
 };

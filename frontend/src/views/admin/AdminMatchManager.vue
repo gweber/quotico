@@ -8,20 +8,19 @@ const toast = useToast();
 
 interface AdminMatch {
   id: string;
-  external_id: string;
   sport_key: string;
-  teams: { home: string; away: string };
-  commence_time: string;
+  home_team: string;
+  away_team: string;
+  match_date: string;
   status: string;
-  result: string | null;
-  home_score: number | null;
-  away_score: number | null;
-  current_odds: Record<string, number>;
-  tip_count: number;
+  odds: { h2h: Record<string, number>; totals?: Record<string, unknown>; spreads?: Record<string, unknown>; updated_at?: string | null };
+  result: { home_score: number | null; away_score: number | null; outcome: string | null };
+  bet_count: number;
 }
 
 const matches = ref<AdminMatch[]>([]);
 const loading = ref(true);
+const error = ref(false);
 const statusFilter = ref("");
 
 // Override modal
@@ -32,10 +31,13 @@ const overrideAway = ref(0);
 
 async function fetchMatches() {
   loading.value = true;
+  error.value = false;
   try {
     const params: Record<string, string> = {};
     if (statusFilter.value) params.status = statusFilter.value;
     matches.value = await api.get<AdminMatch[]>("/admin/matches", params);
+  } catch {
+    error.value = true;
   } finally {
     loading.value = false;
   }
@@ -43,9 +45,9 @@ async function fetchMatches() {
 
 function openOverride(match: AdminMatch) {
   overrideMatch.value = match;
-  overrideResult.value = match.result || "1";
-  overrideHome.value = match.home_score ?? 0;
-  overrideAway.value = match.away_score ?? 0;
+  overrideResult.value = match.result.outcome || "1";
+  overrideHome.value = match.result.home_score ?? 0;
+  overrideAway.value = match.result.away_score ?? 0;
 }
 
 async function submitOverride() {
@@ -87,18 +89,24 @@ onMounted(fetchMatches);
     <!-- Filters -->
     <div class="flex gap-2 mb-4">
       <button
-        v-for="s in ['', 'upcoming', 'live', 'completed']"
+        v-for="s in ['', 'scheduled', 'live', 'final']"
         :key="s"
         class="px-3 py-1.5 text-xs rounded-lg transition-colors"
         :class="statusFilter === s ? 'bg-primary text-surface-0' : 'bg-surface-2 text-text-secondary hover:bg-surface-3'"
         @click="statusFilter = s; fetchMatches()"
       >
-        {{ s === '' ? 'Alle' : s === 'upcoming' ? 'Geplant' : s === 'live' ? 'Live' : 'Beendet' }}
+        {{ s === '' ? 'Alle' : s === 'scheduled' ? 'Geplant' : s === 'live' ? 'Live' : 'Beendet' }}
       </button>
     </div>
 
+    <!-- Error -->
+    <div v-if="error" class="text-center py-12">
+      <p class="text-text-muted mb-3">Error loading.</p>
+      <button class="text-sm text-primary hover:underline" @click="fetchMatches">Try again</button>
+    </div>
+
     <!-- Table -->
-    <div class="bg-surface-1 rounded-card border border-surface-3/50 overflow-x-auto">
+    <div v-else class="bg-surface-1 rounded-card border border-surface-3/50 overflow-x-auto">
       <table class="w-full text-sm">
         <thead>
           <tr class="text-xs text-text-muted border-b border-surface-3">
@@ -121,33 +129,33 @@ onMounted(fetchMatches);
             class="border-b border-surface-3/20 last:border-0"
           >
             <td class="px-4 py-3">
-              <span class="text-text-primary">{{ m.teams.home }}</span>
+              <span class="text-text-primary">{{ m.home_team }}</span>
               <span class="text-text-muted"> vs </span>
-              <span class="text-text-primary">{{ m.teams.away }}</span>
+              <span class="text-text-primary">{{ m.away_team }}</span>
             </td>
             <td class="px-4 py-3 text-text-muted text-xs">{{ sportLabel(m.sport_key) }}</td>
-            <td class="px-4 py-3 text-text-muted text-xs">{{ formatDate(m.commence_time) }}</td>
+            <td class="px-4 py-3 text-text-muted text-xs">{{ formatDate(m.match_date) }}</td>
             <td class="px-4 py-3 text-center">
               <span
                 class="text-xs px-2 py-0.5 rounded-full font-medium"
                 :class="{
-                  'bg-primary-muted/20 text-primary': m.status === 'upcoming',
+                  'bg-primary-muted/20 text-primary': m.status === 'scheduled',
                   'bg-danger-muted/20 text-danger': m.status === 'live',
-                  'bg-surface-3 text-text-muted': m.status === 'completed',
+                  'bg-surface-3 text-text-muted': m.status === 'final',
                 }"
               >{{ m.status }}</span>
             </td>
             <td class="px-4 py-3 text-center font-mono tabular-nums text-text-primary">
-              <template v-if="m.home_score != null">{{ m.home_score }}-{{ m.away_score }}</template>
+              <template v-if="m.result.home_score != null">{{ m.result.home_score }}-{{ m.result.away_score }}</template>
               <span v-else class="text-text-muted">-</span>
             </td>
-            <td class="px-4 py-3 text-right tabular-nums text-text-muted">{{ m.tip_count }}</td>
+            <td class="px-4 py-3 text-right tabular-nums text-text-muted">{{ m.bet_count }}</td>
             <td class="px-4 py-3 text-right">
               <button
                 class="text-xs px-2 py-1 rounded bg-surface-2 hover:bg-surface-3 text-text-secondary transition-colors"
                 @click="openOverride(m)"
               >
-                {{ m.status === 'completed' ? 'Override' : 'Force Settle' }}
+                {{ m.status === 'final' ? 'Override' : 'Force Settle' }}
               </button>
             </td>
           </tr>
@@ -166,7 +174,7 @@ onMounted(fetchMatches);
           <div class="bg-surface-1 rounded-card p-6 w-full max-w-sm border border-surface-3">
             <h2 class="text-lg font-semibold text-text-primary mb-1">Ergebnis setzen</h2>
             <p class="text-xs text-text-muted mb-4">
-              {{ overrideMatch.teams.home }} vs {{ overrideMatch.teams.away }}
+              {{ overrideMatch.home_team }} vs {{ overrideMatch.away_team }}
             </p>
             <form @submit.prevent="submitOverride" class="space-y-4">
               <div>
@@ -175,14 +183,14 @@ onMounted(fetchMatches);
                   v-model="overrideResult"
                   class="w-full px-3 py-2 rounded-lg bg-surface-2 border border-surface-3 text-text-primary text-sm focus:ring-2 focus:ring-primary focus:outline-none"
                 >
-                  <option value="1">1 &mdash; {{ overrideMatch.teams.home }} gewinnt</option>
-                  <option v-if="overrideMatch.current_odds['X'] !== undefined" value="X">X &mdash; Unentschieden</option>
-                  <option value="2">2 &mdash; {{ overrideMatch.teams.away }} gewinnt</option>
+                  <option value="1">1 &mdash; {{ overrideMatch.home_team }} gewinnt</option>
+                  <option v-if="overrideMatch.odds.h2h['X'] !== undefined" value="X">X &mdash; Unentschieden</option>
+                  <option value="2">2 &mdash; {{ overrideMatch.away_team }} gewinnt</option>
                 </select>
               </div>
               <div class="grid grid-cols-2 gap-3">
                 <div>
-                  <label class="block text-sm text-text-secondary mb-1">{{ overrideMatch.teams.home }}</label>
+                  <label class="block text-sm text-text-secondary mb-1">{{ overrideMatch.home_team }}</label>
                   <input
                     v-model.number="overrideHome"
                     type="number"
@@ -191,7 +199,7 @@ onMounted(fetchMatches);
                   />
                 </div>
                 <div>
-                  <label class="block text-sm text-text-secondary mb-1">{{ overrideMatch.teams.away }}</label>
+                  <label class="block text-sm text-text-secondary mb-1">{{ overrideMatch.away_team }}</label>
                   <input
                     v-model.number="overrideAway"
                     type="number"

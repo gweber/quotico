@@ -1,11 +1,13 @@
 <script setup lang="ts">
 import { ref, onMounted } from "vue";
 import { useRoute, useRouter } from "vue-router";
+import { useI18n } from "vue-i18n";
 import { useAuthStore } from "@/stores/auth";
 import { useSquadsStore } from "@/stores/squads";
 import { useApi } from "@/composables/useApi";
 import { useToast } from "@/composables/useToast";
 
+const { t } = useI18n();
 const route = useRoute();
 const router = useRouter();
 const auth = useAuthStore();
@@ -33,7 +35,7 @@ onMounted(async () => {
   try {
     preview.value = await api.get(`/squads/preview/${code}`);
   } catch {
-    error.value = "Dieser Einladungslink ist ungültig oder abgelaufen.";
+    error.value = t('joinSquad.invalidLink');
   } finally {
     loading.value = false;
   }
@@ -52,11 +54,11 @@ async function handleJoin() {
     localStorage.removeItem("pendingInvite");
     router.push(`/squads/${squad.id}`);
   } catch (e: unknown) {
-    const msg = e instanceof Error ? e.message : "Beitritt fehlgeschlagen.";
+    const msg = e instanceof Error ? e.message : t('joinSquad.joinFailed');
     if (msg.includes("bereits Mitglied")) {
       // Already a member — redirect to squad list
       localStorage.removeItem("pendingInvite");
-      toast.success("Du bist bereits Mitglied dieses Squads.");
+      toast.success(t('joinSquad.alreadyMember'));
       await squads.fetchMySquads();
       const existing = squads.squads.find(
         (s) => s.invite_code === code
@@ -94,26 +96,26 @@ const registerUrl = `/register?redirect=/join/${code}`;
         <RouterLink
           to="/"
           class="inline-block text-sm text-primary hover:underline"
-        >Zur Startseite</RouterLink>
+        >{{ $t('joinSquad.backHome') }}</RouterLink>
       </div>
 
       <!-- Squad Preview -->
       <div v-else-if="preview" class="bg-surface-1 rounded-card p-6 border border-surface-3/50 space-y-5">
         <div class="text-center space-y-2">
-          <p class="text-xs text-text-muted uppercase tracking-wider">Einladung</p>
+          <p class="text-xs text-text-muted uppercase tracking-wider">{{ $t('joinSquad.invitation') }}</p>
           <h1 class="text-xl font-bold text-text-primary">{{ preview.name }}</h1>
           <p v-if="preview.description" class="text-sm text-text-muted">
             {{ preview.description }}
           </p>
           <p class="text-xs text-text-muted">
-            {{ preview.member_count }} Mitglieder
+            {{ preview.member_count }} {{ $t('squads.members') }}
           </p>
         </div>
 
         <!-- Already logged in: show join button -->
         <template v-if="auth.isLoggedIn">
           <div v-if="preview.is_full" class="text-center">
-            <p class="text-sm text-text-muted">Dieser Squad ist voll (max. 50 Mitglieder).</p>
+            <p class="text-sm text-text-muted">{{ $t('joinSquad.squadFull') }}</p>
           </div>
           <div v-else-if="error" class="text-center space-y-3">
             <p class="text-sm text-danger">{{ error }}</p>
@@ -124,7 +126,7 @@ const registerUrl = `/register?redirect=/join/${code}`;
               :disabled="joining"
               @click="handleJoin"
             >
-              {{ joining ? "Beitritt..." : "Squad beitreten" }}
+              {{ joining ? $t('joinSquad.joining') : $t('joinSquad.joinButton') }}
             </button>
           </div>
         </template>
@@ -132,20 +134,20 @@ const registerUrl = `/register?redirect=/join/${code}`;
         <!-- Not logged in: show auth options -->
         <template v-else>
           <div v-if="preview.is_full" class="text-center">
-            <p class="text-sm text-text-muted">Dieser Squad ist voll (max. 50 Mitglieder).</p>
+            <p class="text-sm text-text-muted">{{ $t('joinSquad.squadFull') }}</p>
           </div>
           <div v-else class="space-y-3">
             <RouterLink
               :to="registerUrl"
               class="block w-full py-3 rounded-lg bg-primary text-surface-0 font-semibold text-center hover:bg-primary/90 transition-colors"
             >
-              Registrieren und beitreten
+              {{ $t('joinSquad.registerAndJoin') }}
             </RouterLink>
             <RouterLink
               :to="loginUrl"
               class="block w-full py-3 rounded-lg bg-surface-2 text-text-primary font-medium text-center hover:bg-surface-3 transition-colors border border-surface-3"
             >
-              Anmelden und beitreten
+              {{ $t('joinSquad.loginAndJoin') }}
             </RouterLink>
           </div>
         </template>

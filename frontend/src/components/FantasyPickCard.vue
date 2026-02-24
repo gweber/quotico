@@ -1,11 +1,11 @@
 <script setup lang="ts">
 import { ref, computed } from "vue";
-import type { SpieltagMatch } from "@/stores/spieltag";
+import type { MatchdayMatch } from "@/stores/matchday";
 import { useFantasyStore } from "@/stores/fantasy";
 import { useToast } from "@/composables/useToast";
 
 const props = defineProps<{
-  match: SpieltagMatch;
+  match: MatchdayMatch;
   squadId: string;
 }>();
 
@@ -20,7 +20,7 @@ const existingPick = computed(() => {
 });
 
 const kickoffLabel = computed(() => {
-  const d = new Date(props.match.commence_time);
+  const d = new Date(props.match.match_date);
   return d.toLocaleString("de-DE", {
     weekday: "short",
     day: "2-digit",
@@ -60,9 +60,9 @@ async function pickTeam(team: string) {
     </div>
 
     <!-- Score if completed -->
-    <div v-if="match.home_score !== null" class="text-center mb-2">
+    <div v-if="(match.result as any)?.home_score != null" class="text-center mb-2">
       <span class="text-lg font-bold text-text-primary">
-        {{ match.home_score }} : {{ match.away_score }}
+        {{ (match.result as any)?.home_score }} : {{ (match.result as any)?.away_score }}
       </span>
     </div>
 
@@ -71,26 +71,26 @@ async function pickTeam(team: string) {
       <button
         class="py-3 rounded-lg text-sm font-medium transition-colors border"
         :class="
-          existingPick?.team === match.teams.home
+          existingPick?.team === match.home_team
             ? 'bg-primary text-surface-0 border-primary'
             : 'bg-surface-2 text-text-primary border-surface-3 hover:border-primary'
         "
         :disabled="match.is_locked || submitting"
-        @click="pickTeam(match.teams.home)"
+        @click="pickTeam(match.home_team)"
       >
-        {{ match.teams.home }}
+        {{ match.home_team }}
       </button>
       <button
         class="py-3 rounded-lg text-sm font-medium transition-colors border"
         :class="
-          existingPick?.team === match.teams.away
+          existingPick?.team === match.away_team
             ? 'bg-primary text-surface-0 border-primary'
             : 'bg-surface-2 text-text-primary border-surface-3 hover:border-primary'
         "
         :disabled="match.is_locked || submitting"
-        @click="pickTeam(match.teams.away)"
+        @click="pickTeam(match.away_team)"
       >
-        {{ match.teams.away }}
+        {{ match.away_team }}
       </button>
     </div>
 

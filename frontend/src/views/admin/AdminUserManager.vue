@@ -22,6 +22,7 @@ interface AdminUser {
 const users = ref<AdminUser[]>([]);
 const search = ref("");
 const loading = ref(true);
+const error = ref(false);
 
 // Points adjustment
 const adjustUserId = ref<string | null>(null);
@@ -30,10 +31,13 @@ const adjustReason = ref("");
 
 async function fetchUsers() {
   loading.value = true;
+  error.value = false;
   try {
     const params: Record<string, string> = {};
     if (search.value) params.search = search.value;
     users.value = await api.get<AdminUser[]>("/admin/users", params);
+  } catch {
+    error.value = true;
   } finally {
     loading.value = false;
   }
@@ -110,8 +114,14 @@ function onSearch() {
       />
     </div>
 
+    <!-- Error -->
+    <div v-if="error" class="text-center py-12">
+      <p class="text-text-muted mb-3">Error loading.</p>
+      <button class="text-sm text-primary hover:underline" @click="fetchUsers">Try again</button>
+    </div>
+
     <!-- Table -->
-    <div class="bg-surface-1 rounded-card border border-surface-3/50 overflow-x-auto">
+    <div v-else class="bg-surface-1 rounded-card border border-surface-3/50 overflow-x-auto">
       <table class="w-full text-sm">
         <thead>
           <tr class="text-xs text-text-muted border-b border-surface-3">

@@ -26,22 +26,22 @@ defineProps<{
     v-else-if="entries.length === 0"
     class="text-center py-12"
   >
-    <p class="text-text-muted">Noch keine Einträge in der Rangliste.</p>
+    <p class="text-text-muted">{{ $t('leaderboard.empty') }}</p>
   </div>
 
   <!-- Table -->
   <div v-else class="overflow-x-auto">
-    <table class="w-full text-sm" aria-label="Rangliste">
+    <table class="w-full text-sm" :aria-label="$t('leaderboard.heading')">
       <thead>
         <tr class="border-b border-surface-3">
           <th class="text-left py-3 px-4 text-xs font-semibold text-text-muted uppercase tracking-wider w-16">
             #
           </th>
           <th class="text-left py-3 px-4 text-xs font-semibold text-text-muted uppercase tracking-wider">
-            Spieler
+            {{ $t('match.players') }}
           </th>
           <th class="text-right py-3 px-4 text-xs font-semibold text-text-muted uppercase tracking-wider w-28">
-            Punkte
+            {{ $t('settings.points') }}
           </th>
         </tr>
       </thead>

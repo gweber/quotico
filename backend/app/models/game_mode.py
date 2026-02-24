@@ -33,10 +33,10 @@ GAME_MODE_DEFAULTS: dict[str, dict] = {
 }
 
 GAME_MODE_LABELS: dict[str, str] = {
-    "classic": "Tippspiel",
+    "classic": "Classic",
     "bankroll": "Bankroll",
     "survivor": "Survivor",
-    "over_under": "Über/Unter",
+    "over_under": "Over/Under",
     "fantasy": "Fantasy",
-    "moneyline": "Quotentipp",
+    "moneyline": "Moneyline",
 }

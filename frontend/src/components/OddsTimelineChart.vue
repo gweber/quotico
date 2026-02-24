@@ -103,9 +103,9 @@ const chartOptions = computed(() => ({
       titleFont: { size: 11 },
       bodyFont: { size: 11 },
       callbacks: {
-        title: (items: { label: string }[]) => {
-          if (!items.length) return "";
-          const d = new Date(items[0].label);
+        title: (items: { parsed: { x: number | null } }[]) => {
+          if (!items.length || items[0].parsed.x == null) return "";
+          const d = new Date(items[0].parsed.x);
           return d.toLocaleString("de-DE", {
             day: "2-digit",
             month: "2-digit",

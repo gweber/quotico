@@ -8,6 +8,7 @@ from jwt.exceptions import InvalidTokenError
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 import app.database as _db
+from app.utils import parse_utc
 from app.services.auth_service import decode_jwt
 from app.services.match_service import sports_with_live_action, next_kickoff_in
 from app.providers.football_data import (
@@ -127,14 +128,18 @@ class LiveScoreManager:
         for sport_key in live_sports:
             live_data: list[dict] = []
 
-            if sport_key in SPORT_TO_LEAGUE:
-                live_data = await openligadb_provider.get_live_scores(sport_key)
-                if not live_data:
+            try:
+                if sport_key in SPORT_TO_LEAGUE:
+                    live_data = await openligadb_provider.get_live_scores(sport_key)
+                    if not live_data:
+                        live_data = await football_data_provider.get_live_scores(sport_key)
+                elif sport_key in SPORT_TO_COMPETITION:
                     live_data = await football_data_provider.get_live_scores(sport_key)
-            elif sport_key in SPORT_TO_COMPETITION:
-                live_data = await football_data_provider.get_live_scores(sport_key)
-            elif sport_key in SPORT_TO_ESPN:
-                live_data = await espn_provider.get_live_scores(sport_key)
+                elif sport_key in SPORT_TO_ESPN:
+                    live_data = await espn_provider.get_live_scores(sport_key)
+            except Exception:
+                logger.warning("WS live score provider failed for %s", sport_key, exc_info=True)
+                continue
 
             for score in live_data:
                 matched = await _match_to_db(sport_key, score)
@@ -190,13 +195,30 @@ class LiveScoreManager:
         for ws in dead:
             self.disconnect(ws)
 
+    async def broadcast_odds_updated(self, sport_key: str, odds_changed: int) -> None:
+        """Notify clients that odds have been refreshed so they can re-fetch."""
+        if not self.connections:
+            return
+        message = {
+            "type": "odds_updated",
+            "data": {"sport_key": sport_key, "odds_changed": odds_changed},
+        }
+        dead: list[WebSocket] = []
+        for ws in self.connections:
+            try:
+                await ws.send_json(message)
+            except Exception:
+                dead.append(ws)
+        for ws in dead:
+            self.disconnect(ws)
+
 
 async def _match_to_db(sport_key: str, score: dict) -> Optional[dict]:
     """Match a live score to a DB match."""
     utc_date = score.get("utc_date", "")
     if isinstance(utc_date, str) and utc_date:
         try:
-            match_time = datetime.fromisoformat(utc_date.replace("Z", "+00:00"))
+            match_time = parse_utc(utc_date)
         except ValueError:
             return None
     else:
@@ -204,14 +226,14 @@ async def _match_to_db(sport_key: str, score: dict) -> Optional[dict]:
 
     candidates = await _db.db.matches.find({
         "sport_key": sport_key,
-        "commence_time": {
+        "match_date": {
             "$gte": match_time - timedelta(hours=6),
             "$lte": match_time + timedelta(hours=6),
         },
     }).to_list(length=50)
 
     for candidate in candidates:
-        home = candidate.get("teams", {}).get("home", "")
+        home = candidate.get("home_team", "")
         if teams_match(home, score.get("home_team", "")):
             return {
                 "match_id": str(candidate["_id"]),
@@ -230,20 +252,13 @@ live_manager = LiveScoreManager()
 
 @router.websocket("/ws/live-scores")
 async def websocket_live_scores(ws: WebSocket):
-    # Authenticate via access_token cookie
+    # Optional auth — live scores are public, but identify user if token present
     token = ws.cookies.get("access_token")
-    if not token:
-        await ws.close(code=4001, reason="Unauthorized")
-        return
-
-    try:
-        payload = decode_jwt(token)
-        if payload.get("type") != "access":
-            await ws.close(code=4001, reason="Invalid token type")
-            return
-    except InvalidTokenError:
-        await ws.close(code=4001, reason="Invalid token")
-        return
+    if token:
+        try:
+            decode_jwt(token)
+        except InvalidTokenError:
+            pass  # proceed as guest
 
     # Connection cap
     if live_manager.is_full:

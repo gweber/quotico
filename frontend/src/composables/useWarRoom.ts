@@ -27,13 +27,12 @@ export interface WarRoomConsensus {
 export interface WarRoomMatch {
   id: string;
   sport_key: string;
-  teams: { home: string; away: string };
-  commence_time: string;
+  home_team: string;
+  away_team: string;
+  match_date: string;
   status: string;
-  current_odds: Record<string, number>;
-  result: string | null;
-  home_score: number | null;
-  away_score: number | null;
+  odds: Record<string, unknown>;
+  result: Record<string, unknown>;
 }
 
 export interface WarRoomData {
@@ -57,7 +56,7 @@ export function useWarRoom(squadId: string, matchId: string) {
   let ticker: ReturnType<typeof setInterval> | null = null;
 
   const commenceMs = computed(() =>
-    data.value ? new Date(data.value.match.commence_time).getTime() : 0
+    data.value ? new Date(data.value.match.match_date).getTime() : 0
   );
 
   const countdown = computed(() => {
@@ -81,17 +80,17 @@ export function useWarRoom(squadId: string, matchId: string) {
     if (!data.value) return "pre_kickoff";
     const matchStatus = data.value.match.status;
     if (matchStatus === "live" || liveScore.value != null) return "live";
-    if (matchStatus === "completed") return "live";
+    if (matchStatus === "final") return "live";
     if (now.value < commenceMs.value) return "pre_kickoff";
     return "revealed";
   });
 
-  // --- Tip outcome helpers (client-side, real-time via WS) ---
-  function isTipWinning(selection: "1" | "X" | "2"): boolean {
+  // --- Bet outcome helpers (client-side, real-time via WS) ---
+  function isBetWinning(selection: "1" | "X" | "2"): boolean {
     const score = liveScore.value;
     const match = data.value?.match;
-    const hs = score?.home_score ?? match?.home_score;
-    const as_ = score?.away_score ?? match?.away_score;
+    const hs = score?.home_score ?? (match?.result as any)?.home_score;
+    const as_ = score?.away_score ?? (match?.result as any)?.away_score;
     if (hs == null || as_ == null) return false;
 
     if (hs > as_) return selection === "1";
@@ -158,7 +157,7 @@ export function useWarRoom(squadId: string, matchId: string) {
     countdown,
     phase,
     liveScore,
-    isTipWinning,
+    isBetWinning,
     fetchWarRoom,
   };
 }

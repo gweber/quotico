@@ -1,20 +1,25 @@
 <script setup lang="ts">
 import { onMounted, computed, ref } from "vue";
 import { useRoute, useRouter, RouterLink } from "vue-router";
+import { useI18n } from "vue-i18n";
 import { useTeam, teamSlug } from "@/composables/useTeam";
 import { useOddsTimeline } from "@/composables/useOddsTimeline";
 import OddsTimelineChart from "@/components/OddsTimelineChart.vue";
 import { sportLabel } from "@/types/sports";
 
+const { t } = useI18n();
+
 const route = useRoute();
 const router = useRouter();
 const { data: team, loading, error, fetch: fetchTeam } = useTeam();
 
-onMounted(() => {
+function reload() {
   const slug = route.params.teamSlug as string;
   const sport = (route.query.sport as string) || undefined;
   fetchTeam(slug, sport);
-});
+}
+
+onMounted(() => reload());
 
 // Form dot colors
 function formColor(result: string): string {
@@ -48,11 +53,11 @@ function formatDateTime(dateStr: string): string {
 }
 
 // Result indicator for a match relative to this team
-function matchResult(m: { home_team_key?: string; home_goals: number; away_goals: number }): string {
+function matchResult(m: { home_team_key?: string; result: { home_score: number; away_score: number } }): string {
   if (!team.value) return "";
   const isHome = m.home_team_key === team.value.team_key;
-  const hg = m.home_goals;
-  const ag = m.away_goals;
+  const hg = m.result.home_score;
+  const ag = m.result.away_score;
   if (hg === ag) return "D";
   if ((hg > ag && isHome) || (ag > hg && !isHome)) return "W";
   return "L";
@@ -101,13 +106,13 @@ async function toggleTimeline(matchId: string) {
   }
 }
 
-function getOddsEntries(m: { teams: { home: string; away: string }; current_odds: Record<string, number> }) {
-  const odds = m.current_odds;
-  const entries = [{ key: "1", label: m.teams.home, value: odds["1"] }];
-  if (odds["X"] !== undefined) {
-    entries.push({ key: "X", label: "X", value: odds["X"] });
+function getOddsEntries(m: { home_team: string; away_team: string; odds: Record<string, unknown> }) {
+  const h2h = ((m.odds as any)?.h2h || {}) as Record<string, number>;
+  const entries = [{ key: "1", label: m.home_team, value: h2h["1"] }];
+  if (h2h["X"] !== undefined) {
+    entries.push({ key: "X", label: "X", value: h2h["X"] });
   }
-  entries.push({ key: "2", label: m.teams.away, value: odds["2"] });
+  entries.push({ key: "2", label: m.away_team, value: h2h["2"] });
   return entries;
 }
 </script>
@@ -122,24 +127,19 @@ function getOddsEntries(m: { teams: { home: string; away: string }; current_odds
       <svg class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
         <path stroke-linecap="round" stroke-linejoin="round" d="M15 19l-7-7 7-7" />
       </svg>
-      Zurück
+      {{ $t('common.back') }}
     </button>
 
     <!-- Loading state -->
     <div v-if="loading" class="text-center py-12">
       <div class="animate-spin w-8 h-8 border-2 border-primary border-t-transparent rounded-full mx-auto" />
-      <p class="text-text-muted text-sm mt-3">Lade Teamdaten...</p>
+      <p class="text-text-muted text-sm mt-3">{{ $t('teams.loading') }}</p>
     </div>
 
     <!-- Error state -->
-    <div v-else-if="error" class="bg-surface-1 rounded-card p-6 border border-surface-3/50 text-center">
-      <p class="text-text-muted">Team nicht gefunden.</p>
-      <button
-        @click="router.push({ name: 'dashboard' })"
-        class="mt-3 text-sm text-primary hover:underline"
-      >
-        Zum Dashboard
-      </button>
+    <div v-else-if="error" class="text-center py-12">
+      <p class="text-text-muted mb-3">{{ $t('common.loadError') }}</p>
+      <button class="text-sm text-primary hover:underline" @click="reload">{{ $t('common.retry') }}</button>
     </div>
 
     <!-- Team data -->
@@ -159,7 +159,7 @@ function getOddsEntries(m: { teams: { home: string; away: string }; current_odds
 
         <!-- Form strip -->
         <div v-if="team.form.length" class="flex items-center gap-2 mt-3">
-          <span class="text-xs text-text-muted">Form:</span>
+          <span class="text-xs text-text-muted">{{ $t('common.form') }}:</span>
           <div class="flex gap-1">
             <span
               v-for="(f, i) in team.form"
@@ -180,48 +180,48 @@ function getOddsEntries(m: { teams: { home: string; away: string }; current_odds
       <!-- Season stats -->
       <div v-if="stats" class="bg-surface-1 rounded-card p-4 border border-surface-3/50">
         <h2 class="text-sm font-semibold text-text-primary mb-3">
-          Saison {{ stats.season_label }}
+          {{ t('common.season', { label: stats.season_label }) }}
         </h2>
 
         <div class="grid grid-cols-4 gap-3 text-center">
           <div>
             <div class="text-lg font-bold text-text-primary tabular-nums">{{ stats.matches_played }}</div>
-            <div class="text-[10px] text-text-muted uppercase tracking-wider">Spiele</div>
+            <div class="text-[10px] text-text-muted uppercase tracking-wider">{{ $t('teams.played') }}</div>
           </div>
           <div>
             <div class="text-lg font-bold text-emerald-400 tabular-nums">{{ stats.wins }}</div>
-            <div class="text-[10px] text-text-muted uppercase tracking-wider">Siege</div>
+            <div class="text-[10px] text-text-muted uppercase tracking-wider">{{ $t('teams.wins') }}</div>
           </div>
           <div>
             <div class="text-lg font-bold text-amber-400 tabular-nums">{{ stats.draws }}</div>
-            <div class="text-[10px] text-text-muted uppercase tracking-wider">Remis</div>
+            <div class="text-[10px] text-text-muted uppercase tracking-wider">{{ $t('teams.draws') }}</div>
           </div>
           <div>
             <div class="text-lg font-bold text-red-400 tabular-nums">{{ stats.losses }}</div>
-            <div class="text-[10px] text-text-muted uppercase tracking-wider">Niederl.</div>
+            <div class="text-[10px] text-text-muted uppercase tracking-wider">{{ $t('teams.losses') }}</div>
           </div>
         </div>
 
         <div class="mt-3 pt-3 border-t border-surface-3/30 grid grid-cols-2 gap-3 text-xs">
           <div>
-            <span class="text-text-muted">Tore:</span>
+            <span class="text-text-muted">{{ $t('teams.goals') }}</span>
             <span class="font-mono font-bold text-text-primary ml-1 tabular-nums">
               {{ stats.goals_scored }}:{{ stats.goals_conceded }}
             </span>
             <span class="font-mono text-text-muted ml-1 tabular-nums">({{ gdSign }}{{ stats.goal_difference }})</span>
           </div>
           <div class="text-right">
-            <span class="text-text-muted">Punkte:</span>
+            <span class="text-text-muted">{{ $t('teams.points') }}</span>
             <span class="font-bold text-text-primary ml-1 tabular-nums">{{ stats.points }}</span>
           </div>
           <div>
-            <span class="text-text-muted">Heim:</span>
+            <span class="text-text-muted">{{ $t('teams.homeRecord') }}</span>
             <span class="font-mono text-text-secondary ml-1 tabular-nums">
               {{ stats.home_record.w }}/{{ stats.home_record.d }}/{{ stats.home_record.l }}
             </span>
           </div>
           <div class="text-right">
-            <span class="text-text-muted">Auswärts:</span>
+            <span class="text-text-muted">{{ $t('teams.awayRecord') }}</span>
             <span class="font-mono text-text-secondary ml-1 tabular-nums">
               {{ stats.away_record.w }}/{{ stats.away_record.d }}/{{ stats.away_record.l }}
             </span>
@@ -231,7 +231,7 @@ function getOddsEntries(m: { teams: { home: string; away: string }; current_odds
 
       <!-- Recent results -->
       <div v-if="team.recent_results.length" class="bg-surface-1 rounded-card p-4 border border-surface-3/50">
-        <h2 class="text-sm font-semibold text-text-primary mb-3">Letzte Ergebnisse</h2>
+        <h2 class="text-sm font-semibold text-text-primary mb-3">{{ $t('teams.recentResults') }}</h2>
         <div class="space-y-1.5">
           <div
             v-for="(m, i) in team.recent_results"
@@ -253,7 +253,7 @@ function getOddsEntries(m: { teams: { home: string; away: string }; current_odds
               {{ opponent(m) }}
             </RouterLink>
             <span class="font-mono font-bold text-text-primary tabular-nums shrink-0">
-              {{ m.home_goals }}:{{ m.away_goals }}
+              {{ m.result.home_score }}:{{ m.result.away_score }}
             </span>
           </div>
         </div>
@@ -261,7 +261,7 @@ function getOddsEntries(m: { teams: { home: string; away: string }; current_odds
 
       <!-- Upcoming matches -->
       <div v-if="team.upcoming_matches.length" class="bg-surface-1 rounded-card p-4 border border-surface-3/50">
-        <h2 class="text-sm font-semibold text-text-primary mb-3">Kommende Spiele</h2>
+        <h2 class="text-sm font-semibold text-text-primary mb-3">{{ $t('match.upcomingMatches') }}</h2>
         <div class="space-y-3">
           <div
             v-for="um in team.upcoming_matches"
@@ -269,10 +269,10 @@ function getOddsEntries(m: { teams: { home: string; away: string }; current_odds
             class="border-b border-surface-3/30 last:border-0 pb-2 last:pb-0"
           >
             <div class="flex items-center gap-2 text-xs">
-              <span class="text-text-muted w-28 shrink-0">{{ formatDateTime(um.commence_time) }}</span>
+              <span class="text-text-muted w-28 shrink-0">{{ formatDateTime(um.match_date) }}</span>
               <div class="flex-1 min-w-0">
                 <span class="text-text-secondary truncate block">
-                  {{ um.teams.home }} – {{ um.teams.away }}
+                  {{ um.home_team }} – {{ um.away_team }}
                 </span>
               </div>
             </div>
@@ -310,8 +310,8 @@ function getOddsEntries(m: { teams: { home: string; away: string }; current_odds
                 <OddsTimelineChart
                   v-else-if="timelineCache.get(um.id)?.snapshots"
                   :snapshots="timelineCache.get(um.id)!.snapshots"
-                  :home-team="um.teams.home"
-                  :away-team="um.teams.away"
+                  :home-team="um.home_team"
+                  :away-team="um.away_team"
                   compact
                 />
               </div>

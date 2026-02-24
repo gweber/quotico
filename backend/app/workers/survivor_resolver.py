@@ -44,13 +44,13 @@ async def resolve_survivor_picks() -> None:
                 continue
 
             match = await _db.db.matches.find_one({"_id": ObjectId(pick["match_id"])})
-            if not match or match["status"] != "completed" or not match.get("result"):
+            if not match or match["status"] != "final" or not match.get("result", {}).get("outcome"):
                 continue
 
             team = pick["team"]
-            result = match["result"]
-            home = match["teams"]["home"]
-            away = match["teams"]["away"]
+            result = match["result"]["outcome"]
+            home = match["home_team"]
+            away = match["away_team"]
 
             # Determine if the picked team won
             if team == home:

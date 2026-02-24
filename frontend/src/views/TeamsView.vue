@@ -1,7 +1,10 @@
 <script setup lang="ts">
 import { ref, watch } from "vue";
+import { useI18n } from "vue-i18n";
 import { useTeamsStore } from "@/stores/teams";
 import { sportLabel } from "@/types/sports";
+
+useI18n();
 
 const teams = useTeamsStore();
 const searchQuery = ref("");
@@ -74,7 +77,7 @@ watch(searchQuery, (q) => {
       v-else-if="searchQuery.trim().length >= 2 && !teams.searchLoading && teams.searchResults.length === 0"
       class="text-center py-12"
     >
-      <p class="text-sm text-text-muted">Kein Team gefunden.</p>
+      <p class="text-sm text-text-muted">{{ $t('teams.noTeamFound') }}</p>
     </div>
 
     <!-- Initial state -->

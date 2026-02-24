@@ -1,14 +1,16 @@
 <script setup lang="ts">
 import { ref, computed } from "vue";
-import type { SpieltagMatch } from "@/stores/spieltag";
+import { useI18n } from "vue-i18n";
+import type { MatchdayMatch } from "@/stores/matchday";
 import { useWalletStore } from "@/stores/wallet";
 import { useToast } from "@/composables/useToast";
 import HighBetWarning from "./HighBetWarning.vue";
 
 const props = defineProps<{
-  match: SpieltagMatch;
+  match: MatchdayMatch;
 }>();
 
+const { t } = useI18n();
 const walletStore = useWalletStore();
 const toast = useToast();
 
@@ -21,9 +23,11 @@ const existingBet = computed(() =>
   walletStore.bets.find((b) => b.match_id === props.match.id),
 );
 
+const h2hOdds = computed(() => ((props.match.odds as any)?.h2h || {}) as Record<string, number>);
+
 const selectedOdds = computed(() => {
   if (!selectedPrediction.value) return 0;
-  return props.match.current_odds[selectedPrediction.value] || 0;
+  return h2hOdds.value[selectedPrediction.value] || 0;
 });
 
 const potentialWin = computed(() =>
@@ -42,7 +46,7 @@ const isHighBet = computed(() => {
 });
 
 const kickoffLabel = computed(() => {
-  const d = new Date(props.match.commence_time);
+  const d = new Date(props.match.match_date);
   return d.toLocaleString("de-DE", {
     weekday: "short",
     day: "2-digit",
@@ -78,20 +82,20 @@ async function placeBet() {
       stake.value,
       selectedOdds.value,
     );
-    toast.success("Wette platziert!");
+    toast.success(t("wallet.betPlaced"));
     selectedPrediction.value = null;
   } catch (e: unknown) {
-    toast.error(e instanceof Error ? e.message : "Fehler beim Platzieren.");
+    toast.error(e instanceof Error ? e.message : t("common.genericError"));
   } finally {
     submitting.value = false;
   }
 }
 
-const predictionLabels: Record<string, string> = {
-  "1": "Heim",
-  X: "Unentschieden",
-  "2": "Auswärts",
-};
+const predictionLabels = computed<Record<string, string>>(() => ({
+  "1": t("match.home"),
+  X: t("match.draw"),
+  "2": t("match.away"),
+}));
 
 function betStatusClass(status: string) {
   switch (status) {
@@ -113,25 +117,25 @@ function betStatusClass(status: string) {
         class="text-xs font-bold px-2 py-0.5 rounded-full"
         :class="betStatusClass(existingBet.status)"
       >
-        {{ existingBet.status === "won" ? `+${Math.round(existingBet.potential_win)}` : existingBet.status === "pending" ? "Offen" : existingBet.status === "lost" ? `-${existingBet.stake}` : "Void" }}
+        {{ existingBet.status === "won" ? `+${Math.round(existingBet.potential_win)}` : existingBet.status === "pending" ? t('match.open') : existingBet.status === "lost" ? `-${existingBet.stake}` : $t('match.void') }}
       </span>
-      <span v-else-if="match.is_locked" class="text-xs text-text-muted">Gesperrt</span>
+      <span v-else-if="match.is_locked" class="text-xs text-text-muted">{{ $t('match.locked') }}</span>
     </div>
 
     <!-- Teams -->
     <div class="flex items-center justify-between mb-3">
       <span class="text-sm font-medium text-text-primary flex-1 text-left truncate">
-        {{ match.teams.home }}
+        {{ match.home_team }}
       </span>
       <span
-        v-if="match.home_score !== null"
+        v-if="(match.result as any)?.home_score != null"
         class="text-lg font-bold text-text-primary px-2"
       >
-        {{ match.home_score }} : {{ match.away_score }}
+        {{ (match.result as any)?.home_score }} : {{ (match.result as any)?.away_score }}
       </span>
       <span v-else class="text-sm text-text-muted px-2">vs</span>
       <span class="text-sm font-medium text-text-primary flex-1 text-right truncate">
-        {{ match.teams.away }}
+        {{ match.away_team }}
       </span>
     </div>
 
@@ -159,14 +163,14 @@ function betStatusClass(status: string) {
           @click="selectPrediction(pred)"
         >
           <div class="text-xs opacity-70">{{ predictionLabels[pred] }}</div>
-          <div>{{ match.current_odds[pred]?.toFixed(2) || "-" }}</div>
+          <div>{{ h2hOdds[pred]?.toFixed(2) || "-" }}</div>
         </button>
       </div>
 
       <!-- Stake input -->
       <div v-if="selectedPrediction" class="space-y-2">
         <div class="flex items-center gap-2">
-          <label class="text-xs text-text-muted shrink-0">Einsatz:</label>
+          <label class="text-xs text-text-muted shrink-0">{{ $t('wallet.stake') }}</label>
           <input
             v-model.number="stake"
             type="range"
@@ -180,13 +184,13 @@ function betStatusClass(status: string) {
           </span>
         </div>
         <div class="flex justify-between text-xs text-text-muted">
-          <span>Gewinn: {{ potentialWin.toFixed(0) }} Coins</span>
+          <span>{{ $t('wallet.potentialWin') }} {{ potentialWin.toFixed(0) }} Coins</span>
           <button
             class="px-4 py-1.5 rounded-lg bg-primary text-surface-0 font-semibold text-xs hover:bg-primary-hover transition-colors disabled:opacity-50"
             :disabled="submitting || stake <= 0"
             @click="handlePlace"
           >
-            {{ submitting ? "..." : "Setzen" }}
+            {{ submitting ? "..." : $t('match.place') }}
           </button>
         </div>
       </div>

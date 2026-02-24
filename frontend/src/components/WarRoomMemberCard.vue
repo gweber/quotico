@@ -1,6 +1,9 @@
 <script setup lang="ts">
 import { computed } from "vue";
+import { useI18n } from "vue-i18n";
 import type { WarRoomMember } from "@/composables/useWarRoom";
+
+const { t } = useI18n();
 
 const props = defineProps<{
   member: WarRoomMember;
@@ -18,7 +21,7 @@ const selectionLabel = computed(() => {
   if (!sel) return "—";
   if (sel === "1") return props.homeTeam;
   if (sel === "2") return props.awayTeam;
-  return "Unentschieden";
+  return t("match.draw");
 });
 
 const selectionShort = computed(() => props.member.selection?.value ?? "—");
@@ -77,7 +80,7 @@ const cardClass = computed(() => {
           class="text-xs font-medium text-text-primary truncate text-center mb-2 px-1"
         >
           {{ member.alias }}
-          <span v-if="member.is_self" class="text-primary"> (Du)</span>
+          <span v-if="member.is_self" class="text-primary"> {{ t('squad.warRoomYou') }}</span>
         </p>
 
         <!-- Mystery: other user, tipped -->
@@ -132,7 +135,7 @@ const cardClass = computed(() => {
                 />
               </svg>
             </div>
-            <p class="text-[10px] text-warning">Kein Tipp!</p>
+            <p class="text-[10px] text-warning">{{ t('squad.warRoomNoBetWarning') }}</p>
           </div>
         </template>
 
@@ -156,7 +159,7 @@ const cardClass = computed(() => {
                 />
               </svg>
             </div>
-            <p class="text-[10px] text-primary">Getippt</p>
+            <p class="text-[10px] text-primary">{{ t('squad.warRoomBetPlaced') }}</p>
           </div>
         </template>
       </div>
@@ -167,7 +170,7 @@ const cardClass = computed(() => {
           class="text-xs font-medium text-text-primary truncate text-center mb-2 px-1"
         >
           {{ member.alias }}
-          <span v-if="member.is_self" class="text-primary"> (Du)</span>
+          <span v-if="member.is_self" class="text-primary"> {{ t('squad.warRoomYou') }}</span>
         </p>
 
         <template v-if="member.selection">
@@ -212,7 +215,7 @@ const cardClass = computed(() => {
 
         <template v-else>
           <div class="text-center">
-            <p class="text-xs text-text-muted">Kein Tipp</p>
+            <p class="text-xs text-text-muted">{{ t('squad.warRoomNoBet') }}</p>
           </div>
         </template>
 

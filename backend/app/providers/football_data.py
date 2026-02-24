@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import time
 import unicodedata
@@ -56,10 +57,21 @@ def teams_match(name_a: str, name_b: str) -> bool:
 class FootballDataProvider:
     """football-data.org provider for free match scores and live data."""
 
+    # Free tier: 10 requests/minute → 1 request per 7 seconds (with margin)
+    _MIN_INTERVAL = 7.0
+
     def __init__(self):
         self._client = ResilientClient("football_data")
         self._cache: dict[str, dict[str, Any]] = {}
         self._cache_ttl = 300  # 5 minutes
+        self._last_request_at: float = 0.0
+
+    async def _throttle(self) -> None:
+        """Enforce minimum interval between API calls (free tier rate limit)."""
+        elapsed = time.time() - self._last_request_at
+        if elapsed < self._MIN_INTERVAL:
+            await asyncio.sleep(self._MIN_INTERVAL - elapsed)
+        self._last_request_at = time.time()
 
     def _get_cached(self, key: str) -> Optional[list[dict]]:
         entry = self._cache.get(key)
@@ -82,6 +94,7 @@ class FootballDataProvider:
         date_from = (now - timedelta(days=days_back)).strftime("%Y-%m-%d")
         date_to = now.strftime("%Y-%m-%d")
 
+        await self._throttle()
         resp = await self._client.get(
             f"{BASE_URL}/competitions/{competition}/matches",
             params={
@@ -162,6 +175,7 @@ class FootballDataProvider:
             if not api_key:
                 return []
 
+            await self._throttle()
             resp = await self._client.get(
                 f"{BASE_URL}/competitions/{competition}/matches",
                 params={"status": "IN_PLAY"},
@@ -217,6 +231,7 @@ class FootballDataProvider:
             if not api_key:
                 return None
 
+            await self._throttle()
             resp = await self._client.get(
                 f"{BASE_URL}/competitions/{competition}",
                 headers={"X-Auth-Token": api_key},
@@ -249,6 +264,7 @@ class FootballDataProvider:
             if not api_key:
                 return []
 
+            await self._throttle()
             resp = await self._client.get(
                 f"{BASE_URL}/competitions/{competition}/matches",
                 params={"matchday": str(matchday_number)},

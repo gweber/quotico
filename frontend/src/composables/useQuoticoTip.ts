@@ -5,6 +5,7 @@ export interface TierSignals {
   poisson: {
     lambda_home: number;
     lambda_away: number;
+    h2h_weight: number;
     true_probs: Record<string, number>;
     edges: Record<string, number>;
   } | null;
@@ -25,20 +26,27 @@ export interface TierSignals {
     kings_pick: string | null;
     kings_pct: number;
     total_kings: number;
-    kings_who_tipped: number;
+    kings_who_bet: number;
     is_underdog_pick: boolean;
   };
   btb?: {
     home: { evd: number; matches_analyzed: number; btb_count: number; btb_ratio: number; contributes: boolean };
     away: { evd: number; matches_analyzed: number; btb_count: number; btb_ratio: number; contributes: boolean };
   };
+  rest_advantage?: {
+    home_rest_days: number;
+    away_rest_days: number;
+    diff: number;
+    contributes: boolean;
+  };
 }
 
 export interface QuoticoTip {
   match_id: string;
   sport_key: string;
-  teams: Record<string, string>;
-  commence_time: string;
+  home_team: string;
+  away_team: string;
+  match_date: string;
   recommended_selection: string;
   confidence: number;
   edge_pct: number;
@@ -56,13 +64,22 @@ export interface QuoticoTip {
 const tipCache = reactive(new Map<string, QuoticoTip>());
 
 /**
- * Prefetch all active QuoticoTips in a single request.
+ * Prefetch QuoticoTips for the given match IDs (or all active tips if no IDs given).
  * Populates the shared cache so useQuoticoTip().fetch() returns instantly.
  */
-export async function prefetchQuoticoTips(sportKey?: string): Promise<void> {
+export async function prefetchQuoticoTips(
+  matchIds?: string[],
+  sportKey?: string,
+): Promise<void> {
   const api = useApi();
   try {
-    const params: Record<string, string> = { limit: "50", include_no_signal: "true" };
+    const params: Record<string, string> = { include_no_signal: "true" };
+    if (matchIds && matchIds.length > 0) {
+      params.match_ids = matchIds.join(",");
+      params.limit = String(matchIds.length);
+    } else {
+      params.limit = "100";
+    }
     if (sportKey) params.sport_key = sportKey;
 
     const tips = await api.get<QuoticoTip[]>("/quotico-tips/", params);
@@ -85,7 +102,7 @@ export async function refreshQuoticoTips(sportKey?: string): Promise<void> {
   } else {
     tipCache.clear();
   }
-  await prefetchQuoticoTips(sportKey);
+  await prefetchQuoticoTips(undefined, sportKey);
 }
 
 /**

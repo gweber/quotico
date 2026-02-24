@@ -17,9 +17,11 @@ export interface HistoricalMatch {
   away_team: string;
   home_team_key: string;
   away_team_key: string;
-  home_goals: number;
-  away_goals: number;
-  result: string;
+  result: {
+    home_score: number;
+    away_score: number;
+    outcome: string;
+  };
   season_label: string;
 }
 

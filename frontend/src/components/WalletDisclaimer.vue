@@ -23,19 +23,17 @@ async function accept() {
 <template>
   <div class="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4">
     <div class="bg-surface-0 rounded-xl max-w-md w-full p-6 shadow-xl space-y-4">
-      <h2 class="text-lg font-bold text-text-primary">Virtuelle Spielwährung</h2>
+      <h2 class="text-lg font-bold text-text-primary">{{ $t('wallet.virtualCurrency') }}</h2>
 
       <p class="text-sm text-text-secondary leading-relaxed">
-        Quotico-Coins sind eine virtuelle Spielwährung ohne realen Gegenwert.
-        Es handelt sich ausschließlich um ein Unterhaltungsangebot.
-        Setze verantwortungsbewusst.
+        {{ $t('wallet.disclaimer') }}
+        {{ $t('wallet.entertainmentOnly') }}
+        {{ $t('wallet.playResponsibly') }}
       </p>
 
       <div class="bg-surface-1 rounded-lg p-3 border border-surface-3/50">
         <p class="text-xs text-text-muted">
-          Mit dem Akzeptieren bestätigst du, dass du verstanden hast,
-          dass Quotico-Coins keinen realen Geldwert haben und nicht
-          ausgezahlt oder in echtes Geld umgetauscht werden können.
+          {{ $t('wallet.acceptDisclaimer') }}
         </p>
       </div>
 
@@ -44,7 +42,7 @@ async function accept() {
         :disabled="accepting"
         @click="accept"
       >
-        {{ accepting ? "Wird gespeichert..." : "Verstanden & Akzeptieren" }}
+        {{ accepting ? $t('profile.saving') : $t('wallet.acceptButton') }}
       </button>
     </div>
   </div>

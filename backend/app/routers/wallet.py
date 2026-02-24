@@ -22,13 +22,13 @@ async def accept_disclaimer(user=Depends(get_current_user)):
     """Accept the virtual currency disclaimer (required before wallet use)."""
     user_id = str(user["_id"])
     if user.get("wallet_disclaimer_accepted_at"):
-        return {"message": "Bereits akzeptiert."}
+        return {"message": "Already accepted."}
 
     await _db.db.users.update_one(
         {"_id": user["_id"]},
         {"$set": {"wallet_disclaimer_accepted_at": utcnow()}},
     )
-    return {"message": "Disclaimer akzeptiert."}
+    return {"message": "Disclaimer accepted."}
 
 
 # ---------- Wallet ----------
@@ -219,7 +219,7 @@ def _check_disclaimer(user: dict) -> None:
     if not user.get("wallet_disclaimer_accepted_at"):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Bitte akzeptiere zuerst den Coin-Disclaimer.",
+            detail="Please accept the coin disclaimer first.",
         )
 
 
@@ -227,5 +227,5 @@ def _check_adult(user: dict) -> None:
     if not user.get("is_adult"):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Altersprüfung erforderlich.",
+            detail="Age verification required.",
         )

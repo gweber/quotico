@@ -33,12 +33,13 @@ async def resolve_over_under_bets() -> None:
 
     for bet in pending:
         match = await _db.db.matches.find_one({"_id": ObjectId(bet["match_id"])})
-        if not match or match["status"] != "completed":
+        if not match or match["status"] != "final":
             continue
-        if match.get("home_score") is None or match.get("away_score") is None:
+        result = match.get("result", {})
+        if result.get("home_score") is None or result.get("away_score") is None:
             continue
 
-        total_goals = match["home_score"] + match["away_score"]
+        total_goals = result["home_score"] + result["away_score"]
         line = bet["line"]
         prediction = bet["prediction"]
 
@@ -56,7 +57,7 @@ async def resolve_over_under_bets() -> None:
                     amount=bet["stake"],
                     reference_type="over_under_bet",
                     reference_id=str(bet["_id"]),
-                    description=f"Push (Rückerstattung): {total_goals} Tore = Linie {line}",
+                    description=f"Push (refund): {total_goals} goals = line {line}",
                 )
             await _db.db.over_under_bets.update_one(
                 {"_id": bet["_id"]},
@@ -76,7 +77,7 @@ async def resolve_over_under_bets() -> None:
                 amount=win_amount,
                 reference_type="over_under_bet",
                 reference_id=str(bet["_id"]),
-                description=f"O/U Gewinn: {prediction} {line} ({total_goals} Tore)",
+                description=f"O/U win: {prediction} {line} ({total_goals} goals)",
             )
 
         points_earned = bet["locked_odds"] if is_won else 0.0

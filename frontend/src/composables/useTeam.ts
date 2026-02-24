@@ -19,9 +19,10 @@ export interface SeasonStats {
 export interface UpcomingMatch {
   id: string;
   sport_key: string;
-  teams: { home: string; away: string };
-  commence_time: string;
-  current_odds: Record<string, number>;
+  home_team: string;
+  away_team: string;
+  match_date: string;
+  odds: Record<string, unknown>;
   status: string;
 }
 

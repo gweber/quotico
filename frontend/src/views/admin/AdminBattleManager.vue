@@ -15,6 +15,7 @@ interface AdminSquad {
 
 const squads = ref<AdminSquad[]>([]);
 const loading = ref(true);
+const error = ref(false);
 
 // Battle creation
 const showCreate = ref(false);
@@ -24,13 +25,19 @@ const startTime = ref("");
 const endTime = ref("");
 const submitting = ref(false);
 
-onMounted(async () => {
+async function fetchSquads() {
+  loading.value = true;
+  error.value = false;
   try {
     squads.value = await api.get<AdminSquad[]>("/admin/squads");
+  } catch {
+    error.value = true;
   } finally {
     loading.value = false;
   }
-});
+}
+
+onMounted(fetchSquads);
 
 async function createBattle() {
   if (!squadAId.value || !squadBId.value || !startTime.value || !endTime.value) return;
@@ -71,8 +78,14 @@ async function createBattle() {
       </button>
     </div>
 
+    <!-- Error -->
+    <div v-if="error" class="text-center py-12">
+      <p class="text-text-muted mb-3">Error loading.</p>
+      <button class="text-sm text-primary hover:underline" @click="fetchSquads">Try again</button>
+    </div>
+
     <!-- Squads Overview -->
-    <div class="bg-surface-1 rounded-card border border-surface-3/50 mb-6">
+    <div v-else class="bg-surface-1 rounded-card border border-surface-3/50 mb-6">
       <h2 class="text-sm font-semibold text-text-primary px-5 py-3 border-b border-surface-3/50">
         Alle Squads ({{ squads.length }})
       </h2>
