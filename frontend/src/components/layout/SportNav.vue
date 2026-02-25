@@ -1,6 +1,19 @@
+<!--
+frontend/src/components/layout/SportNav.vue
+
+Purpose:
+    Dynamic sport navigation sourced from League Tower instead of hardcoded keys.
+    Renders active+tippable leagues in backend-defined order for sidebar/bar use.
+-->
 <script setup lang="ts">
+/**
+ * Script section for SportNav runtime behavior.
+ */
+import { computed, onMounted } from "vue";
+import { useI18n } from "vue-i18n";
 import { useMatchesStore } from "@/stores/matches";
-import { SPORT_LABELS, sportFlag } from "@/types/sports";
+import { useLeagueStore } from "@/stores/leagues";
+import { sportFlag } from "@/types/sports";
 
 const props = withDefaults(defineProps<{
   variant?: "sidebar" | "bar";
@@ -9,6 +22,8 @@ const props = withDefaults(defineProps<{
 });
 
 const matches = useMatchesStore();
+const leagues = useLeagueStore();
+const { t } = useI18n();
 
 const SPORT_ICONS: Record<string, string> = {
   americanfootball_nfl: "🏈",
@@ -16,14 +31,38 @@ const SPORT_ICONS: Record<string, string> = {
   tennis_atp_french_open: "🎾",
 };
 
-const sports = [
-  { key: null, label: "Alle", icon: "🎯" },
-  ...Object.entries(SPORT_LABELS).map(([key, label]) => ({
-    key,
-    label,
-    icon: key.startsWith("soccer_") ? sportFlag(key) : SPORT_ICONS[key] || "🎯",
+function getFlagFromCountryCode(countryCode: string | null): string | null {
+  if (!countryCode || countryCode.length !== 2) return null;
+  const upper = countryCode.toUpperCase();
+  const base = 127397;
+  return String.fromCodePoint(
+    base + upper.charCodeAt(0),
+    base + upper.charCodeAt(1),
+  );
+}
+
+function leagueIcon(sportKey: string, countryCode: string | null): string {
+  if (sportKey.startsWith("soccer_")) {
+    const mapped = sportFlag(sportKey);
+    if (mapped !== "🏳️") return mapped;
+  }
+  const byCountry = getFlagFromCountryCode(countryCode);
+  if (byCountry) return byCountry;
+  return SPORT_ICONS[sportKey] || "⚽";
+}
+
+const sports = computed(() => [
+  { key: null, label: t("nav.allSports"), icon: "🎯" },
+  ...leagues.navigation.map((league) => ({
+    key: league.sport_key,
+    label: league.name,
+    icon: leagueIcon(league.sport_key, league.country_code),
   })),
-];
+]);
+
+onMounted(() => {
+  void leagues.fetchNavigation();
+});
 
 function selectSport(key: string | null, event?: Event) {
   matches.setSport(key);
@@ -44,11 +83,11 @@ function selectSport(key: string | null, event?: Event) {
   <aside
     v-if="props.variant === 'sidebar'"
     class="hidden lg:block w-56 shrink-0"
-    aria-label="Sportarten"
+    :aria-label="t('nav.sportsLabel')"
   >
     <nav class="sticky top-[3.75rem] p-3 space-y-0.5">
       <h2 class="px-3 py-2 text-xs font-semibold text-text-muted uppercase tracking-wider">
-        Sportarten
+        {{ t("nav.sportsLabel") }}
       </h2>
       <button
         v-for="sport in sports"
@@ -71,7 +110,7 @@ function selectSport(key: string | null, event?: Event) {
   <nav
     v-if="props.variant === 'bar'"
     class="lg:hidden overflow-x-auto border-b border-surface-3 bg-surface-1 scrollbar-hide"
-    aria-label="Sportarten"
+    :aria-label="t('nav.sportsLabel')"
   >
     <div class="flex gap-1 px-3 py-2 min-w-max">
       <button

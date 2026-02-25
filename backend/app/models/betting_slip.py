@@ -62,6 +62,8 @@ class SelectionInDB(BaseModel):
     match_id: str
     market: str = "h2h"                           # h2h | totals | exact_score | survivor_pick | fantasy_pick
     pick: Any                                     # str for h2h/totals/survivor/fantasy, dict for exact_score
+    team_id: Optional[str] = None                 # Survivor/fantasy: team identity reference
+    team_name: Optional[str] = None               # Survivor/fantasy: display only
     displayed_odds: Optional[float] = None        # Odds user saw when adding leg (draft state)
     locked_odds: Optional[float] = None           # Frozen server-side at submit/lock time
     line: Optional[float] = None                  # Totals line (e.g. 2.5 goals)
@@ -106,6 +108,7 @@ class BettingSlipInDB(BaseModel):
 
     # Survivor fields
     used_teams: List[str] = []                    # Teams already picked this season
+    used_team_ids: List[str] = []                 # Team ObjectIds already picked this season
     streak: int = 0                               # Consecutive survived matchdays
     eliminated_at: Optional[datetime] = None      # When eliminated
 
@@ -221,5 +224,6 @@ class BettingSlipResponse(BaseModel):
     streak: Optional[int] = None
     eliminated_at: Optional[datetime] = None
     used_teams: Optional[List[str]] = None
+    used_team_ids: Optional[List[str]] = None
 
     # Fantasy specific (points come via total_points)

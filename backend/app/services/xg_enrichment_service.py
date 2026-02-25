@@ -1,15 +1,23 @@
-"""xG Enrichment Service — fetch match-level Expected Goals from Understat.
+"""
+backend/app/services/xg_enrichment_service.py
 
-Uses the ``soccerdata`` library to scrape xG data, maps team names via
-``team_mapping_service``, and updates MongoDB match documents.
+Purpose:
+    Fetch match-level expected goals data from Understat and enrich finalized
+    matches, guarded by League Tower feature flags.
+
+Dependencies:
+    - app.services.league_service
+    - app.services.team_mapping_service
+    - app.database
 """
 
 import logging
 from datetime import timedelta
 
 import app.database as _db
+from app.services.league_service import LeagueRegistry, league_feature_enabled
 from app.services.team_mapping_service import resolve_team
-from app.utils import utcnow, ensure_utc, parse_utc
+from app.utils import parse_utc
 
 try:
     import soccerdata as sd
@@ -17,20 +25,6 @@ except ImportError:
     sd = None  # type: ignore[assignment]
 
 logger = logging.getLogger("quotico.xg_enrichment")
-
-# ---------------------------------------------------------------------------
-# League mapping: our sport_key → soccerdata league identifier
-# Understat covers EPL, Bundesliga, La Liga, Serie A, Ligue 1, RFPL
-# ---------------------------------------------------------------------------
-SPORT_KEY_TO_UNDERSTAT: dict[str, str] = {
-    "soccer_epl": "ENG-Premier League",
-    "soccer_germany_bundesliga": "GER-Bundesliga",
-    "soccer_spain_la_liga": "ESP-La Liga",
-    "soccer_italy_serie_a": "ITA-Serie A",
-    "soccer_france_ligue_one": "FRA-Ligue 1",
-}
-
-SUPPORTED_SPORT_KEYS = list(SPORT_KEY_TO_UNDERSTAT.keys())
 
 # Match date tolerance for linking Understat → Quotico matches
 MATCH_DATE_WINDOW_HOURS = 24
@@ -41,7 +35,7 @@ def _season_str(year: int) -> str:
     return f"{year}/{year + 1}"
 
 
-def fetch_season_xg(sport_key: str, season_year: int):
+def fetch_season_xg(sport_key: str, season_year: int, understat_league_id: str):
     """Fetch match-level xG from Understat for a league+season.
 
     Returns a pandas DataFrame with columns including:
@@ -54,15 +48,13 @@ def fetch_season_xg(sport_key: str, season_year: int):
             "soccerdata is not installed. Run: pip install soccerdata"
         )
 
-    league_id = SPORT_KEY_TO_UNDERSTAT.get(sport_key)
-    if not league_id:
+    if not understat_league_id:
         raise ValueError(
-            f"Sport key {sport_key!r} not supported for xG enrichment. "
-            f"Supported: {SUPPORTED_SPORT_KEYS}"
+            f"Sport key {sport_key!r} has no Understat mapping in leagues.external_ids.understat"
         )
 
-    logger.info("Fetching xG from Understat: %s season %s", league_id, _season_str(season_year))
-    understat = sd.Understat(leagues=league_id, seasons=season_year, no_cache=False)
+    logger.info("Fetching xG from Understat: %s season %s", understat_league_id, _season_str(season_year))
+    understat = sd.Understat(leagues=understat_league_id, seasons=season_year, no_cache=False)
     schedule = understat.read_schedule()
 
     # Reset the multi-index (league, season, game) to flat columns
@@ -89,7 +81,26 @@ async def match_and_enrich(
     Returns:
         Summary dict with matched/unmatched/skipped/total counts.
     """
-    df = fetch_season_xg(sport_key, season_year)
+    league_registry = LeagueRegistry.get()
+    league = await league_registry.ensure_for_import(
+        sport_key,
+        provider_name="understat",
+        provider_id=sport_key,
+        auto_create_inactive=True,
+    )
+    if not league.get("is_active", False):
+        raise ValueError(f"xG import blocked for inactive league: {sport_key}")
+    if not league_feature_enabled(league, "xg_sync", False):
+        raise ValueError(f"xG import blocked for disabled xg_sync feature: {sport_key}")
+    understat_league_id = (league.get("external_ids") or {}).get("understat")
+    if not understat_league_id:
+        understat_league_id = (league.get("provider_mappings") or {}).get("understat")
+    if not understat_league_id:
+        raise ValueError(
+            f"xG import blocked: {sport_key} has no understat provider mapping in leagues collection."
+        )
+
+    df = fetch_season_xg(sport_key, season_year, understat_league_id)
 
     matched = 0
     unmatched = 0

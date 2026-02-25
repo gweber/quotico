@@ -8,6 +8,7 @@ from pymongo.errors import DuplicateKeyError
 
 import app.database as _db
 from app.services.matchday_service import is_match_locked
+from app.services.team_registry_service import TeamRegistry
 from app.utils import utcnow
 
 logger = logging.getLogger("quotico.survivor_service")
@@ -43,11 +44,15 @@ async def make_pick(
     if is_match_locked(match):
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Match is locked.")
 
-    # Validate team is part of this match
-    home = match["home_team"]
-    away = match["away_team"]
-    if team not in (home, away):
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, f"Team must be '{home}' or '{away}'.")
+    home_team_id = match.get("home_team_id")
+    away_team_id = match.get("away_team_id")
+    if not home_team_id or not away_team_id:
+        raise HTTPException(status.HTTP_409_CONFLICT, "Match team identity not initialized yet.")
+
+    registry = TeamRegistry.get()
+    team_id = await registry.resolve(team, match["sport_key"])
+    if team_id not in (home_team_id, away_team_id):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Team not in this match.")
 
     sport_key = match["sport_key"]
     season = match.get("matchday_season") or now.year
@@ -68,7 +73,7 @@ async def make_pick(
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "You have been eliminated.")
 
         # Check team not already used
-        if team in entry.get("used_teams", []):
+        if team_id in entry.get("used_team_ids", []) or team in entry.get("used_teams", []):
             raise HTTPException(
                 status.HTTP_400_BAD_REQUEST,
                 f"'{team}' has already been used. Choose a different team.",
@@ -86,21 +91,25 @@ async def make_pick(
         new_pick = {
             "matchday_number": matchday_number,
             "team": team,
+            "team_name": team,
+            "team_id": team_id,
             "match_id": match_id,
             "result": "pending",
         }
         await _db.db.survivor_entries.update_one(
             {"_id": entry["_id"]},
             {
-                "$push": {
-                    "picks": new_pick,
+                "$push": {"picks": new_pick},
+                "$addToSet": {
+                    "used_team_ids": team_id,
                     "used_teams": team,
                 },
                 "$set": {"updated_at": now},
             },
         )
         entry["picks"].append(new_pick)
-        entry["used_teams"].append(team)
+        entry.setdefault("used_team_ids", []).append(team_id)
+        entry.setdefault("used_teams", []).append(team)
     else:
         # Create new survivor entry
         entry = {
@@ -112,9 +121,12 @@ async def make_pick(
             "picks": [{
                 "matchday_number": matchday_number,
                 "team": team,
+                "team_name": team,
+                "team_id": team_id,
                 "match_id": match_id,
                 "result": "pending",
             }],
+            "used_team_ids": [team_id],
             "used_teams": [team],
             "streak": 0,
             "eliminated_at": None,

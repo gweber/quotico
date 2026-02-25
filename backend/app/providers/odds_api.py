@@ -1,3 +1,16 @@
+"""
+backend/app/providers/odds_api.py
+
+Purpose:
+    Adapter for TheOddsAPI odds and score endpoints with resilient transport,
+    cache, and normalized payloads for Match ingest.
+
+Dependencies:
+    - app.providers.base
+    - app.providers.http_client
+    - app.config
+"""
+
 import asyncio
 import logging
 import time
@@ -16,10 +29,13 @@ BASE_URL = "https://api.the-odds-api.com/v4"
 SUPPORTED_SPORTS = [
     "soccer_germany_bundesliga",
     "soccer_germany_bundesliga2",
+    "soccer_germany_dfb_pokal",
     "soccer_epl",
     "soccer_spain_la_liga",
     "soccer_italy_serie_a",
     "soccer_france_ligue_one",
+    "soccer_uefa_champs_league",
+    "soccer_fifa_world_cup",
     "soccer_netherlands_eredivisie",
     "soccer_portugal_primeira_liga",
 ]
@@ -237,6 +253,8 @@ class TheOddsAPIProvider(BaseProvider):
                 },
                 "commence_time": event["commence_time"],
                 "odds": odds,
+                "round_name": event.get("description"),
+                "group_name": event.get("group"),
             }
 
             matches.append(match_data)
@@ -279,10 +297,13 @@ class TheOddsAPIProvider(BaseProvider):
 
             results.append({
                 "external_id": event["id"],
+                "sport_key": sport_key,
                 "completed": True,
                 "result": result,
                 "home_score": home_score,
                 "away_score": away_score,
+                "round_name": event.get("description"),
+                "group_name": event.get("group"),
             })
 
         return results

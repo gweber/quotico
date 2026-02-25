@@ -1,3 +1,16 @@
+"""
+backend/app/providers/football_data.py
+
+Purpose:
+    Adapter for football-data.org competitions with normalized score/status
+    payloads for league, cup, and tournament ingest.
+
+Dependencies:
+    - app.providers.http_client
+    - app.config
+    - app.utils.utcnow
+"""
+
 import asyncio
 import logging
 import time
@@ -125,7 +138,13 @@ class FootballDataProvider:
             results = []
 
             for match in raw:
-                ft = match.get("score", {}).get("fullTime", {})
+                score_data = match.get("score", {})
+                ft = score_data.get("fullTime", {})
+                et = score_data.get("extraTime", {})
+                pens = score_data.get("penalties", {})
+                stage = match.get("stage")
+                group_raw = match.get("group")
+                group = group_raw.get("name") if isinstance(group_raw, dict) else group_raw
                 home_score = ft.get("home")
                 away_score = ft.get("away")
                 if home_score is None or away_score is None:
@@ -146,6 +165,16 @@ class FootballDataProvider:
                     "result": result,
                     "home_score": home_score,
                     "away_score": away_score,
+                    "round_name": stage,
+                    "group_name": group,
+                    "score_extra_time": {
+                        "home": et.get("home"),
+                        "away": et.get("away"),
+                    },
+                    "score_penalties": {
+                        "home": pens.get("home"),
+                        "away": pens.get("away"),
+                    },
                 })
 
             self._set_cache(cache_key, results)
@@ -277,7 +306,13 @@ class FootballDataProvider:
 
             matches = []
             for m in raw:
-                ft = m.get("score", {}).get("fullTime", {})
+                score_data = m.get("score", {})
+                ft = score_data.get("fullTime", {})
+                et = score_data.get("extraTime", {})
+                pens = score_data.get("penalties", {})
+                stage = m.get("stage")
+                group_raw = m.get("group")
+                group = group_raw.get("name") if isinstance(group_raw, dict) else group_raw
                 is_finished = m.get("status") == "FINISHED"
                 home_score = ft.get("home") if is_finished else None
                 away_score = ft.get("away") if is_finished else None
@@ -290,6 +325,16 @@ class FootballDataProvider:
                     "home_score": home_score,
                     "away_score": away_score,
                     "matchday_number": matchday_number,
+                    "round_name": stage,
+                    "group_name": group,
+                    "score_extra_time": {
+                        "home": et.get("home"),
+                        "away": et.get("away"),
+                    },
+                    "score_penalties": {
+                        "home": pens.get("home"),
+                        "away": pens.get("away"),
+                    },
                     "season": season,
                 })
 

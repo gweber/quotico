@@ -9,6 +9,8 @@ from pydantic import BaseModel
 class SurvivorPick(BaseModel):
     matchday_number: int
     team: str
+    team_name: Optional[str] = None
+    team_id: Optional[str] = None
     match_id: str
     result: str = "pending"  # pending | won | lost | draw
 
@@ -22,6 +24,7 @@ class SurvivorEntryInDB(BaseModel):
     status: str = "alive"  # alive | eliminated
     picks: list[SurvivorPick] = []
     used_teams: list[str] = []
+    used_team_ids: list[str] = []
     streak: int = 0
     eliminated_at: Optional[datetime] = None
     created_at: datetime
@@ -40,6 +43,7 @@ class SurvivorEntryResponse(BaseModel):
     status: str
     picks: list[dict]
     used_teams: list[str]
+    used_team_ids: list[str] = []
     streak: int
     eliminated_at: Optional[datetime] = None
 

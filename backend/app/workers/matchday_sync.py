@@ -1,4 +1,16 @@
-"""Matchday mode: sync matchdays from providers into the unified matches collection."""
+"""
+backend/app/workers/matchday_sync.py
+
+Purpose:
+    Sync matchday fixtures from league providers into MongoDB and keep matchday
+    state current. Supports global scheduler runs and admin-triggered single
+    league syncs.
+
+Dependencies:
+    - app.services.league_service.LeagueRegistry
+    - app.providers.openligadb / app.providers.football_data
+    - app.database
+"""
 
 import logging
 from datetime import datetime, timedelta
@@ -8,6 +20,9 @@ from app.utils import parse_utc, utcnow
 from app.config_matchday import MATCHDAY_SPORTS
 from app.providers.football_data import football_data_provider, teams_match
 from app.providers.openligadb import openligadb_provider, _current_season
+from app.providers.football_data import SPORT_TO_COMPETITION
+from app.providers.openligadb import SPORT_TO_LEAGUE
+from app.services.league_service import LeagueRegistry, league_feature_enabled
 from app.services.team_mapping_service import (
     SPORT_KEY_TO_LEAGUE_CODE,
     derive_season_year,
@@ -16,6 +31,7 @@ from app.services.team_mapping_service import (
     season_code,
     season_label,
 )
+from app.services.team_registry_service import TeamRegistry
 from app.workers._state import recently_synced, set_synced
 
 logger = logging.getLogger("quotico.matchday_sync")
@@ -39,6 +55,15 @@ async def sync_matchdays() -> None:
             logger.error("Matchday sync failed for %s: %s", sport_key, e)
 
 
+async def sync_matchdays_for_sport(sport_key: str) -> dict:
+    """Admin entrypoint: sync one league and return execution metadata."""
+    config = MATCHDAY_SPORTS.get(sport_key)
+    if not config:
+        raise ValueError(f"Sport key '{sport_key}' is not configured for matchday sync.")
+    await _sync_sport_matchdays(sport_key, config)
+    return {"sport_key": sport_key, "status": "queued"}
+
+
 async def _sync_sport_matchdays(sport_key: str, config: dict) -> None:
     """Sync matchdays for a single sport.
 
@@ -51,6 +76,25 @@ async def _sync_sport_matchdays(sport_key: str, config: dict) -> None:
     max_matchdays = config["matchdays_per_season"]
     season = _get_season_for_sport(sport_key)
     state_key = f"matchday_sync:{sport_key}"
+    provider_name = config["provider"]
+    provider_id = None
+    if provider_name == "openligadb":
+        provider_id = SPORT_TO_LEAGUE.get(sport_key)
+    elif provider_name == "football_data":
+        provider_id = SPORT_TO_COMPETITION.get(sport_key)
+
+    league = await LeagueRegistry.get().ensure_for_import(
+        sport_key,
+        provider_name=provider_name,
+        provider_id=provider_id or sport_key,
+        auto_create_inactive=True,
+    )
+    if not league.get("is_active", False):
+        logger.warning("Skipping matchday ingest for inactive league: %s", sport_key)
+        return
+    if not league_feature_enabled(league, "match_load", True):
+        logger.info("Skipping matchday ingest for disabled match_load feature: %s", sport_key)
+        return
 
     # Check if full-season bootstrap is needed (first time this season)
     existing_count = await _db.db.matchdays.count_documents({
@@ -79,8 +123,6 @@ async def _sync_sport_matchdays(sport_key: str, config: dict) -> None:
             logger.info("Smart sleep safety: %s >6h since last sync, syncing anyway", sport_key)
 
     # Passed smart sleep gate — now fetch current matchday from provider
-    provider_name = config["provider"]
-
     if provider_name == "openligadb":
         current_md = await openligadb_provider.get_current_matchday_number(sport_key)
     else:
@@ -227,6 +269,9 @@ async def _find_or_create_match(
     # Resolve team names to canonical keys
     home_display, home_key = await resolve_or_create_team(home_team, sport_key)
     away_display, away_key = await resolve_or_create_team(away_team, sport_key)
+    registry = TeamRegistry.get()
+    home_team_id = await registry.resolve(home_team, sport_key)
+    away_team_id = await registry.resolve(away_team, sport_key)
 
     sy = derive_season_year(match_date_raw)
     sc = season_code(sy)
@@ -251,7 +296,17 @@ async def _find_or_create_match(
             "match_date": match_date_raw,
             "match_date_hour": match_date_normalized,
             "updated_at": now,
+            "home_team_id": home_team_id,
+            "away_team_id": away_team_id,
         }
+        if provider_match.get("round_name") is not None:
+            update["round_name"] = str(provider_match.get("round_name"))
+        if provider_match.get("group_name") is not None:
+            update["group_name"] = str(provider_match.get("group_name"))
+        if provider_match.get("score_extra_time") is not None:
+            update["score_extra_time"] = provider_match.get("score_extra_time")
+        if provider_match.get("score_penalties") is not None:
+            update["score_penalties"] = provider_match.get("score_penalties")
         if provider_match.get("is_finished") and provider_match.get("home_score") is not None:
             hs, aws = provider_match["home_score"], provider_match["away_score"]
             update["result.home_score"] = hs
@@ -291,11 +346,17 @@ async def _find_or_create_match(
         "league_code": SPORT_KEY_TO_LEAGUE_CODE.get(sport_key),
         "home_team": home_display,
         "away_team": away_display,
+        "home_team_id": home_team_id,
+        "away_team_id": away_team_id,
         "home_team_key": home_key,
         "away_team_key": away_key,
         "metadata": {"source": "matchday_sync"},
         "matchday_number": matchday_number,
         "matchday_season": season,
+        "round_name": provider_match.get("round_name"),
+        "group_name": provider_match.get("group_name"),
+        "score_extra_time": provider_match.get("score_extra_time"),
+        "score_penalties": provider_match.get("score_penalties"),
         "odds": {"h2h": {}, "totals": {}, "spreads": {}, "updated_at": None},
         "result": result_data,
         "created_at": now,

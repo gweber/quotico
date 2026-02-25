@@ -1,3 +1,16 @@
+"""
+backend/app/main.py
+
+Purpose:
+    FastAPI application bootstrap, middleware/router wiring, scheduler lifecycle,
+    and startup initialization for core registries and seed data.
+
+Dependencies:
+    - app.database
+    - app.services.league_service
+    - app.services.team_registry_service
+"""
+
 import asyncio
 import hashlib
 import logging
@@ -24,25 +37,31 @@ _SESSION_SECRET = hashlib.sha256(b"session:" + settings.JWT_SECRET.encode()).hex
 import app.database as _db
 from app.database import connect_db, close_db
 from app.middleware.logging import StructuredLoggingMiddleware, setup_logging
+from app.utils import utcnow
 
 logger = logging.getLogger("quotico")
 scheduler = AsyncIOScheduler()
+_AUTOMATION_META_ID = "automation_settings"
+_AUTOMATED_JOB_IDS = {
+    "odds_poller",
+    "match_resolver",
+    "leaderboard",
+    "badge_engine",
+    "matchday_sync",
+    "matchday_resolver",
+    "matchday_leaderboard",
+    "wallet_maintenance",
+    "qbot_bets",
+    "calibration_eval",
+    "calibration_refine",
+    "calibration_explore",
+    "reliability_check",
+}
+_automation_enabled = False
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    setup_logging()
-    await connect_db()
-
-    # Seed on startup
-    from app.seed import seed_initial_user, seed_qbot_user
-    await seed_initial_user()
-    await seed_qbot_user()
-
-    # Team mappings seeded in database._seed_team_mappings() during connect_db()
-
-    # Start background workers
-    from app.workers.odds_poller import poll_odds
+def _build_automated_job_specs() -> list[dict]:
+    from app.workers.odds_poller import poll_odds, run_qbot_bets
     from app.workers.match_resolver import resolve_matches
     from app.workers.leaderboard import materialize_leaderboard
     from app.workers.badge_engine import check_badges
@@ -50,51 +69,137 @@ async def lifespan(app: FastAPI):
     from app.workers.matchday_resolver import resolve_matchday_predictions
     from app.workers.matchday_leaderboard import materialize_matchday_leaderboard
     from app.workers.wallet_maintenance import run_wallet_maintenance
-    from app.workers.odds_poller import run_qbot_bets
-
-    # ~5 calls per poll (smart sleep), 20k/month budget -> poll every 15min ~ 14k/month
-    scheduler.add_job(poll_odds, "interval", minutes=15, id="odds_poller")
-    # Universal resolver: handles all slip types (single, parlay, matchday, survivor, fantasy, O/U, bankroll)
-    scheduler.add_job(resolve_matches, "interval", minutes=30, id="match_resolver")
-    scheduler.add_job(materialize_leaderboard, "interval", minutes=30, id="leaderboard")
-    scheduler.add_job(check_badges, "interval", minutes=30, id="badge_engine")
-    scheduler.add_job(sync_matchdays, "interval", minutes=30, id="matchday_sync")
-    # Auto-bet injection only (scoring handled by universal resolver)
-    scheduler.add_job(resolve_matchday_predictions, "interval", minutes=30, id="matchday_resolver")
-    scheduler.add_job(materialize_matchday_leaderboard, "interval", minutes=30, id="matchday_leaderboard")
-
-    # Wallet maintenance (daily bonus for bankrupt wallets)
-    scheduler.add_job(run_wallet_maintenance, "interval", hours=6, id="wallet_maintenance")
-
-    # Q-Bot: place bets for matches kicking off within 15 min (candidates generated inline by odds_poller)
-    scheduler.add_job(run_qbot_bets, "interval", minutes=5, id="qbot_bets")
-
-    # Self-calibration: daily eval, weekly refinement, monthly exploration
     from app.workers.calibration_worker import (
         run_daily_evaluation, run_weekly_refinement, run_monthly_exploration,
         run_reliability_check,
     )
-    scheduler.add_job(run_daily_evaluation, "cron", hour=3, minute=0, id="calibration_eval")
-    scheduler.add_job(run_weekly_refinement, "cron", day_of_week="mon", hour=4, minute=0, id="calibration_refine")
-    scheduler.add_job(run_monthly_exploration, "cron", day=1, hour=5, minute=0, id="calibration_explore")
-    # Reliability: meta-learning confidence calibration (Sunday 23:00)
-    scheduler.add_job(run_reliability_check, "cron", day_of_week="sun", hour=23, minute=0, id="reliability_check")
+    return [
+        {"id": "odds_poller", "func": poll_odds, "trigger": "interval", "trigger_kwargs": {"minutes": 15}},
+        {"id": "match_resolver", "func": resolve_matches, "trigger": "interval", "trigger_kwargs": {"minutes": 30}},
+        {"id": "leaderboard", "func": materialize_leaderboard, "trigger": "interval", "trigger_kwargs": {"minutes": 30}},
+        {"id": "badge_engine", "func": check_badges, "trigger": "interval", "trigger_kwargs": {"minutes": 30}},
+        {"id": "matchday_sync", "func": sync_matchdays, "trigger": "interval", "trigger_kwargs": {"minutes": 30}},
+        {"id": "matchday_resolver", "func": resolve_matchday_predictions, "trigger": "interval", "trigger_kwargs": {"minutes": 30}},
+        {"id": "matchday_leaderboard", "func": materialize_matchday_leaderboard, "trigger": "interval", "trigger_kwargs": {"minutes": 30}},
+        {"id": "wallet_maintenance", "func": run_wallet_maintenance, "trigger": "interval", "trigger_kwargs": {"hours": 6}},
+        {"id": "qbot_bets", "func": run_qbot_bets, "trigger": "interval", "trigger_kwargs": {"minutes": 5}},
+        {"id": "calibration_eval", "func": run_daily_evaluation, "trigger": "cron", "trigger_kwargs": {"hour": 3, "minute": 0}},
+        {"id": "calibration_refine", "func": run_weekly_refinement, "trigger": "cron", "trigger_kwargs": {"day_of_week": "mon", "hour": 4, "minute": 0}},
+        {"id": "calibration_explore", "func": run_monthly_exploration, "trigger": "cron", "trigger_kwargs": {"day": 1, "hour": 5, "minute": 0}},
+        {"id": "reliability_check", "func": run_reliability_check, "trigger": "cron", "trigger_kwargs": {"day_of_week": "sun", "hour": 23, "minute": 0}},
+    ]
 
-    # Initial sync on startup (delayed 5s to let app fully start)
-    async def initial_sync():
-        await asyncio.sleep(5)
-        try:
-            await asyncio.gather(sync_matchdays(), poll_odds())
-        except Exception:
-            logger.exception("Initial sync failed — scheduler will retry on next interval")
 
-    asyncio.create_task(initial_sync())
+def _register_automated_jobs() -> int:
+    added = 0
+    for spec in _build_automated_job_specs():
+        if scheduler.get_job(spec["id"]):
+            continue
+        scheduler.add_job(
+            spec["func"],
+            spec["trigger"],
+            id=spec["id"],
+            replace_existing=True,
+            **spec["trigger_kwargs"],
+        )
+        added += 1
+    return added
+
+
+def _remove_automated_jobs() -> int:
+    removed = 0
+    for job_id in _AUTOMATED_JOB_IDS:
+        if scheduler.get_job(job_id):
+            scheduler.remove_job(job_id)
+            removed += 1
+    return removed
+
+
+async def _initial_sync_after_enable() -> None:
+    from app.workers.matchday_sync import sync_matchdays
+    from app.workers.odds_poller import poll_odds
+
+    await asyncio.sleep(5)
+    try:
+        await asyncio.gather(sync_matchdays(), poll_odds())
+    except Exception:
+        logger.exception("Initial sync after automation enable failed")
+
+
+async def set_automation_enabled(
+    enabled: bool,
+    *,
+    run_initial_sync: bool = False,
+    persist: bool = True,
+) -> dict:
+    global _automation_enabled
+
+    changed = enabled != _automation_enabled
+    added = 0
+    removed = 0
+
+    if enabled:
+        added = _register_automated_jobs()
+        _automation_enabled = True
+        if run_initial_sync:
+            asyncio.create_task(_initial_sync_after_enable())
+    else:
+        removed = _remove_automated_jobs()
+        _automation_enabled = False
+
+    if persist:
+        await _db.db.meta.update_one(
+            {"_id": _AUTOMATION_META_ID},
+            {"$set": {"enabled": _automation_enabled, "updated_at": utcnow()}},
+            upsert=True,
+        )
+
+    return {
+        "enabled": _automation_enabled,
+        "changed": changed,
+        "added_jobs": added,
+        "removed_jobs": removed,
+        "scheduled_jobs": automated_job_count(),
+    }
+
+
+def automation_enabled() -> bool:
+    return _automation_enabled
+
+
+def automated_job_count() -> int:
+    return sum(1 for job in scheduler.get_jobs() if job.id in _AUTOMATED_JOB_IDS)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    setup_logging()
+    await connect_db()
+    from app.services.league_service import seed_core_leagues
+    from app.services.team_registry_service import TeamRegistry
+
+    seed_result = await seed_core_leagues()
+    logger.info("Core leagues seeded on startup: %s", seed_result)
+
+    registry = TeamRegistry.get()
+    await registry.initialize()
+    await registry.start_background_refresh()
+
+    # Seed on startup
+    from app.seed import seed_initial_user, seed_qbot_user
+    await seed_initial_user()
+    await seed_qbot_user()
+
     scheduler.start()
+    await set_automation_enabled(False, run_initial_sync=False, persist=False)
+    logger.info("Automated workers disabled on startup. Use Admin to activate.")
     logger.info("Background scheduler started")
 
     yield
 
-    scheduler.shutdown(wait=False)
+    await registry.stop_background_refresh()
+    if scheduler.running:
+        scheduler.shutdown(wait=False)
     await close_db()
 
 
@@ -142,6 +247,7 @@ from app.routers.parlay import router as parlay_router
 from app.routers.historical import router as historical_router
 from app.routers.quotico_tips import router as quotico_tips_router
 from app.routers.teams import router as teams_router
+from app.routers.leagues import router as leagues_router
 from app.routers.qbot import router as qbot_router
 from app.routers.betting_slips import router as betting_slips_router
 
@@ -166,6 +272,7 @@ app.include_router(parlay_router)
 app.include_router(historical_router)
 app.include_router(quotico_tips_router)
 app.include_router(teams_router)
+app.include_router(leagues_router)
 app.include_router(qbot_router)
 app.include_router(betting_slips_router)
 

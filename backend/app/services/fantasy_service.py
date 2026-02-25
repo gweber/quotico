@@ -8,6 +8,7 @@ from pymongo.errors import DuplicateKeyError
 
 import app.database as _db
 from app.services.matchday_service import is_match_locked
+from app.services.team_registry_service import TeamRegistry
 from app.utils import utcnow
 
 logger = logging.getLogger("quotico.fantasy_service")
@@ -62,11 +63,15 @@ async def make_pick(
     if is_match_locked(match):
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Match is locked.")
 
-    # Validate team is part of this match
-    home = match["home_team"]
-    away = match["away_team"]
-    if team not in (home, away):
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, f"Team must be '{home}' or '{away}'.")
+    home_team_id = match.get("home_team_id")
+    away_team_id = match.get("away_team_id")
+    if not home_team_id or not away_team_id:
+        raise HTTPException(status.HTTP_409_CONFLICT, "Match team identity not initialized yet.")
+
+    registry = TeamRegistry.get()
+    team_id = await registry.resolve(team, match["sport_key"])
+    if team_id not in (home_team_id, away_team_id):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Team not in this match.")
 
     sport_key = match["sport_key"]
     season = match.get("matchday_season") or now.year
@@ -81,6 +86,8 @@ async def make_pick(
         "season": season,
         "matchday_number": matchday_number,
         "team": team,
+        "team_name": team,
+        "team_id": team_id,
         "match_id": match_id,
         "goals_scored": None,
         "goals_conceded": None,
@@ -107,6 +114,8 @@ async def make_pick(
             },
             {"$set": {
                 "team": team,
+                "team_name": team,
+                "team_id": team_id,
                 "match_id": match_id,
                 "updated_at": now,
             }},
@@ -120,8 +129,8 @@ async def make_pick(
         })
 
     logger.info(
-        "Fantasy pick: user=%s squad=%s team=%s matchday=%d",
-        user_id, squad_id, team, matchday_number,
+        "Fantasy pick: user=%s squad=%s team=%s team_id=%s matchday=%d",
+        user_id, squad_id, team, str(team_id), matchday_number,
     )
     return pick_doc
 

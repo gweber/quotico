@@ -1,15 +1,27 @@
-"""MongoDB connection and index setup.
+"""
+backend/app/database.py
 
-Green-field setup — no migrations. Collections and indexes are created
-on first startup via ``_ensure_indexes()``.
+Purpose:
+    MongoDB connection bootstrap and index management for all collections.
+    Ensures canonical indexes for Team-Tower and League-Tower driven domains.
+
+Dependencies:
+    - motor.motor_asyncio
+    - pymongo
+    - app.config
+    - app.services.team_mapping_service
 """
 
 from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorDatabase
+from pymongo.errors import DuplicateKeyError, OperationFailure
 
 from app.config import settings
 
 client: AsyncIOMotorClient = None
 db: AsyncIOMotorDatabase = None
+import logging
+
+logger = logging.getLogger("quotico.database")
 
 
 async def connect_db() -> None:
@@ -87,19 +99,36 @@ async def _ensure_indexes() -> None:
     await db.users.create_index("google_sub", sparse=True)
     await db.users.create_index("is_deleted")
 
-    # ---- Matches (lifecycle: scheduled → live → final) ----
+    # ---- Matches (Greenfield: tower IDs + provider external IDs) ----
 
-    # Compound unique dedup key (sport + season + canonical team keys + hour-floored date)
-    # match_date_hour is floored to the hour for dedup safety; match_date is the raw accurate time
-    await db.matches.create_index(
-        [("sport_key", 1), ("season", 1), ("home_team_key", 1),
-         ("away_team_key", 1), ("match_date_hour", 1)],
-        unique=True,
-    )
+    # Canonical dedup key (league/team IDs + hour-floored kickoff).
+    canonical_match_key = [
+        ("league_id", 1), ("home_team_id", 1), ("away_team_id", 1), ("match_date_hour", 1),
+    ]
+    try:
+        await db.matches.create_index(
+            canonical_match_key,
+            unique=True,
+            partialFilterExpression={
+                "league_id": {"$exists": True},
+                "home_team_id": {"$exists": True},
+                "away_team_id": {"$exists": True},
+                "match_date_hour": {"$exists": True},
+            },
+        )
+    except (DuplicateKeyError, OperationFailure) as exc:
+        logger.warning(
+            "Skipped canonical unique matches index due to duplicate data: %s",
+            exc,
+        )
+        await db.matches.create_index(
+            canonical_match_key,
+            name="canonical_match_key_lookup",
+            unique=False,
+        )
     # TheOddsAPI fast-path lookup (sparse: matchday-only matches lack this)
-    await db.matches.create_index(
-        "metadata.theoddsapi_id", unique=True, sparse=True,
-    )
+    await db.matches.create_index("metadata.theoddsapi_id", unique=True, sparse=True)
+    await db.matches.create_index("external_ids.theoddsapi", unique=True, sparse=True)
     # Dashboard / odds polling
     await db.matches.create_index([("sport_key", 1), ("status", 1)])
     await db.matches.create_index([("match_date", 1), ("status", 1)])
@@ -110,17 +139,12 @@ async def _ensure_indexes() -> None:
     await db.matches.create_index(
         [("sport_key", 1), ("matchday_season", 1), ("matchday_number", 1)]
     )
-    # H2H queries
+    # H2H + form queries over canonical team IDs
     await db.matches.create_index(
-        [("home_team_key", 1), ("away_team_key", 1), ("sport_key", 1), ("match_date", -1)]
+        [("home_team_id", 1), ("away_team_id", 1), ("sport_key", 1), ("match_date", -1)]
     )
-    # Form queries
-    await db.matches.create_index(
-        [("home_team_key", 1), ("sport_key", 1), ("match_date", -1)]
-    )
-    await db.matches.create_index(
-        [("away_team_key", 1), ("sport_key", 1), ("match_date", -1)]
-    )
+    await db.matches.create_index([("home_team_id", 1), ("sport_key", 1), ("match_date", -1)])
+    await db.matches.create_index([("away_team_id", 1), ("sport_key", 1), ("match_date", -1)])
     # Season-scoped (EVD, league averages)
     await db.matches.create_index([("sport_key", 1), ("match_date", -1)])
 
@@ -214,6 +238,24 @@ async def _ensure_indexes() -> None:
         "external_ids.openligadb", unique=True,
         partialFilterExpression={"external_ids.openligadb": {"$exists": True}},
     )
+
+    # ---- Teams (Team-Tower identity) ----
+
+    await db.teams.create_index("normalized_name")
+    await db.teams.create_index([("normalized_name", 1), ("sport_key", 1)], unique=True)
+    await db.teams.create_index("aliases.normalized")
+    await db.teams.create_index("needs_review")
+    await db.teams.create_index("league_ids")
+
+    # ---- Leagues (League-Tower identity) ----
+
+    await db.leagues.create_index("sport_key", unique=True)
+    await db.leagues.create_index("is_active")
+    await db.leagues.create_index("needs_review")
+    await db.leagues.create_index("provider_mappings.understat")
+    await db.leagues.create_index("provider_mappings.theoddsapi")
+    await db.leagues.create_index("provider_mappings.football_data")
+    await db.leagues.create_index("provider_mappings.openligadb")
 
     # ---- Points / Leaderboard ----
 
@@ -336,6 +378,8 @@ async def _ensure_indexes() -> None:
     )
 
     await db.quotico_tips.create_index("match_id", unique=True)
+    await db.quotico_tips.create_index("home_team_id")
+    await db.quotico_tips.create_index("away_team_id")
     await db.quotico_tips.create_index(
         [("sport_key", 1), ("status", 1), ("confidence", -1)]
     )

@@ -75,14 +75,25 @@ def resolve_selection(
         sel["actual_score"] = {"home": home_score, "away": away_score}
 
     elif market == "survivor_pick":
-        team = sel["pick"]
-        home_team = match.get("home_team", "")
-        if team == home_team:
+        team_id = sel.get("team_id")
+        home_team_id = match.get("home_team_id")
+        away_team_id = match.get("away_team_id")
+        if not team_id or not home_team_id or not away_team_id:
+            logger.error("Survivor selection identity missing for match %s", match.get("_id"))
+            sel["match_result"] = "lost"
+            sel["status"] = "lost"
+            return sel
+        if team_id == home_team_id:
             team_won = result == "1"
             team_draw = result == "X"
-        else:
+        elif team_id == away_team_id:
             team_won = result == "2"
             team_draw = result == "X"
+        else:
+            logger.error("Survivor selection team_id %s not in match %s", team_id, match.get("_id"))
+            sel["match_result"] = "lost"
+            sel["status"] = "lost"
+            return sel
 
         if team_won:
             sel["match_result"] = "won"
@@ -96,11 +107,19 @@ def resolve_selection(
             sel["status"] = "lost"
 
     elif market == "fantasy_pick":
-        team = sel["pick"]
-        if team == match.get("home_team", ""):
+        team_id = sel.get("team_id")
+        home_team_id = match.get("home_team_id")
+        away_team_id = match.get("away_team_id")
+        if not team_id or not home_team_id or not away_team_id:
+            logger.error("Fantasy selection identity missing for match %s", match.get("_id"))
+            return sel
+        if team_id == home_team_id:
             gs, gc = home_score, away_score
-        else:
+        elif team_id == away_team_id:
             gs, gc = away_score, home_score
+        else:
+            logger.error("Fantasy selection team_id %s not in match %s", team_id, match.get("_id"))
+            return sel
 
         sel["goals_scored"] = gs
         sel["goals_conceded"] = gc

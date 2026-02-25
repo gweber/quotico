@@ -15,6 +15,7 @@ from app.services.historical_service import (
     clear_context_cache,
     sport_keys_for,
 )
+from app.services.team_registry_service import TeamRegistry
 from app.services.team_mapping_service import normalize_match_date, team_name_key
 from app.utils import utcnow
 
@@ -129,6 +130,7 @@ async def import_matches(batch: ImportBatch, _=Depends(verify_import_key)):
 
     now = utcnow()
     ops = []
+    registry = TeamRegistry.get()
 
     for m in batch.matches:
         doc = m.model_dump(exclude_none=True)
@@ -177,18 +179,47 @@ async def import_matches(batch: ImportBatch, _=Depends(verify_import_key)):
         # match_date_hour: floored to hour for compound unique index dedup
         doc["match_date_hour"] = normalize_match_date(doc["match_date"])
 
-        # Dedup by normalized team keys + date — matches unique index
-        # (date needed for NBA playoffs: same home/away pair, different dates)
+        # Resolve persistent team identity for match uniqueness and references
+        home_team_id = await registry.resolve(doc["home_team"], doc["sport_key"])
+        away_team_id = await registry.resolve(doc["away_team"], doc["sport_key"])
+        doc["home_team_id"] = home_team_id
+        doc["away_team_id"] = away_team_id
+
+        # Keep legacy keys populated for compatibility with existing read paths.
         home_key = doc.get("home_team_key") or team_name_key(doc["home_team"])
         away_key = doc.get("away_team_key") or team_name_key(doc["away_team"])
+        doc["home_team_key"] = home_key
+        doc["away_team_key"] = away_key
 
-        ops.append(UpdateOne(
+        # First, try to update an existing legacy keyed match (pre-team_id era).
+        legacy_match = await _db.db.matches.find_one(
             {
                 "sport_key": doc["sport_key"],
                 "season": doc["season"],
                 "home_team_key": home_key,
                 "away_team_key": away_key,
                 "match_date": doc["match_date"],
+            },
+            {"_id": 1},
+        )
+        if legacy_match:
+            ops.append(UpdateOne(
+                {"_id": legacy_match["_id"]},
+                {
+                    "$set": doc,
+                    "$setOnInsert": {"imported_at": now},
+                },
+                upsert=True,
+            ))
+            continue
+
+        ops.append(UpdateOne(
+            {
+                "sport_key": doc["sport_key"],
+                "season": doc["season"],
+                "home_team_id": home_team_id,
+                "away_team_id": away_team_id,
+                "match_date_hour": doc["match_date_hour"],
             },
             {
                 "$set": doc,

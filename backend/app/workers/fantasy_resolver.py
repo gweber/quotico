@@ -41,21 +41,25 @@ async def resolve_fantasy_picks() -> None:
         if result.get("home_score") is None or result.get("away_score") is None:
             continue
 
-        team = pick["team"]
-        home = match["home_team"]
-        away = match["away_team"]
+        pick_team_id = pick.get("team_id")
+        home_team_id = match.get("home_team_id")
+        away_team_id = match.get("away_team_id")
+        if not pick_team_id or not home_team_id or not away_team_id:
+            logger.warning("Fantasy identity missing: pick=%s match=%s", pick.get("_id"), pick["match_id"])
+            continue
+
         home_score = result["home_score"]
         away_score = result["away_score"]
 
         # Determine goals scored/conceded from the picked team's perspective
-        if team == home:
+        if pick_team_id == home_team_id:
             goals_scored = home_score
             goals_conceded = away_score
-        elif team == away:
+        elif pick_team_id == away_team_id:
             goals_scored = away_score
             goals_conceded = home_score
         else:
-            logger.warning("Fantasy pick team '%s' not in match %s", team, pick["match_id"])
+            logger.error("Fantasy pick team_id %s not found in match %s", pick_team_id, pick["match_id"])
             continue
 
         # Determine match result from picked team's perspective

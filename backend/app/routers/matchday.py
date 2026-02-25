@@ -1,4 +1,15 @@
-"""Matchday mode API endpoints."""
+"""
+backend/app/routers/matchday.py
+
+Purpose:
+    Matchday API endpoints for sports, rounds, predictions, and leaderboard data.
+    User-visible sports are filtered by League Tower feature flags.
+
+Dependencies:
+    - app.database
+    - app.services.matchday_service
+    - app.config_matchday
+"""
 
 import asyncio
 import logging
@@ -22,6 +33,7 @@ from app.models.matchday import (
 from app.services.historical_service import build_match_context
 from app.services.auth_service import get_current_user
 from app.utils import as_utc
+from app.services.league_service import LeagueRegistry, league_feature_enabled
 from app.services.matchday_service import (
     LOCK_MINUTES,
     admin_save_prediction,
@@ -39,14 +51,22 @@ router = APIRouter(prefix="/api/matchday", tags=["matchday"])
 @router.get("/sports")
 async def get_matchday_sports():
     """Return list of sports available for Matchday mode."""
-    return [
-        {
-            "sport_key": key,
-            "label": config["label_template"].replace("{n}", ""),
-            "matchdays_per_season": config["matchdays_per_season"],
-        }
-        for key, config in MATCHDAY_SPORTS.items()
-    ]
+    visible = []
+    registry = LeagueRegistry.get()
+    for key, config in MATCHDAY_SPORTS.items():
+        league = await registry.get_league(key)
+        if not league or not league.get("is_active", False):
+            continue
+        if not league_feature_enabled(league, "tipping", bool(league.get("is_active", False))):
+            continue
+        visible.append(
+            {
+                "sport_key": key,
+                "label": config["label_template"].replace("{n}", ""),
+                "matchdays_per_season": config["matchdays_per_season"],
+            }
+        )
+    return visible
 
 
 @router.get("/matchdays", response_model=list[MatchdayResponse])
@@ -57,6 +77,11 @@ async def get_matchdays(
     """Get all matchdays for a sport/season."""
     if sport not in MATCHDAY_SPORTS:
         raise HTTPException(status_code=400, detail="Invalid sport.")
+    league = await LeagueRegistry.get().get_league(sport)
+    if not league or not league.get("is_active", False):
+        raise HTTPException(status_code=404, detail="Sport not available.")
+    if not league_feature_enabled(league, "tipping", bool(league.get("is_active", False))):
+        raise HTTPException(status_code=404, detail="Sport not available.")
 
     query: dict = {"sport_key": sport}
     if season:

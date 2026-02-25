@@ -19,6 +19,7 @@ from pymongo.errors import DuplicateKeyError
 from app.config import settings
 import app.database as _db
 from app.services.matchday_service import LOCK_MINUTES, is_match_locked
+from app.services.team_registry_service import TeamRegistry
 from app.utils import ensure_utc, utcnow
 
 logger = logging.getLogger("quotico.betting_slip_service")
@@ -986,9 +987,15 @@ async def make_survivor_pick(
     if matchday_number is None:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Match has no matchday number (survivor requires matchday sports).")
 
-    # Validate team is one of the match teams
-    if team not in (match.get("home_team", ""), match.get("away_team", "")):
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Team must be one of the match teams.")
+    home_team_id = match.get("home_team_id")
+    away_team_id = match.get("away_team_id")
+    if not home_team_id or not away_team_id:
+        raise HTTPException(status.HTTP_409_CONFLICT, "Match team identity not initialized yet.")
+
+    registry = TeamRegistry.get()
+    team_id = await registry.resolve(team, sport_key)
+    if team_id not in (home_team_id, away_team_id):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Team not in this match.")
 
     # Find or create season-long survivor slip
     slip = await _db.db.betting_slips.find_one({
@@ -1005,7 +1012,7 @@ async def make_survivor_pick(
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "You have been eliminated.")
 
         # Check team not already used
-        if team in slip.get("used_teams", []):
+        if team_id in slip.get("used_team_ids", []) or team in slip.get("used_teams", []):
             raise HTTPException(status.HTTP_409_CONFLICT, "You already used this team this season.")
 
         # Check one pick per matchday
@@ -1018,13 +1025,19 @@ async def make_survivor_pick(
             "match_id": match_id,
             "market": "survivor_pick",
             "pick": team,
+            "team_name": team,
+            "team_id": team_id,
             "status": "pending",
             "matchday_number": matchday_number,
         }
         await _db.db.betting_slips.update_one(
             {"_id": slip["_id"]},
             {
-                "$push": {"selections": new_sel, "used_teams": team},
+                "$push": {"selections": new_sel},
+                "$addToSet": {
+                    "used_team_ids": team_id,
+                    "used_teams": team,
+                },
                 "$set": {"updated_at": now},
             },
         )
@@ -1041,9 +1054,12 @@ async def make_survivor_pick(
                 "match_id": match_id,
                 "market": "survivor_pick",
                 "pick": team,
+                "team_name": team,
+                "team_id": team_id,
                 "status": "pending",
                 "matchday_number": matchday_number,
             }],
+            "used_team_ids": [team_id],
             "used_teams": [team],
             "streak": 0,
             "status": "pending",  # Survivor: immediate commit, no draft
@@ -1091,8 +1107,15 @@ async def make_fantasy_pick(
     if matchday_number is None:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Match has no matchday number (fantasy requires matchday sports).")
 
-    if team not in (match.get("home_team", ""), match.get("away_team", "")):
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Team must be one of the match teams.")
+    home_team_id = match.get("home_team_id")
+    away_team_id = match.get("away_team_id")
+    if not home_team_id or not away_team_id:
+        raise HTTPException(status.HTTP_409_CONFLICT, "Match team identity not initialized yet.")
+
+    registry = TeamRegistry.get()
+    team_id = await registry.resolve(team, sport_key)
+    if team_id not in (home_team_id, away_team_id):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Team not in this match.")
 
     # Upsert: find existing pick for this matchday or create new
     existing = await _db.db.betting_slips.find_one({
@@ -1113,6 +1136,8 @@ async def make_fantasy_pick(
                     "match_id": match_id,
                     "market": "fantasy_pick",
                     "pick": team,
+                    "team_name": team,
+                    "team_id": team_id,
                     "status": "draft",
                     "matchday_number": matchday_number,
                 }],
@@ -1132,6 +1157,8 @@ async def make_fantasy_pick(
             "match_id": match_id,
             "market": "fantasy_pick",
             "pick": team,
+            "team_name": team,
+            "team_id": team_id,
             "status": "draft",
             "matchday_number": matchday_number,
         }],
@@ -1188,12 +1215,20 @@ async def get_slip_by_id(slip_id: str, user_id: Optional[str] = None) -> Optiona
 
 def slip_to_response(doc: dict) -> dict:
     """Convert a betting_slips document to a response dict."""
+    selections = []
+    for sel in doc.get("selections", []):
+        row = dict(sel)
+        if row.get("team_id") is not None:
+            row["team_id"] = str(row["team_id"])
+        selections.append(row)
+
+    used_team_ids = [str(tid) for tid in doc.get("used_team_ids", [])] if doc.get("used_team_ids") else None
     resp = {
         "id": str(doc["_id"]),
         "user_id": doc["user_id"],
         "squad_id": doc.get("squad_id"),
         "type": doc["type"],
-        "selections": doc.get("selections", []),
+        "selections": selections,
         "total_odds": doc.get("total_odds"),
         "stake": doc.get("stake", 10.0),
         "potential_payout": doc.get("potential_payout"),
@@ -1211,6 +1246,7 @@ def slip_to_response(doc: dict) -> dict:
         "streak": doc.get("streak"),
         "eliminated_at": doc.get("eliminated_at"),
         "used_teams": doc.get("used_teams"),
+        "used_team_ids": used_team_ids,
         # Common
         "sport_key": doc.get("sport_key"),
         "season": doc.get("season"),

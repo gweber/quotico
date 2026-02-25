@@ -1,3 +1,17 @@
+"""
+backend/app/routers/admin.py
+
+Purpose:
+    Admin HTTP router for operational controls across users, matches, workers,
+    Team Tower, League Tower, and Qbot tooling.
+
+Dependencies:
+    - app.services.auth_service
+    - app.services.audit_service
+    - app.services.admin_service
+    - app.services.league_service
+"""
+
 import csv
 import io
 import logging
@@ -7,21 +21,24 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from bson import ObjectId
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request, status
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 import app.database as _db
 from app.services.alias_service import generate_default_alias
+from app.services.admin_service import merge_teams
 from app.services.auth_service import get_admin_user, invalidate_user_tokens
 from app.services.audit_service import log_audit
-from app.services.historical_service import clear_context_cache
-from app.services.qbot_backtest_service import simulate_strategy_backtest
-from app.services.team_mapping_service import (
-    team_name_key, _strip_accents_lower, make_canonical_id,
-    load_cache as reload_canonical_cache,
-    seed_team_mappings as seed_canonical_map,
+from app.services.league_service import (
+    LeagueRegistry,
+    invalidate_navigation_cache,
+    seed_core_leagues,
+    update_league_order,
 )
+from app.services.qbot_backtest_service import simulate_strategy_backtest
+from app.services.football_data_service import import_football_data_stats
+from app.services.team_registry_service import TeamRegistry, normalize_team_name
 from app.providers.odds_api import odds_provider
 from app.utils import ensure_utc, utcnow
 from app.workers._state import get_synced_at, get_worker_state
@@ -126,7 +143,7 @@ _TRIGGERABLE_WORKERS = {
 @router.get("/provider-status")
 async def provider_status(admin=Depends(get_admin_user)):
     """Aggregated status of all providers and background workers."""
-    from app.main import scheduler
+    from app.main import scheduler, automation_enabled, automated_job_count
 
     # Provider health
     usage = await odds_provider.load_usage()
@@ -159,11 +176,22 @@ async def provider_status(admin=Depends(get_admin_user)):
             "next_run": job.next_run_time.isoformat() if job and job.next_run_time else None,
         })
 
-    return {"providers": providers, "workers": workers}
+    return {
+        "providers": providers,
+        "workers": workers,
+        "automated_workers_enabled": automation_enabled(),
+        "automated_workers_scheduled_jobs": automated_job_count(),
+        "scheduler_running": bool(scheduler.running),
+    }
 
 
 class TriggerSyncRequest(BaseModel):
     worker_id: str
+
+
+class AutomationToggleRequest(BaseModel):
+    enabled: bool
+    run_initial_sync: bool = False
 
 
 @router.post("/trigger-sync")
@@ -197,6 +225,48 @@ async def trigger_sync(
 
     label = _WORKER_REGISTRY[body.worker_id]["label"]
     return {"message": f"{label} completed", "duration_ms": duration_ms}
+
+
+@router.get("/workers/automation")
+async def get_automation_state(admin=Depends(get_admin_user)):
+    """Return automatic worker scheduler state."""
+    from app.main import automation_enabled, automated_job_count, scheduler
+
+    return {
+        "enabled": automation_enabled(),
+        "scheduled_jobs": automated_job_count(),
+        "scheduler_running": bool(scheduler.running),
+    }
+
+
+@router.post("/workers/automation")
+async def set_automation_state(
+    body: AutomationToggleRequest,
+    request: Request,
+    admin=Depends(get_admin_user),
+):
+    """Enable/disable automatic worker jobs at runtime."""
+    from app.main import set_automation_enabled
+
+    result = await set_automation_enabled(
+        body.enabled,
+        run_initial_sync=body.run_initial_sync and body.enabled,
+        persist=True,
+    )
+    await log_audit(
+        actor_id=str(admin["_id"]),
+        target_id="worker_automation",
+        action="WORKER_AUTOMATION_TOGGLE",
+        metadata={
+            "enabled": result["enabled"],
+            "changed": result["changed"],
+            "added_jobs": result["added_jobs"],
+            "removed_jobs": result["removed_jobs"],
+            "run_initial_sync": bool(body.run_initial_sync and body.enabled),
+        },
+        request=request,
+    )
+    return result
 
 
 def _get_worker_fn(worker_id: str):
@@ -386,30 +456,94 @@ async def reset_alias(user_id: str, request: Request, admin=Depends(get_admin_us
 
 @router.get("/matches")
 async def list_all_matches(
+    league_id: Optional[str] = Query(None),
     status_filter: Optional[str] = Query(None, alias="status"),
+    date_from: Optional[datetime] = Query(None),
+    date_to: Optional[datetime] = Query(None),
+    needs_review: Optional[bool] = Query(None),
     limit: int = Query(100, ge=1, le=500),
     admin=Depends(get_admin_user),
 ):
-    """List all matches (admin view)."""
+    """List matches with league/status/date/review filters (admin view)."""
     query: dict = {}
+    if league_id:
+        query["league_id"] = _parse_object_id(league_id, "league_id")
     if status_filter:
         query["status"] = status_filter
+    if date_from or date_to:
+        query["match_date"] = {}
+        if date_from:
+            query["match_date"]["$gte"] = ensure_utc(date_from)
+        if date_to:
+            query["match_date"]["$lte"] = ensure_utc(date_to)
+    if needs_review is True:
+        review_team_ids = await _db.db.teams.distinct("_id", {"needs_review": True})
+        if not review_team_ids:
+            return []
+        query["$or"] = [
+            {"home_team_id": {"$in": review_team_ids}},
+            {"away_team_id": {"$in": review_team_ids}},
+        ]
 
     matches = await _db.db.matches.find(query).sort("match_date", -1).limit(limit).to_list(length=limit)
     return [
         {
             "id": str(m["_id"]),
+            "league_id": str(m["league_id"]) if m.get("league_id") else None,
             "sport_key": m["sport_key"],
             "home_team": m.get("home_team", ""),
             "away_team": m.get("away_team", ""),
+            "home_team_id": str(m.get("home_team_id")) if m.get("home_team_id") else None,
+            "away_team_id": str(m.get("away_team_id")) if m.get("away_team_id") else None,
             "match_date": ensure_utc(m["match_date"]).isoformat(),
             "status": m["status"],
+            "score": m.get("score", {}),
+            "external_ids": m.get("external_ids", {}),
             "odds": m.get("odds", {}),
-            "result": m.get("result", {}),
             "bet_count": await _db.db.betting_slips.count_documents({"selections.match_id": str(m["_id"])}),
         }
         for m in matches
     ]
+
+
+class MatchSyncBody(BaseModel):
+    league_id: str
+
+
+async def _run_matches_sync_for_league(sport_key: str) -> None:
+    from app.services.match_service import sync_matches_for_sport
+
+    try:
+        await sync_matches_for_sport(sport_key)
+    except Exception:
+        logger.exception("Manual match sync failed for %s", sport_key)
+
+
+@router.post("/matches/sync")
+async def trigger_matches_sync(
+    body: MatchSyncBody,
+    background_tasks: BackgroundTasks,
+    request: Request,
+    admin=Depends(get_admin_user),
+):
+    league_oid = _parse_object_id(body.league_id, "league_id")
+    league = await _db.db.leagues.find_one({"_id": league_oid}, {"sport_key": 1})
+    if not league:
+        raise HTTPException(status_code=404, detail="League not found.")
+
+    sport_key = str(league.get("sport_key") or "").strip()
+    if not sport_key:
+        raise HTTPException(status_code=400, detail="League has no sport_key.")
+
+    background_tasks.add_task(_run_matches_sync_for_league, sport_key)
+    await log_audit(
+        actor_id=str(admin["_id"]),
+        target_id=body.league_id,
+        action="MATCH_SYNC_TRIGGER",
+        metadata={"sport_key": sport_key},
+        request=request,
+    )
+    return {"message": "Match sync queued.", "sport_key": sport_key}
 
 
 @router.post("/matches/{match_id}/override")
@@ -719,231 +853,485 @@ async def export_audit_logs(
     )
 
 
-# --- Team Mapping Management ---
+# --- Team Management (Team-Tower) ---
+
+# --- League Management (League-Tower) ---
 
 
-def _mapping_to_dict(doc: dict) -> dict:
-    """Convert a team_mappings MongoDB document to an API-friendly dict."""
+def _league_to_dict(doc: dict) -> dict:
+    external_ids = doc.get("external_ids")
+    if not isinstance(external_ids, dict):
+        external_ids = doc.get("provider_mappings", {})
+    if not isinstance(external_ids, dict):
+        external_ids = {}
+    features = doc.get("features", {})
+    if not isinstance(features, dict):
+        features = {}
+    tipping_default = bool(doc.get("is_active", False))
+
     return {
         "id": str(doc["_id"]),
-        "canonical_id": doc["canonical_id"],
-        "display_name": doc["display_name"],
-        "names": doc.get("names", []),
-        "sport_keys": doc.get("sport_keys", []),
-        "external_ids": doc.get("external_ids", {}),
+        "sport_key": doc.get("sport_key", ""),
+        "display_name": doc.get("display_name", ""),
+        "structure_type": str(doc.get("structure_type") or "league"),
+        "country_code": doc.get("country_code"),
+        "tier": doc.get("tier"),
+        "current_season": int(doc.get("current_season") or utcnow().year),
+        "ui_order": int(doc.get("ui_order", 999)),
+        "is_active": bool(doc.get("is_active", False)),
+        "needs_review": bool(doc.get("needs_review", False)),
+        "features": {
+            "tipping": bool(features.get("tipping", tipping_default)),
+            "match_load": bool(features.get("match_load", True)),
+            "xg_sync": bool(features.get("xg_sync", False)),
+            "odds_sync": bool(features.get("odds_sync", False)),
+        },
+        "external_ids": {
+            str(provider).strip().lower(): str(external_id).strip()
+            for provider, external_id in external_ids.items()
+            if str(provider).strip() and str(external_id).strip()
+        },
+        "created_at": ensure_utc(doc.get("created_at")).isoformat() if doc.get("created_at") else None,
+        "updated_at": ensure_utc(doc.get("updated_at")).isoformat() if doc.get("updated_at") else None,
     }
 
 
-class TeamMappingUpdate(BaseModel):
-    display_name: str
+async def _refresh_league_registry() -> None:
+    await invalidate_navigation_cache()
+    await LeagueRegistry.get().initialize()
 
 
-class TeamMappingCreate(BaseModel):
-    display_name: str
-    names: list[str] = []
-    sport_keys: list[str] = []
+class LeagueFeaturesUpdateBody(BaseModel):
+    tipping: Optional[bool] = None
+    match_load: Optional[bool] = None
+    xg_sync: Optional[bool] = None
+    odds_sync: Optional[bool] = None
 
 
-class TeamMappingNamesBody(BaseModel):
-    names: list[str]
+class LeagueUpdateBody(BaseModel):
+    display_name: Optional[str] = None
+    structure_type: Optional[str] = None
+    current_season: Optional[int] = None
+    ui_order: Optional[int] = None
+    is_active: Optional[bool] = None
+    external_ids: Optional[dict[str, str]] = None
+    features: Optional[LeagueFeaturesUpdateBody] = None
 
 
-@router.get("/team-mappings")
-async def list_team_mappings(
+class LeagueOrderBody(BaseModel):
+    league_ids: list[str]
+
+
+class LeagueStatsImportBody(BaseModel):
+    season: str | None = None
+
+
+@router.get("/leagues")
+async def list_leagues_admin(admin=Depends(get_admin_user)):
+    docs = await _db.db.leagues.find({}).sort([("ui_order", 1), ("display_name", 1)]).to_list(length=10_000)
+    return {"items": [_league_to_dict(doc) for doc in docs]}
+
+
+@router.post("/leagues/seed")
+async def seed_leagues_admin(request: Request, admin=Depends(get_admin_user)):
+    result = await seed_core_leagues()
+    await log_audit(
+        actor_id=str(admin["_id"]),
+        target_id="leagues",
+        action="LEAGUES_SEEDED",
+        metadata=result,
+        request=request,
+    )
+    return result
+
+
+@router.put("/leagues/order")
+async def update_leagues_order_admin(
+    body: LeagueOrderBody,
+    request: Request,
+    admin=Depends(get_admin_user),
+):
+    if not body.league_ids:
+        raise HTTPException(status_code=400, detail="league_ids must not be empty.")
+
+    ordered_ids: list[ObjectId] = []
+    seen: set[str] = set()
+    for league_id in body.league_ids:
+        if league_id in seen:
+            continue
+        seen.add(league_id)
+        ordered_ids.append(_parse_object_id(league_id, "league_id"))
+
+    result = await update_league_order(ordered_ids)
+    await log_audit(
+        actor_id=str(admin["_id"]),
+        target_id="leagues",
+        action="LEAGUE_ORDER_UPDATE",
+        metadata=result,
+        request=request,
+    )
+    return result
+
+
+@router.patch("/leagues/{league_id}")
+async def update_league_admin(
+    league_id: str,
+    body: LeagueUpdateBody,
+    request: Request,
+    admin=Depends(get_admin_user),
+):
+    if (
+        body.display_name is None
+        and body.structure_type is None
+        and body.current_season is None
+        and body.ui_order is None
+        and body.is_active is None
+        and body.external_ids is None
+        and body.features is None
+    ):
+        raise HTTPException(status_code=400, detail="Nothing to update.")
+
+    league_oid = _parse_object_id(league_id, "league_id")
+    league = await _db.db.leagues.find_one({"_id": league_oid})
+    if not league:
+        raise HTTPException(status_code=404, detail="League not found.")
+
+    updates: dict = {"updated_at": utcnow()}
+    if body.display_name is not None:
+        updates["display_name"] = body.display_name.strip()
+    if body.structure_type is not None:
+        structure_type = str(body.structure_type).strip().lower()
+        if structure_type not in {"league", "cup", "tournament"}:
+            raise HTTPException(status_code=400, detail="Invalid structure_type.")
+        updates["structure_type"] = structure_type
+    if body.current_season is not None:
+        updates["current_season"] = int(body.current_season)
+    if body.ui_order is not None:
+        updates["ui_order"] = int(body.ui_order)
+    if body.is_active is not None:
+        updates["is_active"] = bool(body.is_active)
+    if body.external_ids is not None:
+        updates["external_ids"] = {
+            str(provider).strip().lower(): str(ext_id).strip()
+            for provider, ext_id in body.external_ids.items()
+            if str(provider).strip() and str(ext_id).strip()
+        }
+    if body.features is not None:
+        existing_features = league.get("features")
+        if not isinstance(existing_features, dict):
+            existing_features = {}
+        next_features = {
+            "tipping": bool(existing_features.get("tipping", bool(league.get("is_active", False)))),
+            "match_load": bool(existing_features.get("match_load", True)),
+            "xg_sync": bool(existing_features.get("xg_sync", False)),
+            "odds_sync": bool(existing_features.get("odds_sync", False)),
+        }
+        if body.features.tipping is not None:
+            next_features["tipping"] = bool(body.features.tipping)
+        if body.features.match_load is not None:
+            next_features["match_load"] = bool(body.features.match_load)
+        if body.features.xg_sync is not None:
+            next_features["xg_sync"] = bool(body.features.xg_sync)
+        if body.features.odds_sync is not None:
+            next_features["odds_sync"] = bool(body.features.odds_sync)
+        updates["features"] = next_features
+
+    await _db.db.leagues.update_one({"_id": league_oid}, {"$set": updates})
+    await _refresh_league_registry()
+
+    await log_audit(
+        actor_id=str(admin["_id"]),
+        target_id=league_id,
+        action="LEAGUE_UPDATE",
+        metadata={"updates": updates},
+        request=request,
+    )
+    updated = await _db.db.leagues.find_one({"_id": league_oid})
+    return {"message": "League updated.", "item": _league_to_dict(updated or league)}
+
+
+async def _run_single_league_sync(sport_key: str) -> None:
+    from app.workers.matchday_sync import sync_matchdays_for_sport
+
+    try:
+        await sync_matchdays_for_sport(sport_key)
+    except Exception:
+        logger.exception("Manual league sync failed for %s", sport_key)
+
+
+async def _run_league_stats_import(league_oid: ObjectId, season: str | None = None) -> None:
+    try:
+        result = await import_football_data_stats(league_oid, season=season)
+        logger.info("League stats import completed for %s: %s", str(league_oid), result)
+    except Exception:
+        logger.exception("League stats import failed for %s", str(league_oid))
+
+
+@router.post("/leagues/{league_id}/sync")
+async def trigger_league_sync_admin(
+    league_id: str,
+    background_tasks: BackgroundTasks,
+    request: Request,
+    admin=Depends(get_admin_user),
+):
+    league_oid = _parse_object_id(league_id, "league_id")
+    league = await _db.db.leagues.find_one({"_id": league_oid})
+    if not league:
+        raise HTTPException(status_code=404, detail="League not found.")
+
+    sport_key = str(league.get("sport_key") or "").strip()
+    if not sport_key:
+        raise HTTPException(status_code=400, detail="League has no sport_key.")
+
+    background_tasks.add_task(_run_single_league_sync, sport_key)
+    await log_audit(
+        actor_id=str(admin["_id"]),
+        target_id=league_id,
+        action="LEAGUE_SYNC_TRIGGER",
+        metadata={"sport_key": sport_key},
+        request=request,
+    )
+    return {"message": "League sync queued.", "sport_key": sport_key}
+
+
+@router.post("/leagues/{league_id}/import-stats")
+async def trigger_league_stats_import_admin(
+    league_id: str,
+    background_tasks: BackgroundTasks,
+    request: Request,
+    body: LeagueStatsImportBody = LeagueStatsImportBody(),
+    admin=Depends(get_admin_user),
+):
+    league_oid = _parse_object_id(league_id, "league_id")
+    league = await _db.db.leagues.find_one({"_id": league_oid}, {"_id": 1})
+    if not league:
+        raise HTTPException(status_code=404, detail="League not found.")
+
+    background_tasks.add_task(_run_league_stats_import, league_oid, body.season)
+    await log_audit(
+        actor_id=str(admin["_id"]),
+        target_id=league_id,
+        action="LEAGUE_STATS_IMPORT_TRIGGER",
+        metadata={"season": body.season},
+        request=request,
+    )
+    return {"message": "League stats import queued."}
+
+
+def _team_to_dict(doc: dict) -> dict:
+    aliases = []
+    for alias in doc.get("aliases", []):
+        aliases.append(
+            {
+                "name": alias.get("name", ""),
+                "normalized": alias.get("normalized", ""),
+                "sport_key": alias.get("sport_key"),
+                "source": alias.get("source"),
+            }
+        )
+    return {
+        "id": str(doc["_id"]),
+        "display_name": doc.get("display_name", ""),
+        "normalized_name": doc.get("normalized_name", ""),
+        "sport_key": doc.get("sport_key"),
+        "canonical_id": doc.get("canonical_id"),
+        "needs_review": bool(doc.get("needs_review", False)),
+        "source": doc.get("source"),
+        "aliases": aliases,
+        "created_at": ensure_utc(doc.get("created_at")).isoformat() if doc.get("created_at") else None,
+        "updated_at": ensure_utc(doc.get("updated_at")).isoformat() if doc.get("updated_at") else None,
+    }
+
+
+async def _refresh_team_registry() -> None:
+    await TeamRegistry.get().initialize()
+
+
+def _parse_object_id(value: str, field_name: str) -> ObjectId:
+    try:
+        return ObjectId(value)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid {field_name}.") from exc
+
+
+class TeamAliasCreateBody(BaseModel):
+    name: str
+    sport_key: Optional[str] = None
+    source: str = "admin"
+
+
+class TeamAliasDeleteBody(BaseModel):
+    name: str
+    sport_key: Optional[str] = None
+
+
+class TeamUpdateBody(BaseModel):
+    display_name: Optional[str] = None
+    needs_review: Optional[bool] = None
+
+
+class TeamMergeBody(BaseModel):
+    target_id: str
+
+
+@router.get("/teams")
+async def list_teams_admin(
+    needs_review: Optional[bool] = Query(None),
     search: Optional[str] = Query(None),
-    sport_key: Optional[str] = Query(None),
     limit: int = Query(200, ge=1, le=1000),
     offset: int = Query(0, ge=0),
     admin=Depends(get_admin_user),
 ):
-    """List team mappings with optional search and sport_key filter."""
     query: dict = {}
-    if sport_key:
-        query["sport_keys"] = sport_key
+    if needs_review is not None:
+        query["needs_review"] = needs_review
     if search:
-        escaped = re.escape(search)
+        escaped = re.escape(search.strip())
         query["$or"] = [
             {"display_name": {"$regex": escaped, "$options": "i"}},
-            {"names": {"$regex": escaped, "$options": "i"}},
+            {"aliases.name": {"$regex": escaped, "$options": "i"}},
         ]
 
-    total = await _db.db.team_mappings.count_documents(query)
-    docs = await _db.db.team_mappings.find(query).sort(
-        "display_name", 1,
-    ).skip(offset).limit(limit).to_list(length=limit)
-
+    total = await _db.db.teams.count_documents(query)
+    docs = await _db.db.teams.find(query).sort("updated_at", -1).skip(offset).limit(limit).to_list(length=limit)
     return {
         "total": total,
         "offset": offset,
         "limit": limit,
-        "items": [_mapping_to_dict(d) for d in docs],
+        "items": [_team_to_dict(d) for d in docs],
     }
 
 
-@router.get("/team-mappings/{mapping_id}")
-async def get_team_mapping(
-    mapping_id: str, admin=Depends(get_admin_user),
-):
-    """Get a single team mapping by ID."""
-    doc = await _db.db.team_mappings.find_one({"_id": ObjectId(mapping_id)})
-    if not doc:
-        raise HTTPException(status_code=404, detail="Team mapping not found.")
-    return _mapping_to_dict(doc)
-
-
-@router.put("/team-mappings/{mapping_id}")
-async def update_team_mapping(
-    mapping_id: str, body: TeamMappingUpdate, request: Request,
+@router.post("/teams/{team_id}/aliases")
+async def add_team_alias(
+    team_id: str,
+    body: TeamAliasCreateBody,
+    request: Request,
     admin=Depends(get_admin_user),
 ):
-    """Update a team mapping's display_name."""
-    doc = await _db.db.team_mappings.find_one({"_id": ObjectId(mapping_id)})
-    if not doc:
-        raise HTTPException(status_code=404, detail="Team mapping not found.")
+    team_oid = _parse_object_id(team_id, "team_id")
+    team = await _db.db.teams.find_one({"_id": team_oid})
+    if not team:
+        raise HTTPException(status_code=404, detail="Team not found.")
 
-    old_name = doc["display_name"]
-    await _db.db.team_mappings.update_one(
-        {"_id": ObjectId(mapping_id)},
-        {"$set": {"display_name": body.display_name, "updated_at": utcnow()}},
-    )
+    normalized = normalize_team_name(body.name)
+    if not normalized:
+        raise HTTPException(status_code=400, detail="Alias normalization is empty.")
 
-    await reload_canonical_cache()
-    clear_context_cache()
-
-    admin_id = str(admin["_id"])
-    await log_audit(
-        actor_id=admin_id, target_id=mapping_id, action="TEAM_MAPPING_UPDATE",
-        metadata={"canonical_id": doc["canonical_id"], "old": old_name, "new": body.display_name},
-        request=request,
-    )
-    return {"message": f"Updated display_name: {old_name} -> {body.display_name}"}
-
-
-@router.post("/team-mappings")
-async def create_team_mapping(
-    body: TeamMappingCreate, request: Request, admin=Depends(get_admin_user),
-):
-    """Create a new team mapping."""
-    canonical_id = make_canonical_id(body.display_name)
+    alias_doc = {
+        "name": body.name.strip(),
+        "normalized": normalized,
+        "sport_key": body.sport_key or team.get("sport_key"),
+        "source": body.source or "admin",
+    }
     now = utcnow()
+    await _db.db.teams.update_one(
+        {"_id": team_oid},
+        {"$addToSet": {"aliases": alias_doc}, "$set": {"updated_at": now}},
+    )
+    await _refresh_team_registry()
 
-    # Ensure the display_name itself is always in the names array
-    names = list(dict.fromkeys([body.display_name] + body.names))
-
-    doc = {
-        "canonical_id": canonical_id,
-        "display_name": body.display_name,
-        "names": names,
-        "external_ids": {},
-        "sport_keys": body.sport_keys,
-        "created_at": now,
-        "updated_at": now,
-    }
-    result = await _db.db.team_mappings.insert_one(doc)
-
-    await reload_canonical_cache()
-    clear_context_cache()
-
-    admin_id = str(admin["_id"])
     await log_audit(
-        actor_id=admin_id, target_id=str(result.inserted_id), action="TEAM_MAPPING_CREATE",
-        metadata={"canonical_id": canonical_id, "display_name": body.display_name},
+        actor_id=str(admin["_id"]),
+        target_id=team_id,
+        action="TEAM_ALIAS_ADD",
+        metadata={"alias": alias_doc},
         request=request,
     )
-    return {"message": f"Created team mapping: {body.display_name} ({canonical_id})", "id": str(result.inserted_id)}
+    return {"message": "Alias added.", "alias": alias_doc}
 
 
-@router.delete("/team-mappings/{mapping_id}")
-async def delete_team_mapping(
-    mapping_id: str, request: Request, admin=Depends(get_admin_user),
-):
-    """Delete a team mapping."""
-    doc = await _db.db.team_mappings.find_one({"_id": ObjectId(mapping_id)})
-    if not doc:
-        raise HTTPException(status_code=404, detail="Team mapping not found.")
-
-    await _db.db.team_mappings.delete_one({"_id": ObjectId(mapping_id)})
-    await reload_canonical_cache()
-    clear_context_cache()
-
-    admin_id = str(admin["_id"])
-    await log_audit(
-        actor_id=admin_id, target_id=mapping_id, action="TEAM_MAPPING_DELETE",
-        metadata={"canonical_id": doc["canonical_id"], "display_name": doc["display_name"]},
-        request=request,
-    )
-    return {"message": f"Deleted team mapping: {doc['display_name']}"}
-
-
-@router.post("/team-mappings/{mapping_id}/names")
-async def add_mapping_names(
-    mapping_id: str, body: TeamMappingNamesBody, request: Request,
+@router.delete("/teams/{team_id}/aliases")
+async def remove_team_alias(
+    team_id: str,
+    body: TeamAliasDeleteBody,
+    request: Request,
     admin=Depends(get_admin_user),
 ):
-    """Add name variant(s) to a team mapping."""
-    doc = await _db.db.team_mappings.find_one({"_id": ObjectId(mapping_id)})
-    if not doc:
-        raise HTTPException(status_code=404, detail="Team mapping not found.")
+    team_oid = _parse_object_id(team_id, "team_id")
+    team = await _db.db.teams.find_one({"_id": team_oid})
+    if not team:
+        raise HTTPException(status_code=404, detail="Team not found.")
 
-    await _db.db.team_mappings.update_one(
-        {"_id": ObjectId(mapping_id)},
-        {"$addToSet": {"names": {"$each": body.names}}, "$set": {"updated_at": utcnow()}},
+    normalized = normalize_team_name(body.name)
+    if not normalized:
+        raise HTTPException(status_code=400, detail="Alias normalization is empty.")
+
+    pull_filter: dict = {"normalized": normalized}
+    if body.sport_key:
+        pull_filter["sport_key"] = body.sport_key
+    now = utcnow()
+    await _db.db.teams.update_one(
+        {"_id": team_oid},
+        {"$pull": {"aliases": pull_filter}, "$set": {"updated_at": now}},
     )
+    await _refresh_team_registry()
 
-    await reload_canonical_cache()
-    clear_context_cache()
-
-    admin_id = str(admin["_id"])
     await log_audit(
-        actor_id=admin_id, target_id=mapping_id, action="TEAM_MAPPING_ADD_NAMES",
-        metadata={"canonical_id": doc["canonical_id"], "added": body.names},
+        actor_id=str(admin["_id"]),
+        target_id=team_id,
+        action="TEAM_ALIAS_REMOVE",
+        metadata={"normalized": normalized, "sport_key": body.sport_key},
         request=request,
     )
-    return {"message": f"Added {len(body.names)} name(s) to {doc['display_name']}"}
+    return {"message": "Alias removed.", "normalized": normalized}
 
 
-@router.delete("/team-mappings/{mapping_id}/names")
-async def remove_mapping_names(
-    mapping_id: str, body: TeamMappingNamesBody, request: Request,
+@router.patch("/teams/{team_id}")
+async def update_team_admin(
+    team_id: str,
+    body: TeamUpdateBody,
+    request: Request,
     admin=Depends(get_admin_user),
 ):
-    """Remove name variant(s) from a team mapping."""
-    doc = await _db.db.team_mappings.find_one({"_id": ObjectId(mapping_id)})
-    if not doc:
-        raise HTTPException(status_code=404, detail="Team mapping not found.")
+    if body.display_name is None and body.needs_review is None:
+        raise HTTPException(status_code=400, detail="Nothing to update.")
 
-    await _db.db.team_mappings.update_one(
-        {"_id": ObjectId(mapping_id)},
-        {"$pull": {"names": {"$in": body.names}}, "$set": {"updated_at": utcnow()}},
-    )
+    team_oid = _parse_object_id(team_id, "team_id")
+    team = await _db.db.teams.find_one({"_id": team_oid})
+    if not team:
+        raise HTTPException(status_code=404, detail="Team not found.")
 
-    await reload_canonical_cache()
-    clear_context_cache()
+    updates: dict = {"updated_at": utcnow()}
+    if body.display_name is not None:
+        updates["display_name"] = body.display_name.strip()
+    if body.needs_review is not None:
+        updates["needs_review"] = bool(body.needs_review)
 
-    admin_id = str(admin["_id"])
+    await _db.db.teams.update_one({"_id": team_oid}, {"$set": updates})
+    await _refresh_team_registry()
+
     await log_audit(
-        actor_id=admin_id, target_id=mapping_id, action="TEAM_MAPPING_REMOVE_NAMES",
-        metadata={"canonical_id": doc["canonical_id"], "removed": body.names},
+        actor_id=str(admin["_id"]),
+        target_id=team_id,
+        action="TEAM_UPDATE",
+        metadata={"updates": updates},
         request=request,
     )
-    return {"message": f"Removed {len(body.names)} name(s) from {doc['display_name']}"}
+    return {"message": "Team updated."}
 
 
-@router.post("/team-mappings/reseed")
-async def reseed_team_mappings(
-    request: Request, admin=Depends(get_admin_user),
+@router.post("/teams/{team_id}/merge")
+async def merge_team_admin(
+    team_id: str,
+    body: TeamMergeBody,
+    request: Request,
+    admin=Depends(get_admin_user),
 ):
-    """Re-run the team mapping seed. Restores missing entries, never overwrites manual edits."""
-    upserted = await seed_canonical_map()
-    await reload_canonical_cache()
-    clear_context_cache()
+    source_id = _parse_object_id(team_id, "team_id")
+    target_id = _parse_object_id(body.target_id, "target_id")
+    if source_id == target_id:
+        raise HTTPException(status_code=400, detail="source_id and target_id must differ.")
 
+    stats = await merge_teams(source_id, target_id)
     await log_audit(
-        actor_id=str(admin["_id"]), target_id="team_mappings", action="TEAM_MAPPING_RESEED",
-        metadata={"upserted": upserted},
+        actor_id=str(admin["_id"]),
+        target_id=str(target_id),
+        action="TEAM_MERGE",
+        metadata={"source_id": str(source_id), "target_id": str(target_id), "stats": stats},
         request=request,
     )
-    return {"message": f"Seed completed. {upserted} new entries inserted."}
+    return {"message": "Teams merged.", "stats": stats}
 
 
 # ---------------------------------------------------------------------------

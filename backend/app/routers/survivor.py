@@ -59,11 +59,21 @@ async def get_standings(
 
 
 def _entry_response(entry: dict) -> dict:
+    picks = []
+    for p in entry.get("picks", []):
+        row = p if isinstance(p, dict) else p.model_dump()
+        row = dict(row)
+        if row.get("team_id") is not None:
+            row["team_id"] = str(row["team_id"])
+        picks.append(row)
+
+    used_team_ids = [str(tid) for tid in entry.get("used_team_ids", [])]
     return SurvivorEntryResponse(
         id=str(entry["_id"]),
         status=entry["status"],
-        picks=[p if isinstance(p, dict) else p.model_dump() for p in entry.get("picks", [])],
+        picks=picks,
         used_teams=entry.get("used_teams", []),
+        used_team_ids=used_team_ids,
         streak=entry.get("streak", 0),
         eliminated_at=entry.get("eliminated_at"),
     ).model_dump()

@@ -1,80 +1,419 @@
-"""Match service — unified lifecycle: scheduled → live → final.
-
-Handles odds sync from TheOddsAPI, match queries, and status transitions.
-Team names are resolved to canonical keys at insert time via team_mapping_service.
 """
+backend/app/services/match_service.py
+
+Purpose:
+    Match ingest and query service for the Greenfield Match domain. Validates
+    leagues via LeagueRegistry, resolves team identities via TeamRegistry, and
+    upserts matches idempotently using provider external IDs and Team-ID/date
+    fallback matching.
+
+Dependencies:
+    - app.database
+    - app.models.matches
+    - app.providers.odds_api
+    - app.services.league_service
+    - app.services.team_registry_service
+    - app.utils
+"""
+
+from __future__ import annotations
 
 import logging
 from datetime import datetime, timedelta
-from typing import Optional
+from typing import Any
 
 import app.database as _db
-from app.models.match import MatchStatus
-from app.providers.odds_api import odds_provider, SUPPORTED_SPORTS
-from app.services.team_mapping_service import (
-    SPORT_KEY_TO_LEAGUE_CODE,
-    derive_season_year,
-    normalize_match_date,
-    resolve_or_create_team,
-    season_code,
-    season_label,
-)
+from app.models.matches import MatchStatus
+from app.providers.odds_api import SUPPORTED_SPORTS, odds_provider
+from app.services.league_service import LeagueRegistry
+from app.services.team_registry_service import TeamRegistry
 from app.utils import ensure_utc, parse_utc, utcnow
 
 logger = logging.getLogger("quotico.match_service")
 
-# Max match duration — used for status computation and smart sleep.
 _MAX_DURATION: dict[str, timedelta] = {}
-_DEFAULT_DURATION = timedelta(minutes=190)  # soccer
+_DEFAULT_DURATION = timedelta(minutes=190)
 
 
-def _compute_status(
-    match_date: datetime,
-    now: datetime,
-    sport_key: str,
-    existing: dict | None,
-) -> str | None:
-    """Compute the status for an existing or new match.
+def _as_datetime(value: Any) -> datetime:
+    if isinstance(value, datetime):
+        return ensure_utc(value)
+    if isinstance(value, str):
+        return parse_utc(value)
+    raise ValueError(f"Unsupported datetime value: {value!r}")
 
-    Returns a status string, or None if the existing status should not be changed
-    (i.e. already in a terminal state).
-    """
-    if existing:
-        cur_status = existing.get("status")
-        if cur_status in (MatchStatus.final, MatchStatus.cancelled):
-            return None  # never downgrade terminal states
-        # Preserve live/final for matches that already had results
-        if cur_status == MatchStatus.final:
-            return None
 
-    max_dur = _MAX_DURATION.get(sport_key, _DEFAULT_DURATION)
+def _derive_season(match_date: datetime) -> int:
+    # Football season starts in July; season stores start year.
+    return match_date.year if match_date.month >= 7 else match_date.year - 1
+
+
+def _status_from_provider(provider_status: str | None, match_date: datetime, now: datetime) -> MatchStatus:
+    raw = (provider_status or "").strip().lower()
+
+    if raw in {"in_play", "live", "running", "paused", "halftime", "half_time"}:
+        return MatchStatus.LIVE
+    if raw in {"finished", "final", "complete", "completed"}:
+        return MatchStatus.FINAL
+    if raw in {"postponed"}:
+        return MatchStatus.POSTPONED
+    if raw in {"canceled", "cancelled"}:
+        return MatchStatus.CANCELED
+    if raw in {"timed", "scheduled"}:
+        return MatchStatus.SCHEDULED
+
     if match_date > now:
-        return MatchStatus.scheduled
-    elif (now - match_date) <= max_dur:
-        return MatchStatus.live
-    else:
-        # Past expected duration — don't override to final (let resolver handle it)
-        return None if existing else MatchStatus.final
+        return MatchStatus.SCHEDULED
+    if (now - match_date) <= _DEFAULT_DURATION:
+        return MatchStatus.LIVE
+    return MatchStatus.FINAL
+
+
+def _normalize_score_detail(data: dict[str, Any] | None) -> dict[str, int | None] | None:
+    if not isinstance(data, dict):
+        return None
+    home = data.get("home")
+    away = data.get("away")
+    if home is None and away is None:
+        return None
+    return {
+        "home": int(home) if home is not None else None,
+        "away": int(away) if away is not None else None,
+    }
+
+
+def _normalize_score(payload: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        payload = {}
+
+    full_time = _normalize_score_detail(payload.get("full_time")) or {"home": None, "away": None}
+    half_time = _normalize_score_detail(payload.get("half_time"))
+    extra_time = _normalize_score_detail(payload.get("extra_time"))
+    penalties = _normalize_score_detail(payload.get("penalties"))
+
+    return {
+        "full_time": full_time,
+        "half_time": half_time,
+        "extra_time": extra_time,
+        "penalties": penalties,
+    }
+
+
+def _normalize_text(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _normalize_round_name(value: Any) -> str | None:
+    text = _normalize_text(value)
+    if not text:
+        return None
+    key = text.lower()
+    mapping = {
+        "round of 16": "Round of 16",
+        "last 16": "Round of 16",
+        "quarter finals": "Quarter-Final",
+        "quarterfinal": "Quarter-Final",
+        "quarter-final": "Quarter-Final",
+        "semi finals": "Semi-Final",
+        "semifinal": "Semi-Final",
+        "semi-final": "Semi-Final",
+        "final": "Final",
+        "3rd place final": "Third-Place",
+    }
+    return mapping.get(key, text)
+
+
+def _legacy_result_from_score(score: dict[str, Any]) -> dict[str, Any]:
+    ft = score.get("full_time") or {}
+    home = ft.get("home")
+    away = ft.get("away")
+    outcome = None
+    if home is not None and away is not None:
+        if home > away:
+            outcome = "1"
+        elif home < away:
+            outcome = "2"
+        else:
+            outcome = "X"
+
+    half_time = score.get("half_time")
+    return {
+        "home_score": home,
+        "away_score": away,
+        "outcome": outcome,
+        "half_time": half_time,
+    }
+
+
+def _extract_provider_match(
+    match: dict[str, Any],
+) -> tuple[
+    str,
+    str,
+    datetime,
+    str | None,
+    str | None,
+    dict[str, Any],
+    dict[str, Any],
+    str | None,
+    str | None,
+    dict[str, int | None] | None,
+    dict[str, int | None] | None,
+]:
+    teams = match.get("teams") if isinstance(match.get("teams"), dict) else {}
+    home_team = str(teams.get("home") or match.get("home_team") or "").strip()
+    away_team = str(teams.get("away") or match.get("away_team") or "").strip()
+    if not home_team or not away_team:
+        raise ValueError("Provider match missing home/away team name.")
+
+    match_date = _as_datetime(
+        match.get("match_date")
+        or match.get("commence_time")
+        or match.get("utc_date")
+    )
+
+    provider_external_id = match.get("external_id")
+    if provider_external_id is not None:
+        provider_external_id = str(provider_external_id).strip() or None
+
+    provider_status = match.get("status")
+    if provider_status is not None:
+        provider_status = str(provider_status).strip() or None
+
+    score = _normalize_score(match.get("score"))
+    if score["full_time"]["home"] is None and match.get("home_score") is not None:
+        score["full_time"]["home"] = int(match.get("home_score"))
+    if score["full_time"]["away"] is None and match.get("away_score") is not None:
+        score["full_time"]["away"] = int(match.get("away_score"))
+
+    odds = {
+        "h2h": match.get("odds", {}) if isinstance(match.get("odds"), dict) else {},
+        "totals": match.get("totals_odds", {}) if isinstance(match.get("totals_odds"), dict) else {},
+        "spreads": match.get("spreads_odds", {}) if isinstance(match.get("spreads_odds"), dict) else {},
+    }
+    round_name = _normalize_round_name(
+        match.get("round_name")
+        or match.get("round")
+        or match.get("stage")
+    )
+    group_name = _normalize_text(
+        match.get("group_name")
+        or match.get("group")
+    )
+    score_extra_time = _normalize_score_detail(
+        match.get("score_extra_time")
+        or match.get("extra_time_score")
+    ) or _normalize_score_detail(score.get("extra_time"))
+    score_penalties = _normalize_score_detail(
+        match.get("score_penalties")
+        or match.get("penalties_score")
+    ) or _normalize_score_detail(score.get("penalties"))
+
+    return (
+        home_team,
+        away_team,
+        match_date,
+        provider_external_id,
+        provider_status,
+        score,
+        odds,
+        round_name,
+        group_name,
+        score_extra_time,
+        score_penalties,
+    )
+
+
+async def update_matches_from_provider(provider_name: str, provider_data: list[dict]) -> dict[str, int]:
+    """Upsert provider match payloads into the unified Match model.
+
+    Dedup order:
+    1) external_ids[provider_name]
+    2) (league_id, home_team_id, away_team_id, match_date +-24h)
+    """
+    processed = 0
+    created = 0
+    updated = 0
+    skipped = 0
+    now = utcnow()
+
+    registry = LeagueRegistry.get()
+    team_registry = TeamRegistry.get()
+
+    for raw_match in provider_data:
+        try:
+            sport_key = str(raw_match.get("sport_key") or "").strip()
+            if not sport_key:
+                raise ValueError("Provider match missing sport_key.")
+
+            league = await registry.ensure_for_import(
+                sport_key,
+                provider_name=provider_name,
+                provider_id=sport_key,
+                auto_create_inactive=True,
+            )
+            if not league.get("is_active", False):
+                skipped += 1
+                continue
+
+            league_id = league.get("_id")
+            if league_id is None:
+                raise ValueError(f"League has no _id for sport_key={sport_key}")
+
+            (
+                home_team,
+                away_team,
+                match_date,
+                external_id,
+                provider_status,
+                score,
+                odds,
+                round_name,
+                group_name,
+                score_extra_time,
+                score_penalties,
+            ) = _extract_provider_match(raw_match)
+            home_team_id = await team_registry.resolve(home_team, sport_key)
+            away_team_id = await team_registry.resolve(away_team, sport_key)
+
+            status = _status_from_provider(provider_status, match_date, now)
+            if score["full_time"]["home"] is not None and score["full_time"]["away"] is not None:
+                status = MatchStatus.FINAL
+
+            season = int(raw_match.get("season") or _derive_season(match_date))
+            external_ids: dict[str, str] = {}
+            if external_id:
+                external_ids[provider_name] = external_id
+
+            set_fields: dict[str, Any] = {
+                "league_id": league_id,
+                "sport_key": sport_key,
+                "home_team_id": home_team_id,
+                "away_team_id": away_team_id,
+                "home_team": home_team,
+                "away_team": away_team,
+                "match_date": match_date,
+                "match_date_hour": match_date.replace(minute=0, second=0, microsecond=0),
+                "last_updated": now,
+                "updated_at": now,
+                "season": season,
+                "status": status.value,
+                "score": score,
+                "result": _legacy_result_from_score(score),
+                "odds": {
+                    "h2h": odds["h2h"],
+                    "totals": odds["totals"],
+                    "spreads": odds["spreads"],
+                    "updated_at": now,
+                },
+            }
+
+            if raw_match.get("matchday") is not None:
+                set_fields["matchday"] = int(raw_match["matchday"])
+                set_fields["matchday_number"] = int(raw_match["matchday"])
+            if raw_match.get("matchday_number") is not None:
+                set_fields["matchday_number"] = int(raw_match["matchday_number"])
+            if raw_match.get("matchday_season") is not None:
+                set_fields["matchday_season"] = int(raw_match["matchday_season"])
+            if raw_match.get("round_name") is not None:
+                set_fields["round_name"] = str(raw_match["round_name"])
+            elif round_name is not None:
+                set_fields["round_name"] = round_name
+            if group_name is not None:
+                set_fields["group_name"] = group_name
+            if score_extra_time is not None:
+                set_fields["score_extra_time"] = score_extra_time
+            if score_penalties is not None:
+                set_fields["score_penalties"] = score_penalties
+
+            match_filter: dict[str, Any] | None = None
+            if external_id:
+                match_filter = {f"external_ids.{provider_name}": external_id}
+                existing = await _db.db.matches.find_one(match_filter, {"_id": 1})
+            else:
+                existing = None
+
+            if not existing:
+                fallback_filter = {
+                    "league_id": league_id,
+                    "home_team_id": home_team_id,
+                    "away_team_id": away_team_id,
+                    "match_date": {
+                        "$gte": match_date - timedelta(hours=24),
+                        "$lte": match_date + timedelta(hours=24),
+                    },
+                }
+                existing = await _db.db.matches.find_one(fallback_filter, {"_id": 1})
+                if existing:
+                    match_filter = {"_id": existing["_id"]}
+
+            if match_filter is None:
+                match_filter = {
+                    "league_id": league_id,
+                    "home_team_id": home_team_id,
+                    "away_team_id": away_team_id,
+                    "match_date_hour": match_date.replace(minute=0, second=0, microsecond=0),
+                }
+
+            update_doc: dict[str, Any] = {
+                "$set": set_fields,
+                "$setOnInsert": {
+                    "created_at": now,
+                    "external_ids": external_ids,
+                },
+            }
+
+            if external_id:
+                update_doc.setdefault("$set", {})[f"external_ids.{provider_name}"] = external_id
+                # compatibility for existing workers
+                if provider_name == "theoddsapi":
+                    update_doc["$set"]["metadata.theoddsapi_id"] = external_id
+                    update_doc["$set"]["metadata.source"] = "theoddsapi"
+
+            result = await _db.db.matches.update_one(match_filter, update_doc, upsert=True)
+            processed += 1
+            if result.upserted_id is not None:
+                created += 1
+            else:
+                updated += 1
+
+        except Exception:
+            logger.exception("Match ingest failed for provider=%s payload=%s", provider_name, raw_match)
+            skipped += 1
+
+    return {
+        "processed": processed,
+        "created": created,
+        "updated": updated,
+        "skipped": skipped,
+    }
 
 
 async def sports_with_live_action() -> set[str]:
-    """Return sport_keys that likely have matches in progress right now.
-
-    Checks our own DB — zero external API calls.
-    """
     now = utcnow()
+    live_states = [MatchStatus.LIVE.value, MatchStatus.SCHEDULED.value]
     live_sports: set[str] = set()
 
     for sport_key in SUPPORTED_SPORTS:
+        league = await LeagueRegistry.get().get_league(sport_key)
+        if not league or not league.get("is_active", False):
+            continue
+
         max_dur = _MAX_DURATION.get(sport_key, _DEFAULT_DURATION)
-        has_live = await _db.db.matches.find_one({
-            "sport_key": sport_key,
-            "status": {"$in": [MatchStatus.scheduled, MatchStatus.live]},
-            "match_date": {
-                "$lte": now,
-                "$gte": now - max_dur,
+        has_live = await _db.db.matches.find_one(
+            {
+                "sport_key": sport_key,
+                "status": {"$in": live_states},
+                "match_date": {
+                    "$lte": now,
+                    "$gte": now - max_dur,
+                },
             },
-        })
+            {"_id": 1},
+        )
         if has_live:
             live_sports.add(sport_key)
 
@@ -82,11 +421,10 @@ async def sports_with_live_action() -> set[str]:
 
 
 async def next_kickoff_in() -> timedelta | None:
-    """How long until the next scheduled match kicks off?"""
     now = utcnow()
     nxt = await _db.db.matches.find_one(
         {
-            "status": MatchStatus.scheduled,
+            "status": MatchStatus.SCHEDULED.value,
             "match_date": {"$gt": now},
         },
         sort=[("match_date", 1)],
@@ -97,180 +435,19 @@ async def next_kickoff_in() -> timedelta | None:
     return None
 
 
-async def sync_matches_for_sport(sport_key: str) -> dict:
-    """Fetch odds from provider and upsert matches in DB.
-
-    Key changes from old version:
-    - Resolves team names via team_mapping_service at insert time
-    - Dual lookup: metadata.theoddsapi_id (fast path) → compound key (fallback)
-    - Writes to nested odds structure
-    - Stores season, season_label, league_code, team keys
-
-    Returns {"matches": count, "odds_changed": changed_count}.
-    """
-    matches_data = await odds_provider.get_odds(sport_key)
-    if not matches_data:
-        return {"matches": 0, "odds_changed": 0}
-
-    now = utcnow()
-    count = 0
-    odds_changed = 0
-
-    for m in matches_data:
-        match_date_raw = m["commence_time"]
-        if isinstance(match_date_raw, str):
-            match_date_raw = parse_utc(match_date_raw)
-        match_date_normalized = normalize_match_date(match_date_raw)
-
-        # Resolve team names to canonical keys
-        home_display, home_key = await resolve_or_create_team(
-            m["teams"]["home"], sport_key,
-        )
-        away_display, away_key = await resolve_or_create_team(
-            m["teams"]["away"], sport_key,
-        )
-
-        sy = derive_season_year(match_date_raw)
-        sc = season_code(sy)
-        sl = season_label(sy)
-
-        # Build nested odds
-        odds_h2h = m["odds"]
-        odds_totals = m.get("totals_odds", {})
-        odds_spreads = m.get("spreads_odds", {})
-
-        # --- Find existing match ---
-
-        # Fast path: by TheOddsAPI external_id
-        existing = await _db.db.matches.find_one(
-            {"metadata.theoddsapi_id": m["external_id"]},
-            projection={"status": 1, "odds": 1},
-        )
-
-        if not existing:
-            # Fallback: compound key with ±6h date window
-            # (handles matchday-created matches that later get odds)
-            existing = await _db.db.matches.find_one({
-                "sport_key": sport_key,
-                "home_team_key": home_key,
-                "away_team_key": away_key,
-                "match_date": {
-                    "$gte": match_date_normalized - timedelta(hours=6),
-                    "$lte": match_date_normalized + timedelta(hours=6),
-                },
-            }, projection={"status": 1, "odds": 1})
-
-        # Detect odds changes
-        if existing:
-            old_odds = existing.get("odds", {})
-            if (old_odds.get("h2h") != odds_h2h
-                    or old_odds.get("totals") != odds_totals
-                    or old_odds.get("spreads") != odds_spreads):
-                odds_changed += 1
-
-        # Determine status
-        status = _compute_status(match_date_raw, now, sport_key, existing)
-
-        # Freeze closing line on scheduled → live transition
-        closing_line = None
-        if (
-            status == MatchStatus.live
-            and existing
-            and existing.get("status") == MatchStatus.scheduled
-        ):
-            old_odds = existing.get("odds", {})
-            closing_line = {
-                "h2h": old_odds.get("h2h", {}),
-                "totals": old_odds.get("totals", {}),
-                "spreads": old_odds.get("spreads", {}),
-                "frozen_at": now,
-            }
-
-        # Build update — match_date is the raw accurate time (display/countdown),
-        # match_date_hour is floored to the hour (compound unique index only)
-        set_fields: dict = {
-            "sport_key": sport_key,
-            "match_date": match_date_raw,
-            "match_date_hour": match_date_normalized,
-            "home_team": home_display,
-            "away_team": away_display,
-            "home_team_key": home_key,
-            "away_team_key": away_key,
-            "season": sc,
-            "season_label": sl,
-            "league_code": SPORT_KEY_TO_LEAGUE_CODE.get(sport_key),
-            "odds.h2h": odds_h2h,
-            "odds.updated_at": now,
-            "metadata.theoddsapi_id": m["external_id"],
-            "metadata.source": "theoddsapi",
-            "updated_at": now,
-        }
-        if odds_totals:
-            set_fields["odds.totals"] = odds_totals
-        if odds_spreads:
-            set_fields["odds.spreads"] = odds_spreads
-        if closing_line:
-            set_fields["odds.closing_line"] = closing_line
-        if status:
-            set_fields["status"] = status
-
-        # Choose upsert filter
-        if existing:
-            upsert_filter = {"_id": existing["_id"]}
-        else:
-            upsert_filter = {
-                "sport_key": sport_key,
-                "season": sc,
-                "home_team_key": home_key,
-                "away_team_key": away_key,
-                "match_date_hour": match_date_normalized,
-            }
-
-        set_on_insert: dict = {
-            "result": {
-                "home_score": None, "away_score": None,
-                "outcome": None, "half_time": None,
-            },
-            "created_at": now,
-        }
-        # Only set status in $setOnInsert when it's not already in $set
-        if "status" not in set_fields:
-            set_on_insert["status"] = MatchStatus.scheduled
-
-        await _db.db.matches.update_one(
-            upsert_filter,
-            {
-                "$set": set_fields,
-                "$setOnInsert": set_on_insert,
-            },
-            upsert=True,
-        )
-        count += 1
-
-    # Sweep: touch odds.updated_at for scheduled matches of this sport that
-    # have valid odds but weren't in the API response (lines pulled near kickoff).
-    seen_theoddsapi_ids = [m["external_id"] for m in matches_data]
-    sweep_result = await _db.db.matches.update_many(
-        {
-            "sport_key": sport_key,
-            "status": MatchStatus.scheduled,
-            "odds.h2h": {"$ne": {}},
-            "metadata.theoddsapi_id": {"$nin": seen_theoddsapi_ids},
-        },
-        {"$set": {"odds.updated_at": now}},
-    )
-    if sweep_result.modified_count:
-        logger.info(
-            "Swept %d unfound %s matches (odds.updated_at refreshed)",
-            sweep_result.modified_count, sport_key,
-        )
-
-    logger.info("Synced %d matches for %s (%d odds changed)", count, sport_key, odds_changed)
-    return {"matches": count, "odds_changed": odds_changed}
+async def sync_matches_for_sport(sport_key: str) -> dict[str, int]:
+    provider_payload = await odds_provider.get_odds(sport_key)
+    if not provider_payload:
+        return {"processed": 0, "created": 0, "updated": 0, "skipped": 0, "matches": 0, "odds_changed": 0}
+    result = await update_matches_from_provider("theoddsapi", provider_payload)
+    return {
+        **result,
+        "matches": result["processed"],
+        "odds_changed": result["updated"],
+    }
 
 
-async def get_match_by_id(match_id: str) -> Optional[dict]:
-    """Get a single match by its MongoDB _id."""
+async def get_match_by_id(match_id: str) -> dict | None:
     from bson import ObjectId
 
     try:
@@ -280,20 +457,32 @@ async def get_match_by_id(match_id: str) -> Optional[dict]:
 
 
 async def get_matches(
-    sport_key: Optional[str] = None,
-    status: Optional[str] = None,
+    sport_key: str | None = None,
+    status: str | None = None,
     limit: int = 50,
 ) -> list[dict]:
-    """Get matches with optional filters, sorted by match_date."""
-    query: dict = {}
+    query: dict[str, Any] = {}
     if sport_key:
         query["sport_key"] = sport_key
+
     if status:
-        # Accept both old (upcoming/completed) and new (scheduled/final) status names
-        status_map = {"upcoming": MatchStatus.scheduled, "completed": MatchStatus.final}
-        query["status"] = status_map.get(status, status)
+        normalized = status.strip().lower()
+        aliases = {
+            "upcoming": MatchStatus.SCHEDULED.value,
+            "completed": MatchStatus.FINAL.value,
+            "live": MatchStatus.LIVE.value,
+            "final": MatchStatus.FINAL.value,
+            "cancelled": MatchStatus.CANCELED.value,
+            "canceled": MatchStatus.CANCELED.value,
+        }
+        query["status"] = aliases.get(normalized, normalized)
     else:
-        query["status"] = {"$in": [MatchStatus.scheduled, MatchStatus.live]}
+        query["status"] = {
+            "$in": [
+                MatchStatus.SCHEDULED.value,
+                MatchStatus.LIVE.value,
+            ]
+        }
 
     cursor = _db.db.matches.find(query).sort("match_date", 1).limit(limit)
     return await cursor.to_list(length=limit)

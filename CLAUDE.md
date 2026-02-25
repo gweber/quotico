@@ -39,6 +39,7 @@ No test suite exists yet. The frontend uses TypeScript strict mode as its primar
 - **Services:** `backend/app/services/` — business logic separated from HTTP layer
 - **Providers:** `backend/app/providers/` — external API integrations (TheOddsAPI, football-data.org, OpenLigaDB, ESPN)
 - **Workers:** `backend/app/workers/` — APScheduler background jobs (odds polling, match resolution, leaderboard materialization, badge engine) running every 30 minutes
+- **Worker automation control:** startup keeps automated jobs disabled by default; admins can toggle runtime scheduling via `GET/POST /api/admin/workers/automation` (optional initial sync on enable).
 - **Calibration prep:** scheduled calibration jobs normalize legacy bookmaker odds into canonical `odds.h2h` via `backend/app/services/odds_normalization_service.py` before running optimizer calibration.
 - **Qbot evolution:** `tools/qbot_evolution_arena.py` uses soft bet-count penalties (no hard kill), two-stage search relaxation, Pareto compromise selection, and shadow-mode persistence with structured `optimization_notes`.
 - **Modern-era fitness:** Arena tip loading defaults to an 8-year lookback (`--lookback-years` override), applies linear time-decay weights (floor 0.20) to ROI/Sharpe/Drawdown fitness terms, and persists `optimization_notes.lookback_years`.
@@ -79,6 +80,28 @@ No test suite exists yet. The frontend uses TypeScript strict mode as its primar
 
 ### Database — MongoDB 7
 No ORM. Direct Motor async driver with `app.database.db` module-level instance. Collections: `users`, `matches`, `bets`, `squads`, `battles`, `battle_participations`, `leaderboard`, `points_transactions`, `badges`, `audit_logs`, `refresh_tokens`, `access_blocklist`, `matchday_predictions`, `matchday_leaderboard`, `quotico_tips`, `join_requests`, `wallet_transactions`. Indexes are created on startup in `database._ensure_indexes()`. Naming migrations run on startup in `database._migrate_naming_refactor()`.
+
+### Team Identity Migration Guardrails
+- `TeamRegistry` lives in `backend/app/services/team_registry_service.py` and resolves team names to `teams._id` (ObjectId).
+- Match ingest writes both display names and identity fields: `matches.home_team_id` / `matches.away_team_id`.
+- `LeagueRegistry` lives in `backend/app/services/league_service.py` and is initialized at startup.
+- League ingest validation is mandatory: matches/odds/xG/matchday ingest paths call `LeagueRegistry.ensure_for_import(...)` before processing a `sport_key`.
+- Unknown leagues are created as review docs (`is_active=false`, `needs_review=true`) in `leagues`; ingest for inactive leagues is skipped/aborted until activation.
+- `leagues.sport_key` is unique-indexed; provider mappings are stored in `leagues.provider_mappings` (`theoddsapi`, `understat`, `football_data`, `openligadb`).
+- Initial core leagues are seeded with `python -m tools.seed_leagues`.
+- Admin team operations are Team-Tower-only (`/api/admin/teams*` in `backend/app/routers/admin.py`):
+  - list with `needs_review` + regex search (`display_name`, `aliases.name`)
+  - alias add/remove with normalization via `normalize_team_name()`
+  - team patch (`display_name`, `needs_review`)
+  - merge route (`POST /api/admin/teams/{team_id}/merge`) backed by `backend/app/services/admin_service.py::merge_teams`
+- Team merge rewrites all team identity references (`matches`, `quotico_tips`, `betting_slips`, `survivor_entries`, `fantasy_picks`), deletes source team doc, and forces `TeamRegistry.initialize()` so in-memory cache is immediately consistent.
+- Teams can store `league_ids` (ObjectId refs to `leagues`) in addition to legacy `sport_key`.
+- `tools/seed_teams.py` must run before team-id backfill.
+- `tools/migrate_team_ids.py` enforces a hard precheck:
+  - counts `db.teams` docs where `source == "seed"`
+  - aborts if seeded count is below 70 (`expected 70+`)
+  - initializes `TeamRegistry` only after the precheck passes.
+- Stage-8 refactor order is strict: tips denormalization first, then fantasy, then survivor, then betting slips.
 
 **Datetime convention:** MongoDB returns naive datetimes (no tzinfo). All Python-side datetime arithmetic must use the helpers in `backend/app/utils.py`:
 - `utcnow()` — tz-aware "now" (use instead of `datetime.now()`/`datetime.utcnow()`)

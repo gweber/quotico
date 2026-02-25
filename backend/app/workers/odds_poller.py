@@ -1,3 +1,11 @@
+"""
+backend/app/workers/odds_poller.py
+
+Purpose:
+    Poll odds providers for active leagues and refresh match odds snapshots plus
+    downstream candidate generation, respecting league feature flags.
+"""
+
 import logging
 from datetime import timedelta
 
@@ -6,6 +14,7 @@ from pymongo.errors import DuplicateKeyError
 import app.database as _db
 from app.config import settings
 from app.providers.odds_api import SUPPORTED_SPORTS, odds_provider
+from app.services.league_service import LeagueRegistry, league_feature_enabled
 from app.services.match_service import sync_matches_for_sport
 from app.utils import ensure_utc, utcnow
 from app.workers._state import recently_synced, set_synced
@@ -28,6 +37,18 @@ async def poll_odds() -> None:
     total_odds_changed = 0
 
     for sport_key in SUPPORTED_SPORTS:
+        league = await LeagueRegistry.get().ensure_for_import(
+            sport_key,
+            provider_name="theoddsapi",
+            provider_id=sport_key,
+            auto_create_inactive=True,
+        )
+        if not league.get("is_active", False):
+            continue
+        if not league_feature_enabled(league, "odds_sync", False):
+            logger.debug("Skipping odds polling for %s because features.odds_sync=false", sport_key)
+            continue
+
         has_imminent = await _db.db.matches.find_one({
             "sport_key": sport_key,
             "status": {"$in": ["scheduled", "live"]},

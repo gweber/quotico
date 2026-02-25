@@ -1,3 +1,9 @@
+/**
+ * frontend/src/router/index.ts
+ *
+ * Purpose:
+ *     Central Vue Router configuration with auth/admin guards and route-level lazy loading.
+ */
 import { createRouter, createWebHistory } from "vue-router";
 import { useAuthStore } from "@/stores/auth";
 
@@ -142,7 +148,13 @@ const router = createRouter({
     {
       path: "/admin/team-aliases",
       name: "admin-team-aliases",
-      component: () => import("@/views/admin/AdminTeamAliases.vue"),
+      component: () => import("@/views/admin/AdminTeamTowerView.vue"),
+      meta: { requiresAuth: true, requiresAdmin: true },
+    },
+    {
+      path: "/admin/leagues",
+      name: "admin-leagues",
+      component: () => import("@/views/admin/AdminLeagueTowerView.vue"),
       meta: { requiresAuth: true, requiresAdmin: true },
     },
     {

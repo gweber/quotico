@@ -1,3 +1,9 @@
+<!--
+frontend/src/views/admin/AdminDashboardView.vue
+
+Purpose:
+    Main admin overview with system stats and quick links into admin modules.
+-->
 <script setup lang="ts">
 import { ref, onMounted } from "vue";
 import { useApi } from "@/composables/useApi";
@@ -38,6 +44,7 @@ const cards = [
   { to: "/admin/battles", label: "Battle Management", icon: "\u2694\uFE0F" },
   { to: "/admin/audit", label: "Audit Log", icon: "\uD83D\uDCDC" },
   { to: "/admin/providers", label: "Provider Status", icon: "\uD83D\uDCE1" },
+  { to: "/admin/leagues", label: "League Tower", icon: "\uD83D\uDCCA" },
   { to: "/admin/team-aliases", label: "Team Aliases", icon: "\uD83C\uDFAF" },
   { to: "/admin/qbot-lab", label: "Qbot Lab", icon: "\uD83E\uDDEC" },
 ];

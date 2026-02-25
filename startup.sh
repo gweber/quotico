@@ -1,7 +1,6 @@
 #!/bin/bash
 
 # Konfiguration
-API_KEY="some-random-secret-key"
 LEAGUES=(
     "soccer_france_ligue_one"
     "soccer_netherlands_eredivisie"
@@ -22,20 +21,17 @@ mkdir -p logs
 echo "🧹 Räume alte Logs auf..."
 rm -f logs/backfill_*.log
 
-echo "🚀 Phase 1: Download der Fußball-Daten (CSV-Import)"
-python tools/football_history_backfiller.py --api-key "$API_KEY"
-
-echo "🚀 Phase 2: xG-Veredelung (Sequenziell)"
+echo "🚀 Phase 1: xG-Veredelung (Sequenziell)"
 for XG in "${XG_LEAGUES[@]}"; do
     echo "  -> Lade xG-Daten für $XG..."
     # Falls das Tool den Key via Flag erwartet:
     python -m tools.enrich_matches_xg --sport "$XG" 
 done
 
-echo "🚀 Phase 2.1: time maschine"
+echo "🚀 Phase 1.1: time maschine"
 python -m tools.engine_time_maschine --mode auto --interval-days 30 --concurrency 2 
 
-echo "🚀 Phase 3: Paralleler Backfill auf allen 8 P-Cores"
+echo "🚀 Phase 2: Paralleler Backfill auf allen 8 P-Cores"
 for LG in "${LEAGUES[@]}"; do
     echo "  -> Zünde Backfill-Kern für $LG..."
     # Rerun sorgt für frische Tabellen pro Liga

@@ -47,19 +47,24 @@ async def resolve_survivor_picks() -> None:
             if not match or match["status"] != "final" or not match.get("result", {}).get("outcome"):
                 continue
 
-            team = pick["team"]
+            team_id = pick.get("team_id")
+            team_name = pick.get("team_name") or pick.get("team")
             result = match["result"]["outcome"]
-            home = match["home_team"]
-            away = match["away_team"]
+            home_team_id = match.get("home_team_id")
+            away_team_id = match.get("away_team_id")
+            if not team_id or not home_team_id or not away_team_id:
+                logger.error("Survivor identity missing: entry=%s match=%s", entry.get("_id"), pick["match_id"])
+                continue
 
             # Determine if the picked team won
-            if team == home:
+            if team_id == home_team_id:
                 team_won = result == "1"
                 team_draw = result == "X"
-            elif team == away:
+            elif team_id == away_team_id:
                 team_won = result == "2"
                 team_draw = result == "X"
             else:
+                logger.error("Survivor team_id %s not found in match %s", team_id, pick["match_id"])
                 continue
 
             # Get squad config for draw_eliminates
@@ -91,7 +96,7 @@ async def resolve_survivor_picks() -> None:
                 )
                 logger.info(
                     "Survivor eliminated: user=%s squad=%s team=%s result=%s",
-                    entry["user_id"], entry["squad_id"], team, pick_result,
+                    entry["user_id"], entry["squad_id"], team_name, pick_result,
                 )
             else:
                 # Team won — increment streak
@@ -107,7 +112,7 @@ async def resolve_survivor_picks() -> None:
                 )
                 logger.info(
                     "Survivor survived: user=%s squad=%s team=%s streak+1",
-                    entry["user_id"], entry["squad_id"], team,
+                    entry["user_id"], entry["squad_id"], team_name,
                 )
 
             resolved_count += 1
