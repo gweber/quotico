@@ -26,7 +26,6 @@ import FantasyPickCard from "@/components/FantasyPickCard.vue";
 import FantasyStandings from "@/components/FantasyStandings.vue";
 import ParlayBuilder from "@/components/ParlayBuilder.vue";
 import MoneylineCard from "@/components/MoneylineCard.vue";
-import AdminPredictionPanel from "@/components/AdminPredictionPanel.vue";
 
 const { t } = useI18n();
 const route = useRoute();
@@ -91,6 +90,7 @@ const selectedMatchdayId = ref<string | null>(null);
 const currentMatchdayLabel = computed(
   () => matchday.currentMatchday?.label || t("matchday.title")
 );
+const legacyPredictionCount = computed(() => matchday.legacyPredictionMatches.length);
 
 const error = ref(false);
 const refreshingTips = ref(false);
@@ -459,15 +459,20 @@ watch(selectedSport, (sport) => {
         </div>
       </div>
 
-      <!-- Admin prediction panel (squad admin only) -->
-      <AdminPredictionPanel
-        v-if="selectedSquad?.is_admin && selectedMatchdayId"
-        :squad-id="selectedSquad.id"
-        :matchday-id="selectedMatchdayId"
-      />
-
       <!-- ============ TIPPSPIEL MODE ============ -->
       <template v-if="activeGameMode === 'classic'">
+        <div
+          v-if="legacyPredictionCount > 0"
+          class="rounded-card border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-text-secondary flex items-center gap-2"
+        >
+          <span class="font-semibold text-amber-500">{{ $t('matchday.legacyArchiveBadge') }}</span>
+          <span
+            class="underline decoration-dotted cursor-help"
+            :title="$t('matchday.legacyArchiveTooltip')"
+          >
+            {{ $t('matchday.legacyArchiveHint', { count: legacyPredictionCount }) }}
+          </span>
+        </div>
         <div class="space-y-2">
           <MatchdayMatchCard
             v-for="match in matchday.matches"

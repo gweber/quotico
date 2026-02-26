@@ -22,10 +22,40 @@ class BatchIdsRequest(BaseModel):
     ids: list[int] = Field(default_factory=list, min_length=1)
 
 
+class JusticeMetrics(BaseModel):
+    xg_share_home: float | None = None
+    implied_prob_home: float | None = None
+    justice_diff: float | None = None
+
+
 class MatchTeamSideOut(BaseModel):
     sm_id: int
+    name: str | None = None
+    short_code: str | None = None
+    image_path: str | None = None
     xg: float | None = None
     score: int | None = None
+
+
+class MatchEventOut(BaseModel):
+    type: str
+    minute: int | None = None
+    extra_minute: int | None = None
+    player_name: str = ""
+    player_id: int | None = None
+    team_id: int | None = None
+    detail: str = ""
+    sort_order: int | None = None
+
+
+class PeriodScoreOut(BaseModel):
+    home: int | None = None
+    away: int | None = None
+
+
+class PeriodScoresOut(BaseModel):
+    half_time: PeriodScoreOut = Field(default_factory=PeriodScoreOut)
+    full_time: PeriodScoreOut = Field(default_factory=PeriodScoreOut)
 
 
 class MatchV3Out(BaseModel):
@@ -36,10 +66,15 @@ class MatchV3Out(BaseModel):
     referee_id: int | None = None
     start_at: datetime
     status: str
+    finish_type: str | None = None
     has_advanced_stats: bool = False
     teams: dict[str, MatchTeamSideOut]
+    events: list[MatchEventOut] = Field(default_factory=list)
+    scores: PeriodScoresOut = Field(default_factory=PeriodScoresOut)
     odds_meta: dict[str, Any] = Field(default_factory=dict)
     odds_timeline: list[dict[str, Any]] = Field(default_factory=list)
+    manual_check_required: bool = False
+    justice: JusticeMetrics | None = None
 
 
 class V3ListMeta(BaseModel):
@@ -67,6 +102,7 @@ class MatchesQueryRequest(BaseModel):
     offset: int = Field(default=0, ge=0)
     sort_by: Literal["start_at", "season_id"] = "start_at"
     sort_dir: Literal["asc", "desc"] = "desc"
+    min_justice_diff: float | None = None
 
 
 class StatsQueryRequest(BaseModel):
@@ -92,4 +128,3 @@ class QbotTipsQueryRequest(BaseModel):
 class QbotTipsQueryResponse(BaseModel):
     items: list[dict[str, Any]]
     meta: V3ListMeta
-

@@ -45,8 +45,22 @@ interface JobStatus {
   progress: { processed: number; total: number; percent: number };
   is_stale: boolean;
   can_retry: boolean;
+  current_round_name?: string | null;
+  rate_limit_remaining?: number | null;
+  rate_limit_reset_at?: number | null;
+  rate_limit_paused?: boolean;
+  heartbeat_age_seconds?: number | null;
+  throughput_per_min?: number | null;
+  eta_seconds?: number | null;
   pages_processed?: number;
+  pages_total?: number | null;
   rows_processed?: number;
+  timeout_at?: string | null;
+  max_runtime_minutes?: number | null;
+  page_requests_total?: number;
+  duplicate_page_blocks?: number;
+  error_summary?: { warnings: number; errors: number };
+  error_log?: Array<{ timestamp: string; round_id?: number | null; error_msg: string }>;
 }
 
 interface ActiveJobsResponse {
@@ -86,6 +100,8 @@ interface OpsSnapshot {
     saved_calls_estimate: number;
     api_savings_ratio: number;
   };
+  cache_metrics: { hits: number; misses: number; hit_ratio: number; entries_active: number };
+  guard_metrics: { page_guard_blocks: number; runtime_timeouts: number };
   generated_at: string;
 }
 
@@ -149,6 +165,33 @@ function metricsRunning(seasonId: number): boolean {
 function canStartMetrics(seasonId: number): boolean {
   const health = metricsHealthBySeason[seasonId];
   return Boolean(health && health.total_matches > 0);
+}
+
+function formatSeconds(seconds: number | null | undefined): string {
+  if (seconds == null || !Number.isFinite(seconds) || seconds < 0) return "-";
+  if (seconds < 60) return `${Math.round(seconds)}s`;
+  const mins = Math.floor(seconds / 60);
+  const secs = Math.round(seconds % 60);
+  if (mins < 60) return `${mins}m ${secs}s`;
+  const hours = Math.floor(mins / 60);
+  const remMins = mins % 60;
+  return `${hours}h ${remMins}m`;
+}
+
+function progressPercent(status: JobStatus | null): number {
+  if (!status) return 0;
+  return Math.max(0, Math.min(100, Number(status.progress?.percent || 0)));
+}
+
+function progressLabel(status: JobStatus | null): string {
+  if (!status) return "-";
+  const p = status.progress || { processed: 0, total: 0 };
+  return `${p.processed}/${p.total || "?"}`;
+}
+
+function latestErrors(status: JobStatus | null): Array<{ timestamp: string; round_id?: number | null; error_msg: string }> {
+  if (!status?.error_log?.length) return [];
+  return [...status.error_log].slice(-3).reverse();
 }
 
 async function loadDiscovery(force = false): Promise<void> {
@@ -290,6 +333,26 @@ async function startMetricsSync(seasonId: number | null): Promise<void> {
   }
 }
 
+function canResume(status: JobStatus | null): boolean {
+  if (!status) return false;
+  return status.status === "paused" || status.can_retry === true;
+}
+
+async function resumeJob(status: JobStatus | null): Promise<void> {
+  if (!status) return;
+  try {
+    await api.post(`/admin/ingest/jobs/${status.job_id}/resume`);
+    if (status.type === "sportmonks_metrics_sync") {
+      metricsJobBySeason[status.season_id] = status.job_id;
+    } else {
+      deepJobBySeason[status.season_id] = status.job_id;
+    }
+    toast.success(t("admin.ingest.resumed"));
+  } catch (error) {
+    toast.error(error instanceof Error ? error.message : t("common.genericError"));
+  }
+}
+
 async function refreshSeasonHealth(seasonId: number): Promise<void> {
   try {
     const health = await api.get<MetricsHealth>(`/admin/ingest/season/${seasonId}/metrics-health`);
@@ -353,6 +416,10 @@ onUnmounted(() => {
         <span class="font-mono text-text-primary">{{ opsSnapshot.efficiency.repair_calls }}/{{ opsSnapshot.efficiency.bulk_round_calls }}</span>
         · {{ t("admin.ingest.queueDepth") }}:
         <span class="font-mono text-text-primary">{{ opsSnapshot.queue_metrics.queued }}/{{ opsSnapshot.queue_metrics.running }}/{{ opsSnapshot.queue_metrics.paused }}</span>
+        · {{ t("admin.ingest.cacheHitRatio") }}:
+        <span class="font-mono text-text-primary">{{ Math.round((opsSnapshot.cache_metrics.hit_ratio || 0) * 100) }}%</span>
+        · {{ t("admin.ingest.guardBlocks") }}:
+        <span class="font-mono text-text-primary">{{ opsSnapshot.guard_metrics.page_guard_blocks }}/{{ opsSnapshot.guard_metrics.runtime_timeouts }}</span>
       </p>
       <p v-if="warning" class="text-xs text-danger mt-2">{{ warning }}</p>
     </div>
@@ -429,6 +496,150 @@ onUnmounted(() => {
               {{ metricsJobStatus(getSelectedSeason(league.league_id) || 0)?.status || "-" }}
             </span>
           </p>
+
+          <div
+            v-if="deepJobStatus(getSelectedSeason(league.league_id) || 0)"
+            class="rounded-md border border-surface-3/60 bg-surface-2/70 p-2 space-y-1"
+          >
+            <p class="text-text-secondary font-medium">
+              {{ t("admin.ingest.deepIngest") }} ·
+              {{ deepJobStatus(getSelectedSeason(league.league_id) || 0)?.phase || "-" }}
+            </p>
+            <div class="h-1.5 rounded bg-surface-3/60 overflow-hidden">
+              <div
+                class="h-full bg-primary transition-all"
+                :style="{ width: `${progressPercent(deepJobStatus(getSelectedSeason(league.league_id) || 0))}%` }"
+              />
+            </div>
+            <div class="grid grid-cols-2 gap-x-3 gap-y-1 text-text-muted">
+              <p>{{ t("admin.ingest.progress") }}: <span class="text-text-primary">{{ progressLabel(deepJobStatus(getSelectedSeason(league.league_id) || 0)) }}</span></p>
+              <p>{{ t("admin.ingest.heartbeat") }}: <span class="text-text-primary">{{ formatSeconds(deepJobStatus(getSelectedSeason(league.league_id) || 0)?.heartbeat_age_seconds) }}</span></p>
+              <p>{{ t("admin.ingest.throughput") }}: <span class="text-text-primary">{{ deepJobStatus(getSelectedSeason(league.league_id) || 0)?.throughput_per_min ?? "-" }}</span></p>
+              <p>{{ t("admin.ingest.eta") }}: <span class="text-text-primary">{{ formatSeconds(deepJobStatus(getSelectedSeason(league.league_id) || 0)?.eta_seconds) }}</span></p>
+              <p>{{ t("admin.ingest.pageRequests") }}: <span class="text-text-primary">{{ deepJobStatus(getSelectedSeason(league.league_id) || 0)?.page_requests_total ?? 0 }}</span></p>
+              <p>{{ t("admin.ingest.duplicateBlocks") }}: <span class="text-text-primary">{{ deepJobStatus(getSelectedSeason(league.league_id) || 0)?.duplicate_page_blocks ?? 0 }}</span></p>
+            </div>
+            <p
+              v-if="deepJobStatus(getSelectedSeason(league.league_id) || 0)?.rate_limit_paused"
+              class="text-warning"
+            >
+              {{ t("admin.ingest.ratePaused") }}
+            </p>
+            <p
+              v-if="deepJobStatus(getSelectedSeason(league.league_id) || 0)?.phase === 'failed_timeout'"
+              class="text-danger"
+            >
+              {{ t("admin.ingest.failedTimeout") }}
+            </p>
+            <p
+              v-if="deepJobStatus(getSelectedSeason(league.league_id) || 0)?.phase === 'failed_duplicate_page_guard'"
+              class="text-danger"
+            >
+              {{ t("admin.ingest.failedDuplicatePage") }}
+            </p>
+            <button
+              v-if="canResume(deepJobStatus(getSelectedSeason(league.league_id) || 0))"
+              type="button"
+              class="rounded-md border border-surface-3 px-2 py-1 text-xs text-text-primary"
+              @click="resumeJob(deepJobStatus(getSelectedSeason(league.league_id) || 0))"
+            >
+              {{ t("admin.ingest.resume") }}
+            </button>
+            <div class="pt-1">
+              <p class="text-text-secondary font-medium">{{ t("admin.ingest.lastErrors") }}</p>
+              <p
+                v-if="latestErrors(deepJobStatus(getSelectedSeason(league.league_id) || 0)).length === 0"
+                class="text-text-muted"
+              >
+                {{ t("admin.ingest.noErrors") }}
+              </p>
+              <ul v-else class="space-y-1">
+                <li
+                  v-for="(item, idx) in latestErrors(deepJobStatus(getSelectedSeason(league.league_id) || 0))"
+                  :key="`deep-${idx}-${item.timestamp}`"
+                  class="text-text-muted"
+                >
+                  <span class="font-mono text-text-secondary">{{ item.timestamp }}</span>
+                  <span v-if="item.round_id != null"> · R{{ item.round_id }}</span>
+                  <span> · {{ item.error_msg }}</span>
+                </li>
+              </ul>
+            </div>
+          </div>
+
+          <div
+            v-if="metricsJobStatus(getSelectedSeason(league.league_id) || 0)"
+            class="rounded-md border border-surface-3/60 bg-surface-2/70 p-2 space-y-1"
+          >
+            <p class="text-text-secondary font-medium">
+              {{ t("admin.ingest.metricsSync") }} ·
+              {{ metricsJobStatus(getSelectedSeason(league.league_id) || 0)?.phase || "-" }}
+            </p>
+            <div class="h-1.5 rounded bg-surface-3/60 overflow-hidden">
+              <div
+                class="h-full bg-primary transition-all"
+                :style="{ width: `${progressPercent(metricsJobStatus(getSelectedSeason(league.league_id) || 0))}%` }"
+              />
+            </div>
+            <div class="grid grid-cols-2 gap-x-3 gap-y-1 text-text-muted">
+              <p>{{ t("admin.ingest.progress") }}: <span class="text-text-primary">{{ progressLabel(metricsJobStatus(getSelectedSeason(league.league_id) || 0)) }}</span></p>
+              <p>{{ t("admin.ingest.heartbeat") }}: <span class="text-text-primary">{{ formatSeconds(metricsJobStatus(getSelectedSeason(league.league_id) || 0)?.heartbeat_age_seconds) }}</span></p>
+              <p>{{ t("admin.ingest.throughput") }}: <span class="text-text-primary">{{ metricsJobStatus(getSelectedSeason(league.league_id) || 0)?.throughput_per_min ?? "-" }}</span></p>
+              <p>{{ t("admin.ingest.eta") }}: <span class="text-text-primary">{{ formatSeconds(metricsJobStatus(getSelectedSeason(league.league_id) || 0)?.eta_seconds) }}</span></p>
+              <p>{{ t("admin.ingest.pages") }}: <span class="text-text-primary">{{ metricsJobStatus(getSelectedSeason(league.league_id) || 0)?.pages_processed ?? 0 }}/{{ metricsJobStatus(getSelectedSeason(league.league_id) || 0)?.pages_total ?? "?" }}</span></p>
+              <p>{{ t("admin.ingest.rows") }}: <span class="text-text-primary">{{ metricsJobStatus(getSelectedSeason(league.league_id) || 0)?.rows_processed ?? 0 }}</span></p>
+              <p>{{ t("admin.ingest.warnings") }}: <span class="text-text-primary">{{ metricsJobStatus(getSelectedSeason(league.league_id) || 0)?.error_summary?.warnings ?? 0 }}</span></p>
+              <p>{{ t("admin.ingest.errors") }}: <span class="text-text-primary">{{ metricsJobStatus(getSelectedSeason(league.league_id) || 0)?.error_summary?.errors ?? 0 }}</span></p>
+              <p>{{ t("admin.ingest.pageRequests") }}: <span class="text-text-primary">{{ metricsJobStatus(getSelectedSeason(league.league_id) || 0)?.page_requests_total ?? 0 }}</span></p>
+              <p>{{ t("admin.ingest.duplicateBlocks") }}: <span class="text-text-primary">{{ metricsJobStatus(getSelectedSeason(league.league_id) || 0)?.duplicate_page_blocks ?? 0 }}</span></p>
+            </div>
+            <p
+              v-if="metricsJobStatus(getSelectedSeason(league.league_id) || 0)?.rate_limit_paused"
+              class="text-warning"
+            >
+              {{ t("admin.ingest.ratePaused") }}
+            </p>
+            <p
+              v-if="metricsJobStatus(getSelectedSeason(league.league_id) || 0)?.phase === 'failed_timeout'"
+              class="text-danger"
+            >
+              {{ t("admin.ingest.failedTimeout") }}
+            </p>
+            <p
+              v-if="metricsJobStatus(getSelectedSeason(league.league_id) || 0)?.phase === 'failed_duplicate_page_guard'"
+              class="text-danger"
+            >
+              {{ t("admin.ingest.failedDuplicatePage") }}
+            </p>
+            <button
+              v-if="canResume(metricsJobStatus(getSelectedSeason(league.league_id) || 0))"
+              type="button"
+              class="rounded-md border border-surface-3 px-2 py-1 text-xs text-text-primary"
+              @click="resumeJob(metricsJobStatus(getSelectedSeason(league.league_id) || 0))"
+            >
+              {{ t("admin.ingest.resume") }}
+            </button>
+            <div class="pt-1">
+              <p class="text-text-secondary font-medium">{{ t("admin.ingest.lastErrors") }}</p>
+              <p
+                v-if="latestErrors(metricsJobStatus(getSelectedSeason(league.league_id) || 0)).length === 0"
+                class="text-text-muted"
+              >
+                {{ t("admin.ingest.noErrors") }}
+              </p>
+              <ul v-else class="space-y-1">
+                <li
+                  v-for="(item, idx) in latestErrors(metricsJobStatus(getSelectedSeason(league.league_id) || 0))"
+                  :key="`metrics-${idx}-${item.timestamp}`"
+                  class="text-text-muted"
+                >
+                  <span class="font-mono text-text-secondary">{{ item.timestamp }}</span>
+                  <span v-if="item.round_id != null"> · R{{ item.round_id }}</span>
+                  <span> · {{ item.error_msg }}</span>
+                </li>
+              </ul>
+            </div>
+          </div>
         </div>
 
         <div

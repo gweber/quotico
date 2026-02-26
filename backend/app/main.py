@@ -78,10 +78,12 @@ def automated_job_count() -> int:
 async def lifespan(app: FastAPI):
     setup_logging()
     await connect_db()
+    from app.seed import ensure_startup_superadmin
     from app.services.event_bus import event_bus
     from app.services.event_bus_monitor import event_bus_monitor
     from app.services.event_handlers import register_event_handlers
     from app.services.websocket_manager import websocket_manager
+    await ensure_startup_superadmin()
     if settings.WS_EVENTS_ENABLED:
         await websocket_manager.start()
         logger.info("WebSocket realtime manager enabled")
@@ -98,10 +100,19 @@ async def lifespan(app: FastAPI):
             logger.info("Event bus monitor disabled via config")
     else:
         logger.info("Event bus disabled via config")
+    if settings.METRICS_HEARTBEAT_ENABLED:
+        from app.services.metrics_heartbeat import metrics_heartbeat
+        await metrics_heartbeat.start()
+        logger.info("Metrics heartbeat enabled")
+    else:
+        logger.info("Metrics heartbeat disabled via config")
     logger.info("Legacy automation disabled: passive startup mode active.")
 
     yield
 
+    if settings.METRICS_HEARTBEAT_ENABLED:
+        from app.services.metrics_heartbeat import metrics_heartbeat
+        await metrics_heartbeat.stop()
     if settings.EVENT_BUS_ENABLED:
         if settings.QBUS_MONITOR_ENABLED:
             await event_bus_monitor.stop()
@@ -154,7 +165,9 @@ from app.routers.historical import router as historical_router
 from app.routers.quotico_tips import router as quotico_tips_router
 from app.routers.qbot import router as qbot_router
 from app.routers.betting_slips import router as betting_slips_router
+from app.routers.admin import router as admin_router
 from app.routers.admin_ingest import router as admin_ingest_router
+from app.routers.admin_teams_v3 import router as admin_teams_v3_router
 from app.routers.v3_query import router as v3_query_router
 
 app.include_router(auth_router)
@@ -177,7 +190,9 @@ app.include_router(historical_router)
 app.include_router(quotico_tips_router)
 app.include_router(qbot_router)
 app.include_router(betting_slips_router)
+app.include_router(admin_router)
 app.include_router(admin_ingest_router)
+app.include_router(admin_teams_v3_router)
 app.include_router(v3_query_router)
 
 

@@ -28,10 +28,45 @@ interface StatusResponse {
   workers: Worker[];
 }
 
+interface HeartbeatConfig {
+  xg_crawler_tick_seconds: number;
+  _source: Record<string, string>;
+}
+
 const data = ref<StatusResponse | null>(null);
 const loading = ref(true);
 const error = ref(false);
 const syncing = ref<string | null>(null); // worker_id currently being triggered
+
+// Heartbeat runtime config
+const heartbeatConfig = ref<HeartbeatConfig | null>(null);
+const hbTickInput = ref(2);
+const hbSaving = ref(false);
+
+async function fetchHeartbeatConfig() {
+  try {
+    const cfg = await api.get<HeartbeatConfig>("/admin/heartbeat/config");
+    heartbeatConfig.value = cfg;
+    hbTickInput.value = cfg.xg_crawler_tick_seconds;
+  } catch {
+    // non-critical
+  }
+}
+
+async function saveHeartbeatConfig() {
+  hbSaving.value = true;
+  try {
+    await api.patch("/admin/heartbeat/config", {
+      xg_crawler_tick_seconds: hbTickInput.value,
+    });
+    toast.success(`xG crawler tick set to ${hbTickInput.value}s`);
+    await fetchHeartbeatConfig();
+  } catch (e: unknown) {
+    toast.error(e instanceof Error ? e.message : "Save failed");
+  } finally {
+    hbSaving.value = false;
+  }
+}
 
 async function fetchStatus() {
   loading.value = true;
@@ -100,7 +135,10 @@ function syncAgeColor(iso: string | null): string {
   return "text-danger";
 }
 
-onMounted(fetchStatus);
+onMounted(() => {
+  fetchStatus();
+  fetchHeartbeatConfig();
+});
 </script>
 
 <template>
@@ -237,5 +275,52 @@ onMounted(fetchStatus);
         </div>
       </div>
     </template>
+
+    <!-- Heartbeat Runtime Settings -->
+    <div v-if="heartbeatConfig" class="bg-surface-1 rounded-card border border-surface-3/50 mt-6">
+      <div class="px-4 py-3 border-b border-surface-3/50">
+        <h2 class="text-sm font-semibold text-text-primary">Heartbeat Settings</h2>
+      </div>
+      <div class="p-4 space-y-4">
+        <div class="flex items-center gap-4">
+          <label class="text-sm text-text-secondary w-48 shrink-0">
+            xG Crawler Tick Interval
+          </label>
+          <div class="flex items-center gap-2">
+            <input
+              v-model.number="hbTickInput"
+              type="number"
+              min="1"
+              max="300"
+              class="w-20 h-9 text-center text-sm font-mono bg-surface-2 border border-surface-3 rounded-lg text-text-primary focus:border-primary focus:ring-1 focus:ring-primary transition-colors [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none"
+            />
+            <span class="text-xs text-text-muted">seconds</span>
+            <span
+              v-if="heartbeatConfig._source?.xg_crawler_tick_seconds"
+              class="text-[10px] px-1.5 py-0.5 rounded-full"
+              :class="heartbeatConfig._source.xg_crawler_tick_seconds === 'runtime'
+                ? 'bg-primary/10 text-primary'
+                : 'bg-surface-3 text-text-muted'"
+            >
+              {{ heartbeatConfig._source.xg_crawler_tick_seconds }}
+            </span>
+          </div>
+          <button
+            class="px-3 py-1.5 text-xs rounded-lg font-medium transition-colors"
+            :class="hbSaving
+              ? 'bg-surface-3 text-text-muted cursor-wait'
+              : 'bg-primary/10 text-primary hover:bg-primary/20'"
+            :disabled="hbSaving || hbTickInput === heartbeatConfig.xg_crawler_tick_seconds"
+            @click="saveHeartbeatConfig"
+          >
+            {{ hbSaving ? "Saving..." : "Save" }}
+          </button>
+        </div>
+        <p class="text-[11px] text-text-muted leading-relaxed">
+          Delay between xG crawler ticks (fresh + deep pointer). Lower = faster crawling but more API calls.
+          Takes effect on next tick without restart. (Min: 1s, Max: 300s)
+        </p>
+      </div>
+    </div>
   </div>
 </template>

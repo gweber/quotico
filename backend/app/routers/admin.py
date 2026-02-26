@@ -58,6 +58,7 @@ from app.services.event_bus_monitor import event_bus_monitor
 from app.services.provider_settings_service import provider_settings_service
 from app.services.team_registry_service import TeamRegistry, normalize_team_name
 from app.providers.odds_api import odds_provider
+from app.config import settings
 from app.utils import ensure_utc, utcnow
 from app.workers._state import get_synced_at, get_worker_state
 
@@ -689,6 +690,75 @@ async def set_automation_state(
 ):
     _ = body, request, admin
     raise HTTPException(status_code=410, detail="Legacy endpoint disabled in v3.1")
+
+
+# ---------------------------------------------------------------------------
+# Heartbeat runtime config (stored in meta, overrides config.py defaults)
+# ---------------------------------------------------------------------------
+
+_HEARTBEAT_CONFIG_KEY = "heartbeat_config"
+
+_HEARTBEAT_DEFAULTS = {
+    "xg_crawler_tick_seconds": settings.XG_CRAWLER_TICK_SECONDS,
+}
+
+_HEARTBEAT_FIELD_LIMITS = {
+    "xg_crawler_tick_seconds": (1, 300),  # floor 1s, ceiling 5min
+}
+
+
+class HeartbeatConfigPatch(BaseModel):
+    xg_crawler_tick_seconds: int | None = None
+
+
+@router.get("/heartbeat/config")
+async def get_heartbeat_config(admin=Depends(get_admin_user)):
+    """Current heartbeat runtime config (meta override + defaults)."""
+    doc = await _db.db.meta.find_one({"_id": _HEARTBEAT_CONFIG_KEY}) or {}
+    effective = {}
+    for key, default in _HEARTBEAT_DEFAULTS.items():
+        effective[key] = doc.get(key, default)
+    effective["_source"] = {
+        k: ("runtime" if k in doc else "default") for k in _HEARTBEAT_DEFAULTS
+    }
+    return effective
+
+
+@router.patch("/heartbeat/config")
+async def patch_heartbeat_config(
+    body: HeartbeatConfigPatch,
+    admin=Depends(get_admin_user),
+):
+    """Update heartbeat runtime config. Changes take effect on next tick."""
+    updates: dict[str, Any] = {}
+    for field, value in body.model_dump(exclude_none=True).items():
+        lo, hi = _HEARTBEAT_FIELD_LIMITS.get(field, (None, None))
+        if lo is not None and value < lo:
+            raise HTTPException(400, f"{field} must be >= {lo}")
+        if hi is not None and value > hi:
+            raise HTTPException(400, f"{field} must be <= {hi}")
+        updates[field] = value
+
+    if not updates:
+        raise HTTPException(400, "No fields to update")
+
+    updates["updated_at"] = utcnow()
+    updates["updated_by"] = str(admin["_id"])
+    await _db.db.meta.update_one(
+        {"_id": _HEARTBEAT_CONFIG_KEY},
+        {"$set": updates},
+        upsert=True,
+    )
+
+    from app.services.audit_service import log_audit
+    await log_audit(
+        actor_id=str(admin["_id"]),
+        action="heartbeat_config.updated",
+        target_id=_HEARTBEAT_CONFIG_KEY,
+        details={"changed_fields": list(updates.keys())},
+    )
+
+    return {"ok": True, "applied": updates}
 
 
 def _get_worker_fn(worker_id: str):

@@ -122,6 +122,11 @@ class MatchdayDetailMatch(BaseModel):
     status: str
     odds: dict = Field(default_factory=dict)      # {h2h, totals, spreads, updated_at}
     result: dict = Field(default_factory=dict)     # {home_score, away_score, outcome}
+    odds_meta: Optional[dict] = None
+    has_advanced_stats: Optional[bool] = None
+    referee_id: Optional[int | str] = None
+    referee_name: Optional[str] = None
+    teams: Optional[dict] = None
     is_locked: bool = False  # True if < 15 min to kickoff or started
     h2h_context: Optional[dict] = None  # Embedded historical H2H + form data
     quotico_tip: Optional[dict] = None  # Embedded QuoticoTip recommendation

@@ -15,8 +15,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
+from collections import defaultdict
 from datetime import timedelta
 from typing import Any
+
+import numpy as np
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
@@ -24,6 +28,7 @@ import app.database as _db
 from app.config import settings
 from app.models.v3_query_models import (
     BatchIdsRequest,
+    JusticeMetrics,
     MatchesListResponse,
     MatchesQueryRequest,
     MatchV3Out,
@@ -36,9 +41,53 @@ from app.models.v3_query_models import (
 from app.services.auth_service import get_current_user
 from app.utils import ensure_utc, utcnow
 
+logger = logging.getLogger("quotico.v3_query")
+
 router = APIRouter(prefix="/api/v3", tags=["v3"])
 
 _QUERY_CACHE: dict[str, tuple[Any, Any]] = {}
+_ANALYSIS_CACHE: dict[str, tuple[Any, Any]] = {}
+
+
+def _compute_justice(doc: dict) -> dict | None:
+    """Compute justice metrics for a single match document.
+
+    Returns a JusticeMetrics-compatible dict or None if data is insufficient.
+    """
+    if doc.get("status") != "FINISHED" or not doc.get("has_advanced_stats"):
+        return None
+    teams = doc.get("teams") or {}
+    home = teams.get("home") or {}
+    away = teams.get("away") or {}
+    xg_home = home.get("xg")
+    xg_away = away.get("xg")
+    if not isinstance(xg_home, (int, float)) or not isinstance(xg_away, (int, float)):
+        return None
+    total_xg = xg_home + xg_away
+    if total_xg == 0:
+        return None
+    odds_meta = doc.get("odds_meta") or {}
+    summary = odds_meta.get("summary_1x2") or {}
+    avg_home = (summary.get("home") or {}).get("avg")
+    if not isinstance(avg_home, (int, float)) or avg_home <= 0:
+        return None
+    xg_share_home = xg_home / total_xg
+    implied_prob_home = 1.0 / avg_home
+    justice_diff = xg_share_home - implied_prob_home
+    return {
+        "xg_share_home": round(xg_share_home, 4),
+        "implied_prob_home": round(implied_prob_home, 4),
+        "justice_diff": round(justice_diff, 4),
+    }
+
+
+def _enrich_with_justice(rows: list[dict]) -> list[dict]:
+    """Inject justice metrics into each qualifying match document."""
+    for row in rows:
+        j = _compute_justice(row)
+        if j is not None:
+            row["justice"] = j
+    return rows
 
 
 def _query_hash(payload: dict[str, Any]) -> str:
@@ -147,29 +196,50 @@ async def query_matches_v3(body: MatchesQueryRequest) -> MatchesListResponse:
         cached["meta"]["query_hash"] = key
         return MatchesListResponse.model_validate(cached)
 
+    justice_mode = body.min_justice_diff is not None
+
+    statuses = body.statuses
+    q_extra: dict[str, Any] = {}
+    if justice_mode:
+        statuses = ["FINISHED"]
+        q_extra["has_advanced_stats"] = True
+
     q = _base_query(
         ids=ids,
         season_id=body.season_id,
         league_id=body.league_id,
         team_id=body.team_id,
-        statuses=body.statuses,
+        statuses=statuses,
         date_from=body.date_from,
         date_to=body.date_to,
     )
+    q.update(q_extra)
     sort_field = body.sort_by
     sort_dir = 1 if body.sort_dir == "asc" else -1
-    total = await _db.db.matches_v3.count_documents(q)
-    rows = await _db.db.matches_v3.find(q).sort(sort_field, sort_dir).skip(body.offset).limit(body.limit).to_list(length=body.limit)
-    data = {
-        "items": rows,
-        "meta": {
-            "total": total,
-            "limit": body.limit,
-            "offset": body.offset,
-            "query_hash": key,
-            "source": "fresh",
-        },
-    }
+
+    if justice_mode:
+        # Fetch all qualifying matches, compute justice, filter, sort, paginate in Python
+        all_rows = await _db.db.matches_v3.find(q).sort(sort_field, sort_dir).to_list(length=5000)
+        _enrich_with_justice(all_rows)
+        threshold = body.min_justice_diff or 0.0
+        filtered = [r for r in all_rows if (r.get("justice") or {}).get("justice_diff", 0) >= threshold]
+        # Sort by absolute justice_diff descending
+        filtered.sort(key=lambda r: abs((r.get("justice") or {}).get("justice_diff", 0)), reverse=True)
+        total = len(filtered)
+        page = filtered[body.offset : body.offset + body.limit]
+        data = {
+            "items": page,
+            "meta": {"total": total, "limit": body.limit, "offset": body.offset, "query_hash": key, "source": "fresh"},
+        }
+    else:
+        total = await _db.db.matches_v3.count_documents(q)
+        rows = await _db.db.matches_v3.find(q).sort(sort_field, sort_dir).skip(body.offset).limit(body.limit).to_list(length=body.limit)
+        _enrich_with_justice(rows)
+        data = {
+            "items": rows,
+            "meta": {"total": total, "limit": body.limit, "offset": body.offset, "query_hash": key, "source": "fresh"},
+        }
+
     _cache_set(key, data)
     return MatchesListResponse.model_validate(data)
 
@@ -263,4 +333,264 @@ async def persons_batch_v3(body: BatchIdsRequest, user=Depends(get_current_user)
             }
         )
     return {"items": items}
+
+
+# ---------------------------------------------------------------------------
+# Public Analysis Endpoints
+# ---------------------------------------------------------------------------
+
+_ANALYSIS_CACHE_TTL = timedelta(minutes=10)
+
+
+def _analysis_cache_get(key: str) -> Any | None:
+    row = _ANALYSIS_CACHE.get(key)
+    if not row:
+        return None
+    expires_at, data = row
+    if ensure_utc(expires_at) < utcnow():
+        _ANALYSIS_CACHE.pop(key, None)
+        return None
+    return data
+
+
+def _analysis_cache_set(key: str, value: Any) -> None:
+    _ANALYSIS_CACHE[key] = (utcnow() + _ANALYSIS_CACHE_TTL, value)
+
+
+@router.get("/analysis/leagues")
+async def analysis_leagues() -> dict[str, Any]:
+    """Return leagues with sufficient xG data for justice table analysis."""
+    cached = _analysis_cache_get("analysis:leagues")
+    if cached is not None:
+        return cached
+
+    leagues = await _db.db.league_registry_v3.find(
+        {},
+        {"_id": 1, "name": 1, "country": 1, "available_seasons": 1},
+    ).to_list(length=200)
+
+    items: list[dict[str, Any]] = []
+    for lg in leagues:
+        lid = lg.get("_id")
+        if not isinstance(lid, int):
+            continue
+        name = lg.get("name") or ""
+        if not name:
+            continue
+
+        seasons = lg.get("available_seasons") or []
+        if not seasons:
+            continue
+
+        # Pick the most recent season (highest ID)
+        current = max(seasons, key=lambda s: s.get("id") or 0)
+        season_id = current.get("id")
+        if not isinstance(season_id, int):
+            continue
+
+        xg_count = await _db.db.matches_v3.count_documents(
+            {"league_id": lid, "season_id": season_id, "status": "FINISHED", "has_advanced_stats": True}
+        )
+        if xg_count < 10:
+            continue
+
+        items.append({
+            "league_id": lid,
+            "league_name": name,
+            "country": lg.get("country") or "",
+            "current_season_id": season_id,
+            "season_name": current.get("name") or "",
+            "xg_match_count": xg_count,
+        })
+
+    result = {"items": items}
+    _analysis_cache_set("analysis:leagues", result)
+    return result
+
+
+def _poisson_xp(
+    xg_home: float,
+    xg_away: float,
+    match_id: int,
+    n_sims: int = 10_000,
+) -> tuple[float, float]:
+    """Poisson Monte Carlo: return (xP_home, xP_away) as fractional expected points."""
+    rng = np.random.default_rng(seed=match_id)
+    home_goals = rng.poisson(lam=max(xg_home, 0.01), size=n_sims)
+    away_goals = rng.poisson(lam=max(xg_away, 0.01), size=n_sims)
+    home_wins = int(np.sum(home_goals > away_goals))
+    away_wins = int(np.sum(away_goals > home_goals))
+    draws = n_sims - home_wins - away_wins
+    xp_home = (3 * home_wins + draws) / n_sims
+    xp_away = (3 * away_wins + draws) / n_sims
+    return round(xp_home, 3), round(xp_away, 3)
+
+
+@router.get("/analysis/unjust-table/{league_id}")
+async def analysis_unjust_table(
+    league_id: int,
+    season_id: int | None = Query(default=None),
+) -> dict[str, Any]:
+    """Compute the Unjust League Table for a given league/season using Poisson MC."""
+
+    # Resolve season_id if not provided
+    if season_id is None:
+        reg = await _db.db.league_registry_v3.find_one({"_id": int(league_id)}, {"available_seasons": 1})
+        if not reg or not reg.get("available_seasons"):
+            raise HTTPException(status_code=404, detail="League not found in registry.")
+        seasons = reg["available_seasons"]
+        current = max(seasons, key=lambda s: s.get("id") or 0)
+        season_id = current.get("id")
+        if not isinstance(season_id, int):
+            raise HTTPException(status_code=404, detail="No valid season found.")
+
+    cache_key = f"unjust:{league_id}:{season_id}"
+    cached = _analysis_cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    # Fetch all qualifying matches
+    rows = await _db.db.matches_v3.find(
+        {
+            "league_id": int(league_id),
+            "season_id": int(season_id),
+            "status": "FINISHED",
+            "has_advanced_stats": True,
+        },
+        {
+            "_id": 1,
+            "start_at": 1,
+            "teams": 1,
+        },
+    ).sort("start_at", 1).to_list(length=5000)
+
+    if not rows:
+        raise HTTPException(status_code=404, detail="No matches with xG data found for this league/season.")
+
+    # Aggregate per team
+    team_data: dict[int, dict[str, Any]] = defaultdict(lambda: {
+        "name": "",
+        "xp_values": [],
+        "real_pts_values": [],
+        "xg_for": [],
+        "xg_against": [],
+        "goals_for": [],
+        "goals_against": [],
+    })
+
+    for doc in rows:
+        match_id = doc.get("_id", 0)
+        teams = doc.get("teams") or {}
+        home = teams.get("home") or {}
+        away = teams.get("away") or {}
+
+        xg_h = home.get("xg")
+        xg_a = away.get("xg")
+        score_h = home.get("score")
+        score_a = away.get("score")
+        h_id = home.get("sm_id")
+        a_id = away.get("sm_id")
+
+        if not all(isinstance(v, (int, float)) for v in [xg_h, xg_a]) or h_id is None or a_id is None:
+            continue
+        if not all(isinstance(v, int) for v in [score_h, score_a]):
+            continue
+
+        # Poisson xP
+        xp_h, xp_a = _poisson_xp(float(xg_h), float(xg_a), int(match_id))
+
+        # Real points
+        if score_h > score_a:
+            rp_h, rp_a = 3, 0
+        elif score_a > score_h:
+            rp_h, rp_a = 0, 3
+        else:
+            rp_h, rp_a = 1, 1
+
+        # Home team
+        td_h = team_data[int(h_id)]
+        td_h["name"] = home.get("name") or td_h["name"]
+        td_h["short_code"] = home.get("short_code") or td_h.get("short_code")
+        td_h["image_path"] = home.get("image_path") or td_h.get("image_path")
+        td_h["xp_values"].append(xp_h)
+        td_h["real_pts_values"].append(rp_h)
+        td_h["xg_for"].append(float(xg_h))
+        td_h["xg_against"].append(float(xg_a))
+        td_h["goals_for"].append(int(score_h))
+        td_h["goals_against"].append(int(score_a))
+
+        # Away team
+        td_a = team_data[int(a_id)]
+        td_a["name"] = away.get("name") or td_a["name"]
+        td_a["short_code"] = away.get("short_code") or td_a.get("short_code")
+        td_a["image_path"] = away.get("image_path") or td_a.get("image_path")
+        td_a["xp_values"].append(xp_a)
+        td_a["real_pts_values"].append(rp_a)
+        td_a["xg_for"].append(float(xg_a))
+        td_a["xg_against"].append(float(xg_h))
+        td_a["goals_for"].append(int(score_a))
+        td_a["goals_against"].append(int(score_h))
+
+    # Build table
+    table: list[dict[str, Any]] = []
+    for sm_id, td in team_data.items():
+        if not td["name"]:
+            continue
+        played = len(td["xp_values"])
+        if played == 0:
+            continue
+        real_pts = sum(td["real_pts_values"])
+        expected_pts = round(sum(td["xp_values"]), 1)
+        diff = round(expected_pts - real_pts, 1)
+
+        # 95% confidence interval
+        xp_arr = np.array(td["xp_values"])
+        std_total = float(np.std(xp_arr)) * (played ** 0.5)
+        ci_low = round(expected_pts - 1.96 * std_total, 1)
+        ci_high = round(expected_pts + 1.96 * std_total, 1)
+
+        # Goal difference justice
+        xg_diff = round(sum(td["xg_for"]) - sum(td["xg_against"]), 1)
+        real_gd = sum(td["goals_for"]) - sum(td["goals_against"])
+        gd_justice = round(xg_diff - real_gd, 1)
+
+        # Last 5 xP (most recent first — values are in chronological order)
+        last_5_xp = list(reversed(td["xp_values"][-5:]))
+
+        table.append({
+            "team_sm_id": sm_id,
+            "team_name": td["name"],
+            "team_short_code": td.get("short_code"),
+            "team_image_path": td.get("image_path"),
+            "played": played,
+            "real_pts": real_pts,
+            "expected_pts": expected_pts,
+            "diff": diff,
+            "luck_range": [ci_low, ci_high],
+            "avg_xg_for": round(sum(td["xg_for"]) / played, 2),
+            "avg_xg_against": round(sum(td["xg_against"]) / played, 2),
+            "xg_diff": xg_diff,
+            "real_gd": real_gd,
+            "gd_justice": gd_justice,
+            "last_5_xp": last_5_xp,
+        })
+
+    # Sort by diff descending (most "robbed" first), assign rank
+    table.sort(key=lambda r: r["diff"], reverse=True)
+    for i, row in enumerate(table):
+        row["rank"] = i + 1
+
+    # Resolve league name
+    reg = await _db.db.league_registry_v3.find_one({"_id": int(league_id)}, {"name": 1})
+    league_name = (reg or {}).get("name", "")
+
+    result: dict[str, Any] = {
+        "league_id": int(league_id),
+        "league_name": league_name,
+        "season_id": int(season_id),
+        "match_count": len(rows),
+        "table": table,
+    }
+    _analysis_cache_set(cache_key, result)
+    return result
 

@@ -12,7 +12,7 @@ import QuoticoTipBadge from "./QuoticoTipBadge.vue";
 import { useQuoticoTip } from "@/composables/useQuoticoTip";
 import { getCachedUserBet } from "@/composables/useUserBets";
 import { sportFlag, sportLabel } from "@/types/sports";
-import { toOddsSummary, toOddsBadge, oddsValueBySelection } from "@/composables/useMatchV3Adapter";
+import { toOddsSummary, toOddsBadge, oddsValueBySelection, computeJusticeDiff } from "@/composables/useMatchV3Adapter";
 import type { MatchV3, OddsButtonKey } from "@/types/MatchV3";
 
 const { t, locale } = useI18n();
@@ -138,6 +138,31 @@ const liveProjectedPoints = computed(() => {
 const hasOdds = computed(() => oddsSummary.value.some((row) => row.avg != null));
 const buttonsDisabled = computed(() => !isUpcoming.value || isExpired.value || !!userTip.value || !hasOdds.value);
 
+// Justice diff value indicator
+const justiceDiff = computed(() => computeJusticeDiff(props.match as unknown as MatchV3));
+const justiceTooltipHome = computed(() => {
+  const m = props.match as unknown as MatchV3;
+  const xgH = m.teams?.home?.xg;
+  const xgA = m.teams?.away?.xg;
+  const oddsH = m.odds_meta?.summary_1x2?.home?.avg;
+  if (xgH == null || xgA == null || !oddsH || xgH + xgA === 0) return "";
+  const share = ((xgH / (xgH + xgA)) * 100).toFixed(0);
+  const implied = ((1 / oddsH) * 100).toFixed(0);
+  const diff = ((justiceDiff.value.home ?? 0) * 100).toFixed(1);
+  return t("match.valueSummary", { share, implied, diff });
+});
+const justiceTooltipAway = computed(() => {
+  const m = props.match as unknown as MatchV3;
+  const xgH = m.teams?.home?.xg;
+  const xgA = m.teams?.away?.xg;
+  const oddsA = m.odds_meta?.summary_1x2?.away?.avg;
+  if (xgH == null || xgA == null || !oddsA || xgH + xgA === 0) return "";
+  const share = ((xgA / (xgH + xgA)) * 100).toFixed(0);
+  const implied = ((1 / oddsA) * 100).toFixed(0);
+  const diff = ((justiceDiff.value.away ?? 0) * 100).toFixed(1);
+  return t("match.valueSummary", { share, implied, diff });
+});
+
 function handleSelect(prediction: string) {
   if (buttonsDisabled.value) return;
   const selected = oddsValueBySelection(props.match as unknown as MatchV3, prediction as OddsButtonKey);
@@ -208,11 +233,35 @@ const statusClass = computed(() => {
       <!-- Teams + Score -->
       <div class="flex-1 min-w-0 flex items-center gap-3">
         <div class="flex-1 min-w-0">
-          <span class="text-sm font-medium text-text-primary truncate block">
+          <span class="text-sm font-medium text-text-primary truncate flex items-center">
+            <img
+              v-if="match.teams?.home?.image_path"
+              :src="match.teams.home.image_path"
+              :alt="match.home_team"
+              class="w-5 h-5 mr-1.5 object-contain flex-shrink-0"
+              loading="lazy"
+            />
             {{ match.home_team }}
+            <span
+              v-if="justiceDiff.home != null && justiceDiff.home > 0.10"
+              class="inline-flex items-center text-[10px] text-success ml-0.5"
+              :title="justiceTooltipHome"
+            >&#9650;</span>
           </span>
-          <span class="text-sm font-medium text-text-primary truncate block mt-1">
+          <span class="text-sm font-medium text-text-primary truncate flex items-center mt-1">
+            <img
+              v-if="match.teams?.away?.image_path"
+              :src="match.teams.away.image_path"
+              :alt="match.away_team"
+              class="w-5 h-5 mr-1.5 object-contain flex-shrink-0"
+              loading="lazy"
+            />
             {{ match.away_team }}
+            <span
+              v-if="justiceDiff.away != null && justiceDiff.away > 0.10"
+              class="inline-flex items-center text-[10px] text-success ml-0.5"
+              :title="justiceTooltipAway"
+            >&#9650;</span>
           </span>
         </div>
 
@@ -320,9 +369,11 @@ const statusClass = computed(() => {
 
     <!-- Historical context -->
     <MatchHistory
+      v-if="match.teams?.home?.sm_id && match.teams?.away?.sm_id"
       :home-team="match.home_team"
       :away-team="match.away_team"
-      :sport-key="match.sport_key"
+      :home-s-m-id="match.teams.home.sm_id"
+      :away-s-m-id="match.teams.away.sm_id"
     />
 
     <!-- Odds timeline -->

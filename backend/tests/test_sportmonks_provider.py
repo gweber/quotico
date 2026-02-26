@@ -104,4 +104,37 @@ async def test_discovery_pagination_merges_data_and_uses_rate_limit_fallback(mon
     assert result["remaining"] == 77
     assert before + 20 <= int(result["reset_at"]) <= after + 20
     assert fake_client.calls[0]["params"]["include"] == "seasons;country"
-    assert fake_client.calls[1]["params"] == {}
+    assert fake_client.calls[0]["params"]["page"] == 1
+    assert fake_client.calls[1]["params"]["include"] == "seasons;country"
+    assert fake_client.calls[1]["params"]["page"] == 2
+
+
+def test_cache_scope_excludes_fixture_odds_and_includes_expected_pages():
+    assert SportmonksProvider._cache_allowed(
+        endpoint="football/expected/fixtures",
+        params_norm={"filters": "fixtureSeasons:25536", "page": "2", "per_page": "100"},
+    )
+    assert SportmonksProvider._cache_allowed(
+        endpoint="football/rounds/100",
+        params_norm={"include": "fixtures;fixtures.statistics"},
+    )
+    assert not SportmonksProvider._cache_allowed(
+        endpoint="football/rounds/100",
+        params_norm={"include": "fixtures;fixtures.odds"},
+    )
+    assert not SportmonksProvider._cache_allowed(
+        endpoint="football/odds/pre-match/fixtures/19433558",
+        params_norm={},
+    )
+
+
+def test_cache_doc_id_changes_with_relevant_params():
+    a = SportmonksProvider._cache_doc_id(
+        endpoint="football/leagues",
+        params_norm={"include": "seasons;country", "page": "1"},
+    )
+    b = SportmonksProvider._cache_doc_id(
+        endpoint="football/leagues",
+        params_norm={"include": "seasons;country", "page": "2"},
+    )
+    assert a != b

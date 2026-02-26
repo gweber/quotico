@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, watch } from "vue";
+import { computed, onMounted } from "vue";
 import { useI18n } from "vue-i18n";
 import type { MatchdayMatch } from "@/stores/matchday";
 import { useMatchdayStore } from "@/stores/matchday";
@@ -24,8 +24,7 @@ const persons = usePersonsStore();
 const matchday = useMatchdayStore();
 
 const draft = computed(() => matchday.draftPredictions.get(props.match.id));
-const isAdminUnlocked = computed(() => matchday.adminUnlockedSet.has(props.match.id));
-const isEditable = computed(() => !props.match.is_locked || isAdminUnlocked.value);
+const isEditable = computed(() => !props.match.is_locked);
 
 const pointsEarned = computed(() => {
   if (!matchday.predictions) return null;
@@ -76,27 +75,18 @@ const showXgJustice = computed(() =>
   vm.value.justice.enabled && xgHome.value != null && xgAway.value != null
 );
 
+// Prefer denormalized name, fall back to persons store lookup
 const refereeName = computed(() => {
+  if (vm.value.refereeName) return vm.value.refereeName;
   const rid = vm.value.refereeId;
   return rid ? persons.getPersonName(rid) : null;
 });
 
-async function hydrateReferee() {
-  const rid = vm.value.refereeId;
-  if (!rid) return;
-  try {
-    await persons.resolveByIds([rid]);
-  } catch {
-    // Optional footer metadata should never break card rendering.
-  }
-}
-
 onMounted(() => {
-  void hydrateReferee();
-});
-
-watch(() => vm.value.refereeId, () => {
-  void hydrateReferee();
+  const rid = vm.value.refereeId;
+  if (rid && !vm.value.refereeName) {
+    void persons.resolveByIds([rid]);
+  }
 });
 
 const kickoffLabel = computed(() => {
@@ -111,7 +101,7 @@ const kickoffLabel = computed(() => {
 });
 
 const countdown = computed(() => {
-  if (props.match.is_locked && !isAdminUnlocked.value) return null;
+  if (props.match.is_locked) return null;
   const now = Date.now();
   const kickoff = new Date(props.match.match_date).getTime();
   const diff = kickoff - now;
@@ -146,7 +136,7 @@ function updateAway(e: Event) {
 <template>
   <div
     class="bg-surface-1 rounded-card p-4 border border-surface-3/50 transition-colors"
-    :class="{ 'opacity-60': match.is_locked && !isAdminUnlocked && !pointsEarned }"
+    :class="{ 'opacity-60': match.is_locked && !pointsEarned }"
   >
     <!-- Top row: kickoff + countdown/points -->
     <div class="flex items-center justify-between mb-3">
@@ -165,12 +155,6 @@ function updateAway(e: Event) {
         {{ countdown }}
       </span>
       <span
-        v-else-if="isAdminUnlocked"
-        class="text-xs text-amber-500 font-medium"
-      >
-        {{ t('match.adminUnlocked') }}
-      </span>
-      <span
         v-else-if="match.is_locked"
         class="text-xs text-text-muted"
       >
@@ -181,9 +165,9 @@ function updateAway(e: Event) {
     <!-- Teams + Score/Inputs -->
     <div class="flex items-center gap-3">
       <!-- Home team -->
-        <div class="flex-1 text-right">
+        <div class="flex-1 flex items-center justify-end gap-2">
           <span
-            class="text-sm font-medium truncate block"
+            class="text-sm font-medium truncate"
             :class="[
               vm.justice.home === 'unlucky' ? 'text-rose-400' : '',
               vm.justice.home === 'overperformed' ? 'text-emerald-400' : '',
@@ -192,6 +176,12 @@ function updateAway(e: Event) {
           >
             {{ match.home_team }}
           </span>
+          <img
+            v-if="match.teams?.home?.image_path"
+            :src="match.teams.home.image_path"
+            :alt="match.home_team"
+            class="w-6 h-6 shrink-0 object-contain"
+          />
         </div>
 
       <!-- Score inputs or result -->
@@ -241,9 +231,15 @@ function updateAway(e: Event) {
       </div>
 
       <!-- Away team -->
-        <div class="flex-1">
+        <div class="flex-1 flex items-center gap-2">
+          <img
+            v-if="match.teams?.away?.image_path"
+            :src="match.teams.away.image_path"
+            :alt="match.away_team"
+            class="w-6 h-6 shrink-0 object-contain"
+          />
           <span
-            class="text-sm font-medium truncate block"
+            class="text-sm font-medium truncate"
             :class="[
               vm.justice.away === 'unlucky' ? 'text-rose-400' : '',
               vm.justice.away === 'overperformed' ? 'text-emerald-400' : '',
@@ -332,10 +328,11 @@ function updateAway(e: Event) {
 
     <!-- Historical context (embedded from API response) -->
     <MatchHistory
-      v-if="sportKey"
+      v-if="match.teams?.home?.sm_id && match.teams?.away?.sm_id"
       :home-team="match.home_team"
       :away-team="match.away_team"
-      :sport-key="sportKey"
+      :home-s-m-id="match.teams.home.sm_id"
+      :away-s-m-id="match.teams.away.sm_id"
       :context="(match.h2h_context as any) ?? undefined"
     />
 

@@ -35,6 +35,7 @@ export interface MatchdayMatch {
   odds_meta?: OddsMetaV3;
   has_advanced_stats?: boolean;
   referee_id?: number | string | null;
+  referee_name?: string | null;
   teams?: MatchV3["teams"];
   is_locked: boolean;
   h2h_context?: Record<string, unknown> | null;
@@ -60,11 +61,6 @@ export interface MatchdayPrediction {
   status: string;
 }
 
-export interface SquadMember {
-  user_id: string;
-  alias: string;
-}
-
 export interface MoneylineBet {
   id: string;
   match_id: string;
@@ -83,6 +79,7 @@ export const useMatchdayStore = defineStore("matchday", () => {
   const currentMatchday = ref<Matchday | null>(null);
   const matches = ref<MatchdayMatch[]>([]);
   const predictions = ref<MatchdayPrediction | null>(null);
+  const legacyPredictionMatches = ref<string[]>([]);
 
   // Draft state (local edits before saving)
   const draftPredictions = ref<Map<string, { home: number; away: number }>>(new Map());
@@ -111,20 +108,8 @@ export const useMatchdayStore = defineStore("matchday", () => {
     return 300_000;                             // 5 min — upcoming, odds drift
   }
 
-  // Admin state
-  const squadMembers = ref<SquadMember[]>([]);
-  const adminTargetUserId = ref<string | null>(null);
-  const adminTargetPredictions = ref<MatchdayPrediction | null>(null);
-
-  // Computed
-  const adminUnlockedSet = computed(() =>
-    new Set(predictions.value?.admin_unlocked_matches ?? [])
-  );
-
   const editableMatches = computed(() =>
-    matches.value.filter(
-      (m) => !m.is_locked || adminUnlockedSet.value.has(m.id)
-    )
+    matches.value.filter((m) => !m.is_locked)
   );
 
   const lockedMatches = computed(() =>
@@ -211,6 +196,16 @@ export const useMatchdayStore = defineStore("matchday", () => {
   }
 
   async function fetchMatchdayDetail(matchdayId: string, squadId?: string | null) {
+    // Prevent state bleed when switching from legacy-like IDs to v3 IDs (or vice versa).
+    const currentlyV3 = String(currentMatchday.value?.id || "").startsWith("v3:");
+    const nextV3 = String(matchdayId || "").startsWith("v3:");
+    if (currentMatchday.value && currentlyV3 !== nextV3) {
+      currentMatchday.value = null;
+      matches.value = [];
+      predictions.value = null;
+      draftPredictions.value = new Map();
+      legacyPredictionMatches.value = [];
+    }
     const cached = detailCache.get(matchdayId);
 
     if (cached) {
@@ -247,11 +242,17 @@ export const useMatchdayStore = defineStore("matchday", () => {
         params
       );
       predictions.value = data;
+      legacyPredictionMatches.value = [];
 
       // Populate draft from existing predictions
       draftPredictions.value = new Map();
       if (data?.predictions) {
+        const activeMatchIds = new Set(matches.value.map((m) => String(m.id)));
         for (const p of data.predictions) {
+          if (!activeMatchIds.has(String(p.match_id))) {
+            legacyPredictionMatches.value.push(String(p.match_id));
+            continue;
+          }
           draftPredictions.value.set(p.match_id, {
             home: p.home_score,
             away: p.away_score,
@@ -261,6 +262,7 @@ export const useMatchdayStore = defineStore("matchday", () => {
       draftAutoStrategy.value = data?.auto_bet_strategy || "none";
     } catch {
       predictions.value = null;
+      legacyPredictionMatches.value = [];
     }
   }
 
@@ -399,86 +401,6 @@ export const useMatchdayStore = defineStore("matchday", () => {
     predictions.value = null;
     draftPredictions.value = new Map();
     moneylineBets.value = new Map();
-    // Clear admin state
-    adminTargetUserId.value = null;
-    adminTargetPredictions.value = null;
-  }
-
-  // ---------- Admin actions ----------
-
-  async function fetchSquadMembers(squadId: string) {
-    try {
-      squadMembers.value = await api.get<SquadMember[]>(
-        `/matchday/admin/members/${squadId}`
-      );
-    } catch {
-      squadMembers.value = [];
-    }
-  }
-
-  async function fetchAdminPredictions(
-    matchdayId: string,
-    squadId: string,
-    userId: string
-  ) {
-    try {
-      adminTargetPredictions.value =
-        await api.get<MatchdayPrediction | null>(
-          `/matchday/admin/predictions/${matchdayId}`,
-          { squad_id: squadId, user_id: userId }
-        );
-    } catch {
-      adminTargetPredictions.value = null;
-    }
-  }
-
-  async function adminUnlockMatch(
-    squadId: string,
-    matchdayId: string,
-    userId: string,
-    matchId: string
-  ): Promise<boolean> {
-    try {
-      await api.post("/matchday/admin/unlock", {
-        squad_id: squadId,
-        matchday_id: matchdayId,
-        user_id: userId,
-        match_id: matchId,
-      });
-      // Refresh the target user's predictions
-      await fetchAdminPredictions(matchdayId, squadId, userId);
-      return true;
-    } catch {
-      return false;
-    }
-  }
-
-  async function adminSavePrediction(
-    squadId: string,
-    matchdayId: string,
-    userId: string,
-    matchId: string,
-    homeScore: number,
-    awayScore: number
-  ): Promise<{ points_earned: number | null } | null> {
-    try {
-      const result = await api.post<{ points_earned: number | null }>(
-        "/matchday/admin/prediction",
-        {
-          squad_id: squadId,
-          matchday_id: matchdayId,
-          user_id: userId,
-          match_id: matchId,
-          home_score: homeScore,
-          away_score: awayScore,
-        }
-      );
-      // Refresh the target user's predictions
-      await fetchAdminPredictions(matchdayId, squadId, userId);
-      return result;
-    } catch {
-      return null;
-    }
   }
 
   return {
@@ -487,6 +409,7 @@ export const useMatchdayStore = defineStore("matchday", () => {
     currentMatchday,
     matches,
     predictions,
+    legacyPredictionMatches,
     draftPredictions,
     draftAutoStrategy,
     loading,
@@ -510,14 +433,5 @@ export const useMatchdayStore = defineStore("matchday", () => {
     setSport,
     setSquadContext,
     invalidateCache,
-    // Admin
-    squadMembers,
-    adminTargetUserId,
-    adminTargetPredictions,
-    adminUnlockedSet,
-    fetchSquadMembers,
-    fetchAdminPredictions,
-    adminUnlockMatch,
-    adminSavePrediction,
   };
 });

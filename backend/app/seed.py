@@ -129,3 +129,57 @@ async def seed_qbot_user() -> str:
     result = await _db.db.users.insert_one(user_doc)
     logger.info("Q-Bot user created: %s", result.inserted_id)
     return str(result.inserted_id)
+
+
+async def ensure_startup_superadmin() -> None:
+    """Ensure a configured superadmin exists at startup.
+
+    Greenfield v3.1 bootstrap behavior:
+    - No broad startup seeding of sports data.
+    - Optional admin bootstrap only when both env vars are present.
+    - Idempotent: promotes existing user and refreshes password hash.
+    """
+    if not settings.SEED_ADMIN_EMAIL or not settings.SEED_ADMIN_PASSWORD:
+        logger.debug("SEED_ADMIN_EMAIL/SEED_ADMIN_PASSWORD not set, startup admin bootstrap skipped")
+        return
+
+    email = settings.SEED_ADMIN_EMAIL.strip().lower()
+    if not email:
+        logger.warning("Startup admin bootstrap skipped: empty SEED_ADMIN_EMAIL")
+        return
+
+    now = utcnow()
+    existing = await _db.db.users.find_one({"email": email})
+    if existing:
+        await _db.db.users.update_one(
+            {"_id": existing["_id"]},
+            {
+                "$set": {
+                    "is_admin": True,
+                    "hashed_password": ph.hash(settings.SEED_ADMIN_PASSWORD),
+                    "updated_at": now,
+                }
+            },
+        )
+        logger.info("Startup admin bootstrap updated/promoted user: %s", existing["_id"])
+        return
+
+    alias, alias_slug = await generate_default_alias(_db.db)
+    doc = {
+        "email": email,
+        "hashed_password": ph.hash(settings.SEED_ADMIN_PASSWORD),
+        "alias": alias,
+        "alias_slug": alias_slug,
+        "has_custom_alias": False,
+        "points": 0.0,
+        "is_admin": True,
+        "is_banned": False,
+        "is_2fa_enabled": False,
+        "encrypted_2fa_secret": None,
+        "encryption_key_version": 1,
+        "is_deleted": False,
+        "created_at": now,
+        "updated_at": now,
+    }
+    result = await _db.db.users.insert_one(doc)
+    logger.info("Startup admin bootstrap created superadmin: %s", result.inserted_id)

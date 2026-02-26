@@ -57,15 +57,24 @@ class _Collection:
                     return False
                 if "$exists" in expected and bool(expected["$exists"]) != bool(exists):
                     return False
+                if "$ne" in expected and value == expected["$ne"]:
+                    return False
+                if "$gte" in expected:
+                    if value is None or value < expected["$gte"]:
+                        return False
                 continue
             if not exists or value != expected:
                 return False
         return True
 
-    async def find_one(self, query, _projection=None):
-        for doc in self.docs:
-            if self._matches(doc, query):
-                return dict(doc)
+    async def find_one(self, query, _projection=None, sort=None):
+        matches = [doc for doc in self.docs if self._matches(doc, query)]
+        if sort and matches:
+            key, direction = sort[0]
+            reverse = int(direction) < 0
+            matches = sorted(matches, key=lambda d: self._get_nested(d, key)[0], reverse=reverse)
+        for doc in matches:
+            return dict(doc)
         return None
 
     async def update_one(self, query, update, upsert=False):
@@ -94,6 +103,8 @@ class _FakeDB:
         self.meta = _Collection(meta)
         self.admin_import_jobs = _Collection(jobs)
         self.matches_v3 = _Collection(matches_v3)
+        self.users = _Collection([])
+        self.betting_slips = _Collection([])
 
 
 @pytest.mark.asyncio
@@ -197,3 +208,44 @@ async def test_metrics_health_counts_coverage(monkeypatch):
     assert result["total_matches"] == 2
     assert result["xg_covered_matches"] == 1
     assert result["xg_coverage_percent"] == 50.0
+
+
+@pytest.mark.asyncio
+async def test_overview_stats_returns_v3_shape(monkeypatch):
+    now = utcnow()
+    fake_db = _FakeDB(
+        meta=[{"_id": "sportmonks_rate_limit_state", "remaining": 77, "reset_at": now}],
+        jobs=[
+            {"_id": ObjectId(), "status": "queued"},
+            {"_id": ObjectId(), "status": "running"},
+            {"_id": ObjectId(), "status": "failed"},
+        ],
+        matches_v3=[
+            {
+                "_id": 1,
+                "status": "FINISHED",
+                "updated_at": now,
+                "has_advanced_stats": True,
+                "odds_meta": {"summary_1x2": {"home": {"avg": 2.1}, "draw": {"avg": 3.4}, "away": {"avg": 3.6}}},
+            },
+            {"_id": 2, "status": "LIVE", "updated_at": now},
+            {"_id": 3, "status": "POSTPONED", "updated_at": now},
+            {"_id": 4, "status": "CANCELED", "updated_at": now},
+            {"_id": 5, "status": "WALKOVER", "updated_at": now},
+            {"_id": 6, "status": "SCHEDULED", "updated_at": now},
+        ],
+    )
+    fake_db.users = _Collection([{"_id": 1}, {"_id": 2, "is_banned": True}])
+    fake_db.betting_slips = _Collection([{"_id": 1, "created_at": now}, {"_id": 2, "created_at": now}])
+    monkeypatch.setattr(ingest_router._db, "db", fake_db, raising=False)
+
+    result = await ingest_router.get_admin_overview_stats(admin={"_id": ObjectId()})
+    assert result.matches_v3.total == 6
+    assert result.matches_v3.finished == 1
+    assert result.matches_v3.live == 1
+    assert result.matches_v3.postponed == 1
+    assert result.matches_v3.canceled == 1
+    assert result.matches_v3.walkover == 1
+    assert result.matches_v3.with_xg == 1
+    assert result.matches_v3.with_odds == 1
+    assert result.sportmonks_api.remaining == 77

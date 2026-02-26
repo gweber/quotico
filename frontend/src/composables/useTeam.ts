@@ -1,6 +1,5 @@
 import { ref, type Ref } from "vue";
 import { useApi } from "./useApi";
-import type { HistoricalMatch } from "./useMatchHistory";
 
 export interface SeasonStats {
   season_label: string;
@@ -26,12 +25,27 @@ export interface UpcomingMatch {
   status: string;
 }
 
+/** Legacy match shape returned by the team profile endpoint (Team Tower IDs). */
+export interface TeamRecentMatch {
+  match_date: string;
+  home_team: string;
+  away_team: string;
+  home_team_id: string;
+  away_team_id: string;
+  result: {
+    home_score: number;
+    away_score: number;
+    outcome: string;
+  };
+  season_label: string;
+}
+
 export interface TeamProfile {
   team_key: string;
   display_name: string;
   sport_keys: string[];
   form: string[];
-  recent_results: HistoricalMatch[];
+  recent_results: TeamRecentMatch[];
   season_stats: SeasonStats | null;
   upcoming_matches: UpcomingMatch[];
 }

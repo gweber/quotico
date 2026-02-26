@@ -15,6 +15,7 @@ Dependencies:
 from __future__ import annotations
 
 import asyncio
+import logging
 import traceback
 from collections import defaultdict
 from datetime import timedelta
@@ -26,7 +27,19 @@ from pymongo import UpdateOne
 import app.database as _db
 from app.config import settings
 from app.providers.sportmonks import sportmonks_provider
+from app.services.matchday_v3_cache_service import invalidate_matchday_list_cache_for_season
+from app.services.team_alias_normalizer import normalize_team_alias
 from app.utils import ensure_utc, parse_utc, utcnow
+
+logger = logging.getLogger("quotico.sportmonks_connector")
+
+CRITICAL_MANUAL_CHECK_REASONS = frozenset(
+    {
+        "finished_without_scores",
+        "walkover_with_scores",
+        "postponed_with_scores",
+    }
+)
 
 
 class SportmonksConnector:
@@ -36,6 +49,7 @@ class SportmonksConnector:
         self._db = database
         self._remaining: int | None = None
         self._reset_at: int | None = None
+        self._request_windows: dict[str, dict[str, list[Any]]] = {}
 
     @property
     def db(self):
@@ -65,6 +79,100 @@ class SportmonksConnector:
             return int(value)
         except (TypeError, ValueError):
             return default
+
+    def _recompute_manual_check_fields(self, reasons: list[str] | None) -> dict[str, Any]:
+        """Normalize reasons and derive manual_check_required from critical reasons."""
+        seen: set[str] = set()
+        normalized: list[str] = []
+        for raw in reasons or []:
+            value = str(raw or "").strip()
+            if not value or value in seen:
+                continue
+            seen.add(value)
+            normalized.append(value)
+        requires_manual = bool(set(normalized) & set(CRITICAL_MANUAL_CHECK_REASONS))
+        return {
+            "manual_check_reasons": normalized,
+            "manual_check_required": requires_manual,
+        }
+
+    def _manual_check_reasons_expr(self, *, clear_reasons: list[str] | None = None) -> dict[str, Any]:
+        reasons_expr: dict[str, Any] = {"$ifNull": ["$manual_check_reasons", []]}
+        to_clear = [str(value).strip() for value in (clear_reasons or []) if str(value).strip()]
+        if to_clear:
+            reasons_expr = {"$setDifference": [reasons_expr, to_clear]}
+        return {"$setUnion": [reasons_expr, []]}
+
+    async def _apply_match_manual_check_update(
+        self,
+        fixture_id: int,
+        *,
+        set_fields: dict[str, Any],
+        clear_reasons: list[str] | None = None,
+        timeline_entry: dict[str, Any] | None = None,
+    ) -> None:
+        """Atomic helper for match updates that also heals/recomputes manual-check fields."""
+        match_id = int(fixture_id)
+        now = utcnow()
+        stage_set = dict(set_fields)
+        stage_set.setdefault("updated_at", now)
+        reasons_expr = self._manual_check_reasons_expr(clear_reasons=clear_reasons)
+        stage_set["manual_check_reasons"] = reasons_expr
+        stage_set["manual_check_required"] = {
+            "$gt": [
+                {
+                    "$size": {
+                        "$setIntersection": [
+                            reasons_expr,
+                            sorted(CRITICAL_MANUAL_CHECK_REASONS),
+                        ]
+                    }
+                },
+                0,
+            ]
+        }
+        if timeline_entry is not None:
+            stage_set["odds_timeline"] = {
+                "$slice": [
+                    {
+                        "$concatArrays": [
+                            {"$ifNull": ["$odds_timeline", []]},
+                            [timeline_entry],
+                        ]
+                    },
+                    -20,
+                ]
+            }
+        try:
+            await self.db.matches_v3.update_one({"_id": match_id}, [{"$set": stage_set}])
+            return
+        except Exception:
+            # Fallback for environments without update-pipeline support.
+            doc = await self.db.matches_v3.find_one(
+                {"_id": match_id},
+                {"manual_check_reasons": 1},
+            )
+            current_reasons = list((doc or {}).get("manual_check_reasons") or [])
+            if clear_reasons:
+                cleared = {str(value).strip() for value in clear_reasons if str(value).strip()}
+                current_reasons = [value for value in current_reasons if str(value).strip() not in cleared]
+            recomputed = self._recompute_manual_check_fields(current_reasons)
+            update_doc: dict[str, Any] = {
+                "$set": {
+                    **set_fields,
+                    "updated_at": stage_set["updated_at"],
+                    "manual_check_reasons": recomputed["manual_check_reasons"],
+                    "manual_check_required": recomputed["manual_check_required"],
+                }
+            }
+            if timeline_entry is not None:
+                update_doc["$push"] = {
+                    "odds_timeline": {
+                        "$each": [timeline_entry],
+                        "$slice": -20,
+                    }
+                }
+            await self.db.matches_v3.update_one({"_id": match_id}, update_doc)
 
     async def upsert_match_v3(self, fixture_sm_id: int, match_data_v3: dict[str, Any]) -> None:
         await self._upsert_v3_document(
@@ -186,7 +294,23 @@ class SportmonksConnector:
         return sorted(merged.values(), key=lambda x: int(x["id"]), reverse=True)
 
     async def ingest_season(self, season_id: int, *, job_id: ObjectId | None = None) -> dict[str, Any]:
+        sync_odds = bool(settings.SPORTMONKS_DEEP_INGEST_SYNC_ODDS)
+        max_runtime_minutes = int(settings.SPORTMONKS_MAX_RUNTIME_DEEP_MINUTES)
+        timeout_at = utcnow() + timedelta(minutes=max_runtime_minutes)
         await self._job_update(job_id, status="running", phase="loading_rounds", started_at=utcnow())
+        await self._job_update(
+            job_id,
+            timeout_at=timeout_at,
+            max_runtime_minutes=max_runtime_minutes,
+            page_requests_total=0,
+            duplicate_page_blocks=0,
+            phase_page_requests={},
+        )
+        await self._guard_before_external_call(
+            job_id=job_id,
+            phase="loading_rounds",
+            request_key=f"rounds:season:{int(season_id)}",
+        )
         rounds_response = await sportmonks_provider.get_season_rounds(int(season_id))
         self._remaining = self._to_int(rounds_response.get("remaining"))
         self._reset_at = self._to_int(rounds_response.get("reset_at"))
@@ -220,7 +344,15 @@ class SportmonksConnector:
                     rate_limit_paused=False,
                 )
 
-                fixtures_response = await sportmonks_provider.get_round_fixtures(round_id)
+                await self._guard_before_external_call(
+                    job_id=job_id,
+                    phase="ingesting_round",
+                    request_key=f"round:{int(round_id)}:include_odds:{int(sync_odds)}",
+                )
+                fixtures_response = await sportmonks_provider.get_round_fixtures(
+                    round_id,
+                    include_odds=sync_odds,
+                )
                 self._remaining = self._to_int(fixtures_response.get("remaining"))
                 self._reset_at = self._to_int(fixtures_response.get("reset_at"))
                 fixtures = (fixtures_response.get("payload") or {}).get("data") or []
@@ -238,7 +370,13 @@ class SportmonksConnector:
                         people_count = await self._sync_people_from_fixture(fixture)
                         await self.upsert_match_v3(fixture_id, self._map_fixture_to_match(fixture, season_id))
                         await self._pause_if_needed(job_id=job_id)
-                        odds_saved = await self.sync_fixture_odds_summary(fixture_id)
+                        odds_saved = False
+                        if sync_odds:
+                            odds_saved = await self.sync_fixture_odds_summary(
+                                fixture_id,
+                                job_id=job_id,
+                                phase="deep_odds_sync",
+                            )
                         counters["matches_upserted"] += 1
                         counters["persons_upserted"] += people_count
                         counters["odds_synced"] += 1 if odds_saved else 0
@@ -279,6 +417,7 @@ class SportmonksConnector:
                 finished_at=utcnow(),
                 error={"message": str(exc), "type": type(exc).__name__},
             )
+            self._clear_request_window(job_id)
             raise
 
         await self._job_update(
@@ -294,6 +433,11 @@ class SportmonksConnector:
                 **counters,
             },
         )
+        try:
+            await invalidate_matchday_list_cache_for_season(season_id=int(season_id))
+        except Exception:
+            pass
+        self._clear_request_window(job_id)
         return {
             "season_id": int(season_id),
             "processed_rounds": processed_rounds,
@@ -303,14 +447,26 @@ class SportmonksConnector:
 
     async def run_metrics_sync(self, season_id: int, *, job_id: ObjectId | None = None) -> dict[str, int]:
         """Run dedicated metrics sync (bulk odds -> repair -> paginated xG) for a season."""
+        max_runtime_minutes = int(settings.SPORTMONKS_MAX_RUNTIME_METRICS_MINUTES)
+        timeout_at = utcnow() + timedelta(minutes=max_runtime_minutes)
         await self._job_update(
             job_id,
             status="running",
             phase="metrics_sync",
             started_at=utcnow(),
+            timeout_at=timeout_at,
+            max_runtime_minutes=max_runtime_minutes,
+            page_requests_total=0,
+            duplicate_page_blocks=0,
+            phase_page_requests={},
             pages_processed=0,
             pages_total=None,
             rows_processed=0,
+        )
+        await self._guard_before_external_call(
+            job_id=job_id,
+            phase="metrics_loading_rounds",
+            request_key=f"rounds:season:{int(season_id)}",
         )
         rounds_response = await sportmonks_provider.get_season_rounds(int(season_id))
         self._remaining = self._to_int(rounds_response.get("remaining"))
@@ -361,7 +517,12 @@ class SportmonksConnector:
             await self._pause_if_needed(job_id=job_id)
             repair_calls += 1
             try:
-                if await self.sync_fixture_odds_summary(int(fixture_id), source="sportmonks_fixture_repair"):
+                if await self.sync_fixture_odds_summary(
+                    int(fixture_id),
+                    source="sportmonks_fixture_repair",
+                    job_id=job_id,
+                    phase="metrics_repair",
+                ):
                     repair_success += 1
             except Exception as exc:
                 repair_failures += 1
@@ -384,10 +545,22 @@ class SportmonksConnector:
                     },
                 )
 
-        xg_result = await self.sync_season_xg(int(season_id), job_id=job_id)
+        xg_result: dict[str, int] = {}
+        try:
+            xg_result = await self.sync_season_xg(int(season_id), job_id=job_id)
+        except Exception as exc:
+            await self._append_job_error(
+                job_id=job_id,
+                round_id=None,
+                message=f"xG sync failed (odds were synced successfully): {exc}",
+                trace=self._safe_trace(),
+            )
         total_fixtures = len(seen_fixture_ids) if seen_fixture_ids else len(docs)
         saved_calls_estimate = max(0, int(total_fixtures) - (int(bulk_round_calls) + int(repair_calls)))
         savings_ratio = round((saved_calls_estimate / int(total_fixtures)), 4) if int(total_fixtures) > 0 else 0.0
+
+        # Post-sync data guard: flag cross-pipeline issues (xG/odds)
+        guard_result = await self._post_sync_data_guard(int(season_id))
 
         result = {
             "season_id": int(season_id),
@@ -406,6 +579,8 @@ class SportmonksConnector:
             "odds_matches_synced": int(bulk_fixtures_processed + repair_success),
             "odds_errors": int(repair_failures),
             "total_matches": int(total_fixtures),
+            "guard_xg_flagged": int(guard_result.get("xg_flagged") or 0),
+            "guard_odds_flagged": int(guard_result.get("odds_flagged") or 0),
         }
         await self._job_update(
             job_id,
@@ -415,6 +590,11 @@ class SportmonksConnector:
             finished_at=utcnow(),
             results=result,
         )
+        try:
+            await invalidate_matchday_list_cache_for_season(season_id=int(season_id))
+        except Exception:
+            pass
+        self._clear_request_window(job_id)
         return result
 
     async def sync_round_odds_summary(
@@ -425,6 +605,11 @@ class SportmonksConnector:
         job_id: ObjectId | None = None,
     ) -> dict[str, Any]:
         """Bulk-sync odds summaries for one round from fixtures.odds include."""
+        await self._guard_before_external_call(
+            job_id=job_id,
+            phase="metrics_bulk_odds",
+            request_key=f"round:{int(round_id)}:include_odds:1",
+        )
         response = await sportmonks_provider.get_round_fixtures(int(round_id))
         self._remaining = self._to_int(response.get("remaining"))
         self._reset_at = self._to_int(response.get("reset_at"))
@@ -489,111 +674,209 @@ class SportmonksConnector:
         }
 
     async def sync_season_xg(self, season_id: int, *, job_id: ObjectId | None = None) -> dict[str, int]:
-        """Sync xG from expected endpoint and patch existing matches_v3 documents."""
-        grouped: dict[int, list[dict[str, Any]]] = defaultdict(list)
-        next_page: str | None = None
+        """Sync xG via a local mirror collection (xg_raw), then resolve to matches.
+
+        The Sportmonks /football/expected/fixtures endpoint returns xG for ALL
+        leagues/seasons globally (no filter, 25 rows/page, newest-first).
+        Hundreds of leagues × ~300 matches/season = millions of rows.
+
+        Strategy — mirror then match:
+        Phase A: Append new rows from the API into db.xg_raw (stop at last seen _id).
+                 First run does the heavy lift; subsequent runs grab 1-2 pages.
+        Phase B: For the requested season, join xg_raw against matches_v3 to
+                 write home/away xG on any FINISHED match still missing it.
+        """
+        # ── Phase A: mirror new xG rows into xg_raw ─────────────────────
+        # Find the highest row_id we already have
+        latest_doc = await self.db.xg_raw.find_one(sort=[("_id", -1)])
+        high_water = int((latest_doc or {}).get("_id") or 0)
+
+        current_page = 1
         page_count = 0
-        rows_processed = 0
-        while True:
+        rows_stored = 0
+        max_pages = 50  # quick front-catch only; background crawler handles backfill
+        hit_existing = False
+
+        while page_count < max_pages:
+            await self._guard_before_external_call(
+                job_id=job_id,
+                phase="metrics_xg_sync",
+                request_key=f"expected:page:{int(current_page)}",
+            )
             page = await sportmonks_provider.get_expected_fixtures_page(
-                season_id=int(season_id),
-                next_page_url=next_page,
+                page=current_page,
             )
             self._remaining = self._to_int(page.get("remaining"))
             self._reset_at = self._to_int(page.get("reset_at"))
             payload = page.get("payload") or {}
             rows = payload.get("data") or []
+            if not isinstance(rows, list) or not rows:
+                break
             page_count += 1
-            rows_processed += len(rows) if isinstance(rows, list) else 0
-            for row in rows if isinstance(rows, list) else []:
-                if self._to_int((row or {}).get("type_id")) != 5304:
+
+            batch: list[dict[str, Any]] = []
+            for row in rows:
+                if not isinstance(row, dict):
                     continue
-                fixture_id = self._to_int((row or {}).get("fixture_id"))
-                if fixture_id is None:
-                    continue
-                grouped[int(fixture_id)].append(row)
-            pagination = payload.get("pagination") or {}
-            next_page_value = pagination.get("next_page")
-            next_page = str(next_page_value).strip() if next_page_value else None
+                row_id = self._to_int(row.get("id")) or 0
+                if row_id <= high_water:
+                    hit_existing = True
+                    break
+                batch.append({
+                    "_id": row_id,
+                    "fixture_id": self._to_int(row.get("fixture_id")),
+                    "type_id": self._to_int(row.get("type_id")),
+                    "participant_id": self._to_int(row.get("participant_id")),
+                    "location": str(row.get("location") or "").strip().lower(),
+                    "value": ((row.get("data") or {}).get("value") if isinstance(row.get("data"), dict) else None),
+                })
+
+            if batch:
+                try:
+                    await self.db.xg_raw.insert_many(batch, ordered=False)
+                except Exception:
+                    # Duplicate-key errors are expected at overlap boundaries
+                    pass
+                rows_stored += len(batch)
+
             await self._job_update(
                 job_id,
                 phase="metrics_xg_sync",
                 pages_processed=page_count,
                 pages_total=None,
-                rows_processed=rows_processed,
+                rows_processed=rows_stored,
                 rate_limit_remaining=self._remaining,
             )
-            if not bool(pagination.get("has_more")) or not next_page:
+
+            if hit_existing:
                 break
+            pagination = payload.get("pagination") or {}
+            if not bool(pagination.get("has_more")):
+                break
+            current_page += 1
+
+        # ── Phase B: resolve xG for this season's matches ────────────────
+        season_fixtures: dict[int, dict[str, int | None]] = {}
+        async for doc in self.db.matches_v3.find(
+            {"season_id": int(season_id), "has_advanced_stats": {"$ne": True}, "status": "FINISHED"},
+            {"_id": 1, "teams.home.sm_id": 1, "teams.away.sm_id": 1},
+        ):
+            fid = self._to_int((doc or {}).get("_id"))
+            if fid is None:
+                continue
+            teams = (doc.get("teams") or {}) if isinstance(doc.get("teams"), dict) else {}
+            season_fixtures[int(fid)] = {
+                "home_sm_id": self._to_int(((teams.get("home") or {}).get("sm_id")) if isinstance(teams.get("home"), dict) else None),
+                "away_sm_id": self._to_int(((teams.get("away") or {}).get("sm_id")) if isinstance(teams.get("away"), dict) else None),
+            }
 
         matches_synced = 0
         partial_warnings = 0
-        for fixture_id, xg_rows in grouped.items():
-            match_doc = await self.db.matches_v3.find_one(
-                {"_id": int(fixture_id)},
-                {"teams.home.sm_id": 1, "teams.away.sm_id": 1},
+        for fid, team_lookup in season_fixtures.items():
+            xg_rows = await self.db.xg_raw.find(
+                {"fixture_id": int(fid), "type_id": 5304},
+            ).to_list(length=10)
+            if not xg_rows:
+                continue
+            synced, partial = await self._write_fixture_xg(
+                fixture_id=fid,
+                xg_rows=xg_rows,
+                team_lookup=team_lookup,
+                job_id=job_id,
+                season_id=season_id,
             )
-            if not isinstance(match_doc, dict):
-                continue
-            teams = (match_doc.get("teams") or {}) if isinstance(match_doc.get("teams"), dict) else {}
-            home_id = self._to_int(((teams.get("home") or {}).get("sm_id")) if isinstance(teams.get("home"), dict) else None)
-            away_id = self._to_int(((teams.get("away") or {}).get("sm_id")) if isinstance(teams.get("away"), dict) else None)
-            home_xg: float | None = None
-            away_xg: float | None = None
-            for row in xg_rows:
-                location = str((row or {}).get("location") or "").strip().lower()
-                participant_id = self._to_int((row or {}).get("participant_id"))
-                value_raw = ((row or {}).get("data") or {}).get("value") if isinstance((row or {}).get("data"), dict) else None
-                try:
-                    value = float(value_raw)
-                except (TypeError, ValueError):
-                    continue
-                if location == "home":
-                    home_xg = value
-                    continue
-                if location == "away":
-                    away_xg = value
-                    continue
-                if participant_id is not None and participant_id == home_id:
-                    home_xg = value
-                    continue
-                if participant_id is not None and participant_id == away_id:
-                    away_xg = value
-
-            update_fields: dict[str, Any] = {"updated_at": utcnow()}
-            if home_xg is not None:
-                update_fields["teams.home.xg"] = home_xg
-            if away_xg is not None:
-                update_fields["teams.away.xg"] = away_xg
-            if home_xg is not None and away_xg is not None:
-                update_fields["has_advanced_stats"] = True
-            elif home_xg is not None or away_xg is not None:
-                partial_warnings += 1
-                missing_side = "away" if home_xg is not None else "home"
-                await self._append_job_error(
-                    job_id=job_id,
-                    round_id=None,
-                    message=(
-                        f"warning: partial xg mapping fixture={fixture_id} "
-                        f"season_id={int(season_id)} missing_side={missing_side}"
-                    ),
-                    trace="",
-                )
-            if len(update_fields) <= 1:
-                continue
-            await self.db.matches_v3.update_one({"_id": int(fixture_id)}, {"$set": update_fields})
-            matches_synced += 1
+            matches_synced += synced
+            partial_warnings += partial
 
         return {
-            "fixtures_seen": len(grouped),
+            "fixtures_seen": len(season_fixtures),
             "matches_synced": matches_synced,
             "partial_warnings": partial_warnings,
             "pages_processed": page_count,
-            "rows_processed": rows_processed,
+            "rows_processed": rows_stored,
+            "hit_watermark": hit_existing,
+            "watermark_row_id": high_water,
         }
 
-    async def sync_fixture_odds_summary(self, fixture_id: int, *, source: str = "sportmonks_pre_match") -> bool:
+    async def _write_fixture_xg(
+        self,
+        *,
+        fixture_id: int,
+        xg_rows: list[dict[str, Any]],
+        team_lookup: dict[str, int | None],
+        job_id: ObjectId | None,
+        season_id: int,
+    ) -> tuple[int, int]:
+        """Write xG values for a single fixture. Returns (synced, partial_warnings)."""
+        home_id = team_lookup.get("home_sm_id")
+        away_id = team_lookup.get("away_sm_id")
+        home_xg: float | None = None
+        away_xg: float | None = None
+        for row in xg_rows:
+            location = str((row or {}).get("location") or "").strip().lower()
+            participant_id = self._to_int((row or {}).get("participant_id"))
+            # xg_raw stores value flat; raw API nests under data.value
+            value_raw = (row or {}).get("value")
+            if value_raw is None:
+                value_raw = ((row or {}).get("data") or {}).get("value") if isinstance((row or {}).get("data"), dict) else None
+            try:
+                value = float(value_raw)
+            except (TypeError, ValueError):
+                continue
+            if location == "home":
+                home_xg = value
+            elif location == "away":
+                away_xg = value
+            elif participant_id is not None and participant_id == home_id:
+                home_xg = value
+            elif participant_id is not None and participant_id == away_id:
+                away_xg = value
+
+        update_fields: dict[str, Any] = {}
+        if home_xg is not None:
+            update_fields["teams.home.xg"] = home_xg
+        if away_xg is not None:
+            update_fields["teams.away.xg"] = away_xg
+        partial = 0
+        clear_reasons: list[str] = []
+        if home_xg is not None and away_xg is not None:
+            update_fields["has_advanced_stats"] = True
+            clear_reasons = ["finished_without_xg"]
+        elif home_xg is not None or away_xg is not None:
+            partial = 1
+            missing_side = "away" if home_xg is not None else "home"
+            await self._append_job_error(
+                job_id=job_id,
+                round_id=None,
+                message=(
+                    f"warning: partial xg mapping fixture={fixture_id} "
+                    f"season_id={int(season_id)} missing_side={missing_side}"
+                ),
+                trace="",
+            )
+        if not update_fields:
+            return 0, partial
+        await self._apply_match_manual_check_update(
+            int(fixture_id),
+            set_fields=update_fields,
+            clear_reasons=clear_reasons,
+        )
+        return 1, partial
+
+    async def sync_fixture_odds_summary(
+        self,
+        fixture_id: int,
+        *,
+        source: str = "sportmonks_pre_match",
+        job_id: ObjectId | None = None,
+        phase: str = "metrics_repair",
+    ) -> bool:
         """Store compact 1X2 odds snapshot in matches_v3.odds_meta."""
+        await self._guard_before_external_call(
+            job_id=job_id,
+            phase=phase,
+            request_key=f"prematch-odds:fixture:{int(fixture_id)}",
+        )
         response = await sportmonks_provider.get_prematch_odds_by_fixture(int(fixture_id))
         self._remaining = self._to_int(response.get("remaining"))
         self._reset_at = self._to_int(response.get("reset_at"))
@@ -619,16 +902,17 @@ class SportmonksConnector:
                 "updated_at": now,
             }
         }
+        timeline_entry = None
         if self._should_append_odds_timeline(existing, summary, now):
-            update_doc["$push"] = {
-                "odds_timeline": {
-                    "$each": [self._build_timeline_entry(summary=summary, source=source, ts=now)],
-                    "$slice": -20,
-                }
-            }
-        await self.db.matches_v3.update_one(
-            {"_id": int(fixture_id)},
-            update_doc,
+            timeline_entry = self._build_timeline_entry(summary=summary, source=source, ts=now)
+        clear_reasons: list[str] = []
+        if self._summary_has_valid_odds(summary):
+            clear_reasons.append("finished_without_odds")
+        await self._apply_match_manual_check_update(
+            int(fixture_id),
+            set_fields=update_doc["$set"],
+            clear_reasons=clear_reasons,
+            timeline_entry=timeline_entry,
         )
         return True
 
@@ -692,6 +976,7 @@ class SportmonksConnector:
         except (TypeError, ValueError):
             return None
 
+
     def _build_1x2_summary_from_rows(
         self,
         rows: list[dict[str, Any]] | Any,
@@ -735,6 +1020,16 @@ class SportmonksConnector:
             }
         return summary, has_market_1
 
+    def _summary_has_valid_odds(self, summary: dict[str, dict[str, float | int]]) -> bool:
+        for label in ("home", "draw", "away"):
+            node = summary.get(label)
+            if not isinstance(node, dict):
+                return False
+            value = self._to_float(node.get("avg"))
+            if value is None or value <= 1.0:
+                return False
+        return True
+
     def needs_odds_repair(self, match_doc: dict[str, Any], *, force_missing_market: bool = False) -> bool:
         if force_missing_market:
             return True
@@ -753,11 +1048,11 @@ class SportmonksConnector:
         kickoff = ensure_utc(start_at)
         now = utcnow()
         delta_minutes = (kickoff - now).total_seconds() / 60.0
-        stale_after_minutes = 60
+        stale_after_minutes = int(settings.ODDS_SCHEDULER_TIER_IMMINENT_MINUTES)
         if delta_minutes > (24 * 60):
-            stale_after_minutes = 360
+            stale_after_minutes = int(settings.ODDS_SCHEDULER_TIER_APPROACHING_HOURS) * 60
         elif delta_minutes < (2 * 60):
-            stale_after_minutes = 15
+            stale_after_minutes = int(settings.ODDS_SCHEDULER_TIER_CLOSING_MINUTES)
         updated_at = odds_meta.get("updated_at")
         if updated_at is None:
             return True
@@ -767,6 +1062,135 @@ class SportmonksConnector:
         if str(odds_meta.get("source") or "") == "sportmonks_round_bulk" and delta_minutes < (2 * 60):
             return True
         return False
+
+    async def _guard_before_external_call(
+        self,
+        *,
+        job_id: ObjectId | None,
+        phase: str,
+        request_key: str,
+    ) -> None:
+        if job_id is None:
+            return
+        max_total = int(settings.SPORTMONKS_MAX_PAGE_REQUESTS_TOTAL)
+        max_per_phase = int(settings.SPORTMONKS_MAX_PAGE_REQUESTS_PER_PHASE)
+        duplicate_window_seconds = int(settings.SPORTMONKS_DUPLICATE_PAGE_WINDOW_SECONDS)
+        duplicate_max_hits = int(settings.SPORTMONKS_DUPLICATE_PAGE_MAX_HITS)
+        now = utcnow()
+        job_doc = await self.db.admin_import_jobs.find_one(
+            {"_id": job_id},
+            {
+                "timeout_at": 1,
+                "status": 1,
+                "page_requests_total": 1,
+                "phase_page_requests": 1,
+                "duplicate_page_blocks": 1,
+            },
+        )
+        if not isinstance(job_doc, dict):
+            return
+        timeout_at = job_doc.get("timeout_at")
+        if timeout_at is not None and now > ensure_utc(timeout_at):
+            await self._inc_guard_metric("runtime_timeouts")
+            await self._append_job_error(
+                job_id=job_id,
+                round_id=None,
+                message="Timeout: max runtime exceeded",
+                trace="",
+            )
+            await self._job_update(
+                job_id,
+                status="failed",
+                phase="failed_timeout",
+                active_lock=False,
+                finished_at=now,
+                error={"message": "Timeout: max runtime exceeded", "type": "TimeoutError"},
+            )
+            self._clear_request_window(job_id)
+            raise RuntimeError("Timeout: max runtime exceeded")
+
+        page_requests_total = int(job_doc.get("page_requests_total") or 0) + 1
+        phase_counts = job_doc.get("phase_page_requests") if isinstance(job_doc.get("phase_page_requests"), dict) else {}
+        phase_total = int(phase_counts.get(phase) or 0) + 1
+        if page_requests_total > max_total or phase_total > max_per_phase:
+            await self._append_job_error(
+                job_id=job_id,
+                round_id=None,
+                message=(
+                    f"Page request limit exceeded: max_total={max_total} max_per_phase={max_per_phase} "
+                    f"phase={phase} total={page_requests_total} phase_total={phase_total}"
+                ),
+                trace="",
+            )
+            await self._job_update(
+                job_id,
+                status="failed",
+                phase="failed_page_limit",
+                active_lock=False,
+                finished_at=now,
+                page_requests_total=page_requests_total,
+                error={"message": "Page request limit exceeded", "type": "PageLimitError"},
+            )
+            self._clear_request_window(job_id)
+            raise RuntimeError("Page request limit exceeded")
+
+        job_key = str(job_id)
+        key = f"{phase}|{request_key}"
+        phase_map = self._request_windows.setdefault(job_key, {})
+        timestamps = phase_map.get(key) or []
+        timestamps = [ts for ts in timestamps if (now - ts).total_seconds() <= duplicate_window_seconds]
+        timestamps.append(now)
+        phase_map[key] = timestamps
+        duplicate_blocks = int(job_doc.get("duplicate_page_blocks") or 0)
+        if len(timestamps) > duplicate_max_hits:
+            duplicate_blocks += 1
+            await self._inc_guard_metric("page_guard_blocks")
+            await self._append_job_error(
+                job_id=job_id,
+                round_id=None,
+                message=(
+                    "Duplicate page blocked: "
+                    f"phase={phase} request={request_key} hits={len(timestamps)} "
+                    f"window_seconds={duplicate_window_seconds}"
+                ),
+                trace="",
+            )
+            await self._job_update(
+                job_id,
+                status="failed",
+                phase="failed_duplicate_page_guard",
+                active_lock=False,
+                finished_at=now,
+                page_requests_total=page_requests_total,
+                duplicate_page_blocks=duplicate_blocks,
+                error={"message": "Duplicate page blocked", "type": "DuplicatePageGuardError"},
+            )
+            self._clear_request_window(job_id)
+            raise RuntimeError("Duplicate page blocked")
+
+        phase_counts[phase] = phase_total
+        await self._job_update(
+            job_id,
+            page_requests_total=page_requests_total,
+            phase_page_requests=phase_counts,
+            duplicate_page_blocks=duplicate_blocks,
+        )
+
+    async def _inc_guard_metric(self, field: str) -> None:
+        await self.db.meta.update_one(
+            {"_id": "sportmonks_guard_metrics"},
+            {
+                "$inc": {str(field): 1},
+                "$set": {"updated_at": utcnow()},
+                "$setOnInsert": {"created_at": utcnow()},
+            },
+            upsert=True,
+        )
+
+    def _clear_request_window(self, job_id: ObjectId | None) -> None:
+        if job_id is None:
+            return
+        self._request_windows.pop(str(job_id), None)
 
     async def sync_leagues_on_startup(self) -> None:
         if not settings.SPORTMONKS_STARTUP_DISCOVERY_ENABLED:
@@ -876,15 +1300,16 @@ class SportmonksConnector:
         participants = (fixture or {}).get("participants") or []
         home = participants[0] if len(participants) > 0 else {}
         away = participants[1] if len(participants) > 1 else {}
+        home_score, away_score = self._extract_scores(fixture)
         stats_rows = (fixture or {}).get("statistics") or []
         xg_home = None
         xg_away = None
         for row in stats_rows:
-            key = str((row or {}).get("type") or "").lower()
-            if "xg" not in key:
+            type_id = self._to_int((row or {}).get("type_id"))
+            if type_id != 5304:
                 continue
             team_id = self._to_int((row or {}).get("participant_id"))
-            value = row.get("data") if isinstance(row, dict) else None
+            value = ((row or {}).get("data") or {}).get("value") if isinstance((row or {}).get("data"), dict) else None
             try:
                 parsed = float(value)
             except (TypeError, ValueError):
@@ -902,35 +1327,143 @@ class SportmonksConnector:
             referee_node = nested if isinstance(nested, dict) else first_ref
         if not isinstance(referee_node, dict):
             referee_node = ((fixture or {}).get("referee") or {}) if isinstance((fixture or {}).get("referee"), dict) else {}
+
+        status = self._map_status(fixture)
+        period_scores = self._extract_period_scores(fixture)
+        lineups = self._map_lineups(fixture)
+
+        # Extract finish_type from raw state (FT / AET / PEN)
+        state = (fixture or {}).get("state") or {}
+        raw_state = str((state or {}).get("short_name") or "").upper().strip()
+        finish_type = raw_state if raw_state in {"FT", "AET", "PEN"} else None
+
+        # --- Data guard: flag, don't gate ---
+        reasons: list[str] = []
+        ft = period_scores.get("full_time") or {}
+        if status == "FINISHED":
+            if ft.get("home") is None or ft.get("away") is None:
+                # Fallback: fill full_time from CURRENT scores
+                if home_score is not None and away_score is not None:
+                    period_scores["full_time"] = {"home": home_score, "away": away_score}
+                else:
+                    reasons.append("finished_without_scores")
+            if not lineups:
+                reasons.append("finished_without_lineups")
+        if status == "WALKOVER" and (home_score is not None or away_score is not None):
+            reasons.append("walkover_with_scores")
+        if status == "POSTPONED" and (home_score is not None or away_score is not None):
+            reasons.append("postponed_with_scores")
+
+        recomputed = self._recompute_manual_check_fields(reasons)
+
         return {
             "league_id": self._to_int((fixture or {}).get("league_id"), 0) or 0,
             "season_id": int(season_id),
             "round_id": self._to_int((fixture or {}).get("round_id")),
             "referee_id": self._to_int((referee_node or {}).get("id")),
+            "referee_name": self._first_non_empty(
+                (referee_node or {}).get("common_name"),
+                (referee_node or {}).get("name"),
+            ),
             "start_at": parse_utc((fixture or {}).get("starting_at") or utcnow()),
             "has_advanced_stats": has_advanced,
-            "status": self._map_status(fixture),
+            "status": status,
+            "finish_type": finish_type,
             "teams": {
-                "home": {"sm_id": self._to_int(home.get("id"), 0) or 0, "xg": xg_home},
-                "away": {"sm_id": self._to_int(away.get("id"), 0) or 0, "xg": xg_away},
+                "home": {
+                    "sm_id": self._to_int(home.get("id"), 0) or 0,
+                    "name": self._norm_name(home.get("name")),
+                    "short_code": self._first_non_empty(home.get("short_code")),
+                    "image_path": self._first_non_empty(home.get("image_path")),
+                    "score": home_score,
+                    "xg": xg_home,
+                },
+                "away": {
+                    "sm_id": self._to_int(away.get("id"), 0) or 0,
+                    "name": self._norm_name(away.get("name")),
+                    "short_code": self._first_non_empty(away.get("short_code")),
+                    "image_path": self._first_non_empty(away.get("image_path")),
+                    "score": away_score,
+                    "xg": xg_away,
+                },
             },
-            "lineups": self._map_lineups(fixture),
+            "events": self._map_events(fixture),
+            "scores": period_scores,
+            "lineups": lineups,
             "penalty_info": self._map_penalty_info(fixture),
+            "manual_check_required": bool(recomputed["manual_check_required"]),
+            "manual_check_reasons": recomputed["manual_check_reasons"],
         }
 
     def _map_status(self, fixture: dict[str, Any]) -> str:
-        raw = str((((fixture or {}).get("state") or {}).get("short_name")) or (fixture or {}).get("status") or "").upper()
+        state = (fixture or {}).get("state") or {}
+        raw = str((state or {}).get("short_name") or (state or {}).get("state") or (fixture or {}).get("status") or "").upper()
+        state_id = self._to_int((fixture or {}).get("state_id"))
         if raw in {"FT", "AET", "PEN"}:
+            return "FINISHED"
+        if state_id in {5, 6, 7}:
             return "FINISHED"
         if raw in {"LIVE", "HT", "ET", "IN_PLAY"}:
             return "LIVE"
+        if state_id in {2, 3, 4, 8, 9}:
+            return "LIVE"
         if raw in {"TBA", "NS"}:
+            return "SCHEDULED"
+        if state_id in {1}:
             return "SCHEDULED"
         if raw in {"PST"}:
             return "POSTPONED"
+        if state_id in {10}:
+            return "POSTPONED"
         if raw in {"WO", "CANCL"}:
             return "WALKOVER"
+        if state_id in {11, 12}:
+            return "WALKOVER"
         return "SCHEDULED"
+
+    def _extract_scores(self, fixture: dict[str, Any]) -> tuple[int | None, int | None]:
+        rows = (fixture or {}).get("scores") or []
+        if not isinstance(rows, list) or not rows:
+            return None, None
+        preferred = [row for row in rows if str((row or {}).get("description") or "").upper() == "CURRENT"]
+        candidates = preferred if preferred else rows
+        home_score = None
+        away_score = None
+        for row in candidates:
+            score = (row or {}).get("score") or {}
+            side = str(score.get("participant") or "").strip().lower()
+            goals = self._to_int(score.get("goals"))
+            if goals is None:
+                continue
+            if side == "home":
+                home_score = goals
+            elif side == "away":
+                away_score = goals
+        return home_score, away_score
+
+    def _extract_period_scores(self, fixture: dict[str, Any]) -> dict[str, Any]:
+        """Extract half_time and full_time period scores from fixture score rows."""
+        rows = (fixture or {}).get("scores") or []
+        result: dict[str, dict[str, int | None]] = {
+            "half_time": {"home": None, "away": None},
+            "full_time": {"home": None, "away": None},
+        }
+        if not isinstance(rows, list) or not rows:
+            return result
+        desc_map = {"1ST_HALF": "half_time", "CURRENT": "full_time"}
+        for row in rows:
+            desc = str((row or {}).get("description") or "").upper().strip()
+            period_key = desc_map.get(desc)
+            if period_key is None:
+                continue
+            score = (row or {}).get("score") or {}
+            side = str(score.get("participant") or "").strip().lower()
+            goals = self._to_int(score.get("goals"))
+            if goals is None:
+                continue
+            if side in ("home", "away"):
+                result[period_key][side] = goals
+        return result
 
     def _map_lineups(self, fixture: dict[str, Any]) -> list[dict[str, Any]]:
         out: list[dict[str, Any]] = []
@@ -970,10 +1503,31 @@ class SportmonksConnector:
             image_path = self._first_non_empty((participant or {}).get("image_path"))
             if image_path is not None:
                 set_payload["image_path"] = image_path
+            normalized = normalize_team_alias(str(name or ""))
+            default_alias = (
+                {
+                    "name": str(name or "").strip(),
+                    "normalized": normalized,
+                    "source": "provider_unknown",
+                    "sport_key": None,
+                    "alias_key": f"{normalized}|*|provider_unknown",
+                    "is_default": True,
+                    "created_at": utcnow(),
+                    "updated_at": utcnow(),
+                }
+                if normalized
+                else None
+            )
             ops.append(
                 UpdateOne(
                     {"_id": int(team_id)},
-                    {"$set": set_payload, "$setOnInsert": {"created_at": utcnow()}},
+                    {
+                        "$set": set_payload,
+                        "$setOnInsert": {
+                            "created_at": utcnow(),
+                            "aliases": [default_alias] if default_alias else [],
+                        },
+                    },
                     upsert=True,
                 )
             )
@@ -996,6 +1550,194 @@ class SportmonksConnector:
             details.append({"minute": minute, "converted": minute in goal_minutes})
         return {"occurred": bool(details), "details": details}
 
+    # Sportmonks v3 event type_id constants
+    _EVT_VAR = 10
+    _EVT_GOAL = 14
+    _EVT_OWN_GOAL = 15
+    _EVT_PENALTY_SCORED = 16
+    _EVT_MISSED_PENALTY = 17
+    _EVT_YELLOW_CARD = 19
+    _EVT_RED_CARD = 20
+    _EVT_YELLOW_RED_CARD = 21
+
+    _EVT_TYPE_MAP: dict[int, tuple[str, str]] = {
+        # type_id -> (mapped_type, default_detail)
+        _EVT_VAR: ("var", ""),
+        _EVT_GOAL: ("goal", "regular"),
+        _EVT_OWN_GOAL: ("goal", "own_goal"),
+        _EVT_PENALTY_SCORED: ("goal", "penalty"),
+        _EVT_MISSED_PENALTY: ("missed_penalty", ""),
+        _EVT_YELLOW_CARD: ("card", "yellow"),
+        _EVT_RED_CARD: ("card", "red"),
+        _EVT_YELLOW_RED_CARD: ("card", "yellow_red"),
+    }
+
+    def _map_events(self, fixture: dict[str, Any]) -> list[dict[str, Any]]:
+        """Extract goals, cards, VAR, and missed penalties from fixture events."""
+        raw_events = (fixture or {}).get("events") or []
+        mapped: list[dict[str, Any]] = []
+        for event in raw_events:
+            type_id = self._to_int((event or {}).get("type_id"))
+            entry = self._EVT_TYPE_MAP.get(type_id)  # type: ignore[arg-type]
+            if entry is None:
+                continue
+            mapped_type, default_detail = entry
+            minute = self._to_int((event or {}).get("minute"))
+            extra_minute = self._to_int((event or {}).get("extra_minute"))
+            player_name = str((event or {}).get("player_name") or "").strip()
+            player_id = self._to_int((event or {}).get("player_id"))
+            team_id = self._to_int((event or {}).get("team_id") or (event or {}).get("participant_id"))
+            sort_order = self._to_int((event or {}).get("sort_order"))
+            info = str((event or {}).get("info") or "").strip()
+
+            # Determine detail
+            if type_id == self._EVT_GOAL:
+                sub_type = str((event or {}).get("sub_type") or "").lower()
+                detail = "penalty" if "pen" in sub_type else "regular"
+            elif type_id in (self._EVT_VAR, self._EVT_MISSED_PENALTY):
+                detail = info or default_detail
+            else:
+                detail = default_detail
+
+            mapped.append({
+                "type": mapped_type,
+                "minute": minute,
+                "extra_minute": extra_minute,
+                "player_name": player_name,
+                "player_id": player_id,
+                "team_id": team_id,
+                "detail": detail,
+                "sort_order": sort_order,
+            })
+        # Sort by sort_order (Sportmonks canonical), fallback to minute
+        mapped.sort(key=lambda e: (e.get("sort_order") or 0, e.get("minute") or 0))
+        return mapped
+
+    async def _post_sync_data_guard(self, season_id: int) -> dict[str, int]:
+        """Flag FINISHED matches missing xG or odds after full metrics sync."""
+        now = utcnow()
+        result_xg = await self.db.matches_v3.update_many(
+            {
+                "season_id": int(season_id),
+                "status": "FINISHED",
+                "has_advanced_stats": {"$ne": True},
+            },
+            {
+                "$addToSet": {"manual_check_reasons": "finished_without_xg"},
+                "$set": {"updated_at": now},
+            },
+        )
+        result_odds = await self.db.matches_v3.update_many(
+            {
+                "season_id": int(season_id),
+                "status": "FINISHED",
+                "odds_meta.summary_1x2.home.avg": {"$exists": False},
+            },
+            {
+                "$addToSet": {"manual_check_reasons": "finished_without_odds"},
+                "$set": {"updated_at": now},
+            },
+        )
+        # Keep manual_check_required aligned for all flagged docs.
+        await self.db.matches_v3.update_many(
+            {
+                "season_id": int(season_id),
+                "status": "FINISHED",
+                "manual_check_reasons": {
+                    "$in": sorted(CRITICAL_MANUAL_CHECK_REASONS),
+                },
+            },
+            {"$set": {"manual_check_required": True, "updated_at": now}},
+        )
+        return {
+            "xg_flagged": result_xg.modified_count,
+            "odds_flagged": result_odds.modified_count,
+        }
+
+    async def auto_heal_manual_check_flags(
+        self,
+        *,
+        season_id: int | None = None,
+    ) -> dict[str, int]:
+        """Bulk-heal stale finished_without_* reasons and recompute manual-check fields."""
+        base_query: dict[str, Any] = {"status": "FINISHED"}
+        if season_id is not None:
+            base_query["season_id"] = int(season_id)
+
+        stale_xg_query = {
+            **base_query,
+            "has_advanced_stats": True,
+            "manual_check_reasons": "finished_without_xg",
+        }
+        stale_odds_query = {
+            **base_query,
+            "manual_check_reasons": "finished_without_odds",
+            "odds_meta.summary_1x2.home.avg": {"$gt": 1.0},
+            "odds_meta.summary_1x2.draw.avg": {"$gt": 1.0},
+            "odds_meta.summary_1x2.away.avg": {"$gt": 1.0},
+        }
+
+        xg_ids = await self.db.matches_v3.find(stale_xg_query, {"_id": 1}).to_list(length=200_000)
+        odds_ids = await self.db.matches_v3.find(stale_odds_query, {"_id": 1}).to_list(length=200_000)
+        target_ids = {int(row["_id"]) for row in [*xg_ids, *odds_ids] if row.get("_id") is not None}
+        now = utcnow()
+        healed_xg = 0
+        healed_odds = 0
+        healed_total = 0
+
+        for match_id in sorted(target_ids):
+            doc = await self.db.matches_v3.find_one(
+                {"_id": int(match_id)},
+                {
+                    "manual_check_reasons": 1,
+                    "has_advanced_stats": 1,
+                    "odds_meta.summary_1x2.home.avg": 1,
+                    "odds_meta.summary_1x2.draw.avg": 1,
+                    "odds_meta.summary_1x2.away.avg": 1,
+                },
+            )
+            reasons = list((doc or {}).get("manual_check_reasons") or [])
+            reasons_set = {str(value).strip() for value in reasons if str(value).strip()}
+            changed = False
+            has_valid_xg = bool((doc or {}).get("has_advanced_stats") is True)
+            odds_summary = (((doc or {}).get("odds_meta") or {}).get("summary_1x2") or {})
+            has_valid_odds = self._summary_has_valid_odds(odds_summary if isinstance(odds_summary, dict) else {})
+            if "finished_without_xg" in reasons_set and has_valid_xg:
+                reasons_set.discard("finished_without_xg")
+                healed_xg += 1
+                changed = True
+            if "finished_without_odds" in reasons_set and has_valid_odds:
+                reasons_set.discard("finished_without_odds")
+                healed_odds += 1
+                changed = True
+            if not changed:
+                continue
+            recomputed = self._recompute_manual_check_fields(sorted(reasons_set))
+            await self.db.matches_v3.update_one(
+                {"_id": int(match_id)},
+                {
+                    "$set": {
+                        "manual_check_reasons": recomputed["manual_check_reasons"],
+                        "manual_check_required": recomputed["manual_check_required"],
+                        "updated_at": now,
+                    }
+                },
+            )
+            healed_total += 1
+
+        logger.info(
+            "Auto-healed manual-check flags: season=%s healed_total=%d healed_xg=%d healed_odds=%d",
+            str(season_id) if season_id is not None else "all",
+            healed_total,
+            healed_xg,
+            healed_odds,
+        )
+        return {
+            "healed_total": int(healed_total),
+            "healed_xg": int(healed_xg),
+            "healed_odds": int(healed_odds),
+        }
+
     async def _pause_if_needed(self, *, job_id: ObjectId | None) -> None:
         reserve = int(settings.SPORTMONKS_RESERVE_CREDITS)
         if self._remaining is None or self._remaining > reserve:
@@ -1005,6 +1747,7 @@ class SportmonksConnector:
             status="paused",
             rate_limit_paused=True,
             rate_limit_remaining=self._remaining,
+            rate_limit_reset_at=self._reset_at,
             phase="rate_limit_pause",
         )
         sleep_for = 30
@@ -1018,6 +1761,10 @@ class SportmonksConnector:
         if job_id is None:
             return
         payload = dict(fields)
+        if "rate_limit_remaining" not in payload and self._remaining is not None:
+            payload["rate_limit_remaining"] = self._remaining
+        if "rate_limit_reset_at" not in payload and self._reset_at is not None:
+            payload["rate_limit_reset_at"] = self._reset_at
         payload["updated_at"] = utcnow()
         await self.db.admin_import_jobs.update_one({"_id": job_id}, {"$set": payload})
 

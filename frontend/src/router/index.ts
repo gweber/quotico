@@ -88,6 +88,12 @@ const router = createRouter({
       component: () => import("@/views/SettingsView.vue"),
       meta: { requiresAuth: true },
     },
+    // Public analysis
+    {
+      path: "/analysis/:league?",
+      name: "analysis",
+      component: () => import("@/views/AnalysisView.vue"),
+    },
     // Legal
     {
       path: "/legal/:section",
@@ -101,12 +107,98 @@ const router = createRouter({
     // Admin routes
     {
       path: "/admin",
-      redirect: "/admin/ingest",
+      name: "admin-dashboard",
+      component: () => import("@/views/admin/AdminDashboardView.vue"),
+      meta: { requiresAuth: true, requiresAdmin: true },
     },
     {
       path: "/admin/ingest",
       name: "admin-ingest",
       component: () => import("@/views/admin/AdminIngestDiscoveryView.vue"),
+      meta: { requiresAuth: true, requiresAdmin: true },
+    },
+    {
+      path: "/admin/users",
+      name: "admin-users",
+      component: () => import("@/views/admin/AdminUserManager.vue"),
+      meta: { requiresAuth: true, requiresAdmin: true },
+    },
+    {
+      path: "/admin/matches",
+      name: "admin-matches",
+      component: () => import("@/views/admin/AdminMatchManager.vue"),
+      meta: { requiresAuth: true, requiresAdmin: true },
+    },
+    {
+      path: "/admin/matches/:matchId",
+      name: "admin-match-detail",
+      component: () => import("@/views/admin/AdminMatchDetailView.vue"),
+      meta: { requiresAuth: true, requiresAdmin: true },
+    },
+    {
+      path: "/admin/battles",
+      name: "admin-battles",
+      component: () => import("@/views/admin/AdminBattleManager.vue"),
+      meta: { requiresAuth: true, requiresAdmin: true },
+    },
+    {
+      path: "/admin/audit",
+      name: "admin-audit",
+      component: () => import("@/views/admin/AdminAuditLog.vue"),
+      meta: { requiresAuth: true, requiresAdmin: true },
+    },
+    {
+      path: "/admin/event-bus",
+      name: "admin-event-bus",
+      component: () => import("@/views/admin/AdminEventBusMonitor.vue"),
+      meta: { requiresAuth: true, requiresAdmin: true },
+    },
+    {
+      path: "/admin/time-machine-justice",
+      name: "admin-time-machine-justice",
+      component: () => import("@/views/admin/AdminTimeMachineJusticeView.vue"),
+      meta: { requiresAuth: true, requiresAdmin: true },
+    },
+    {
+      path: "/admin/team-tower",
+      name: "admin-team-tower",
+      component: () => import("@/views/admin/AdminTeamTowerView.vue"),
+      meta: { requiresAuth: true, requiresAdmin: true },
+    },
+    {
+      path: "/admin/qbot-lab",
+      name: "admin-qbot-lab",
+      component: () => import("@/views/admin/QbotLabView.vue"),
+      meta: { requiresAuth: true, requiresAdmin: true },
+    },
+    {
+      path: "/admin/qbot/strategies/:strategyId",
+      name: "admin-qbot-strategy-detail",
+      component: () => import("@/views/admin/AdminQbotStrategyDetailView.vue"),
+      meta: { requiresAuth: true, requiresAdmin: true },
+    },
+    {
+      path: "/admin/provider-status",
+      name: "admin-provider-status",
+      component: () => import("@/views/admin/AdminProviderStatus.vue"),
+      meta: { requiresAuth: true, requiresAdmin: true },
+    },
+    {
+      path: "/admin/leagues",
+      name: "admin-leagues",
+      component: () => import("@/views/admin/AdminLeagueTowerView.vue"),
+      meta: { requiresAuth: true, requiresAdmin: true },
+    },
+    {
+      path: "/admin/qtip-trace/:matchId",
+      name: "admin-qtip-trace",
+      component: () => import("@/views/admin/AdminQtipTraceView.vue"),
+      meta: { requiresAuth: true, requiresAdmin: true },
+    },
+    {
+      path: "/admin/data-audit",
+      name: "admin-data-audit",
+      component: () => import("@/views/admin/AdminDataAuditView.vue"),
       meta: { requiresAuth: true, requiresAdmin: true },
     },
   ],

@@ -87,6 +87,7 @@ All team name comparisons must pass through `normalize_team_name(raw: str)`:
 * **Auth:** JWT via `httpOnly` cookies.
 * **Response:** Standard JSON envelopes.
 * **Privacy:** `email` fields must never be serialized in public-facing schemas (e.g., Leaderboards, Squads). Only `/auth/me` or `/admin/*` may return emails.
+* **API-Documentation** all calls to Sportmonks have to be verified against and follow the official documentation on https://postman.sportmonks.com/
 
 ---
 

@@ -9,6 +9,7 @@
 import type {
   MatchV3,
   MatchCardVM,
+  JusticeDiff,
   OddsBadge,
   OddsButtonKey,
   OddsButtonVM,
@@ -119,13 +120,40 @@ export function computeJustice(match: MatchV3): MatchCardVM["justice"] {
   };
 }
 
+export function computeJusticeDiff(match: MatchV3): JusticeDiff {
+  if (!statusIsFinal(match.status) || !match.has_advanced_stats) {
+    return { home: null, away: null };
+  }
+  const xg = extractXg(match);
+  const oddsHome = toNumber(match.odds_meta?.summary_1x2?.home?.avg);
+  const oddsAway = toNumber(match.odds_meta?.summary_1x2?.away?.avg);
+  if (xg.home == null || xg.away == null) return { home: null, away: null };
+  const totalXg = xg.home + xg.away;
+  if (totalXg === 0) return { home: null, away: null };
+
+  const homeShare = xg.home / totalXg;
+  const awayShare = xg.away / totalXg;
+  return {
+    home:
+      oddsHome && oddsHome > 0
+        ? +((homeShare - 1 / oddsHome).toFixed(3))
+        : null,
+    away:
+      oddsAway && oddsAway > 0
+        ? +((awayShare - 1 / oddsAway).toFixed(3))
+        : null,
+  };
+}
+
 export function toMatchCardVM(match: MatchV3): MatchCardVM {
   const refereeIdRaw = toNumber(match.referee_id);
   return {
     oddsButtons: toOddsSummary(match),
     oddsBadge: toOddsBadge(match),
     justice: computeJustice(match),
+    justiceDiff: computeJusticeDiff(match),
     refereeId: refereeIdRaw == null ? undefined : Math.trunc(refereeIdRaw),
+    refereeName: typeof match.referee_name === "string" ? match.referee_name.trim() || undefined : undefined,
   };
 }
 

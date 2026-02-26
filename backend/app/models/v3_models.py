@@ -39,6 +39,10 @@ class PersonInDB(BaseModel):
 
 class TeamV3(BaseModel):
     sm_id: int
+    name: str | None = None
+    short_code: str | None = None
+    image_path: str | None = None
+    score: int | None = None
     xg: float | None = None
 
 
@@ -58,6 +62,27 @@ class PenaltyInfoV3(BaseModel):
     details: list[PenaltyDetailV3] = Field(default_factory=list)
 
 
+class MatchEventV3(BaseModel):
+    type: Literal["goal", "card", "var", "missed_penalty"]
+    minute: int | None = None
+    extra_minute: int | None = None
+    player_name: str = ""
+    player_id: int | None = None
+    team_id: int | None = None
+    detail: str = ""
+    sort_order: int | None = None
+
+
+class PeriodScoreV3(BaseModel):
+    home: int | None = None
+    away: int | None = None
+
+
+class PeriodScoresV3(BaseModel):
+    half_time: PeriodScoreV3 = Field(default_factory=PeriodScoreV3)
+    full_time: PeriodScoreV3 = Field(default_factory=PeriodScoreV3)
+
+
 class MatchTeamsV3(BaseModel):
     home: TeamV3
     away: TeamV3
@@ -72,10 +97,15 @@ class MatchV3InDB(BaseModel):
     start_at: datetime
     has_advanced_stats: bool = False
     status: Literal["FINISHED", "LIVE", "SCHEDULED", "POSTPONED", "WALKOVER"] = "SCHEDULED"
+    finish_type: str | None = None
     teams: MatchTeamsV3
+    events: list[MatchEventV3] = Field(default_factory=list)
+    scores: PeriodScoresV3 = Field(default_factory=PeriodScoresV3)
     lineups: list[LineupEntryV3] = Field(default_factory=list)
     penalty_info: PenaltyInfoV3 = Field(default_factory=PenaltyInfoV3)
     odds_meta: dict[str, Any] = Field(default_factory=dict)
+    manual_check_required: bool = False
+    manual_check_reasons: list[str] = Field(default_factory=list)
     created_at: datetime
     updated_at: datetime
 

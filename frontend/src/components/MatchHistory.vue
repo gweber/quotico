@@ -3,7 +3,7 @@
 
   Purpose:
   Renders H2H and form insights for match cards and loads additional H2H pages.
-  All team comparisons and API parameters use Team Tower IDs.
+  All team comparisons use Sportmonks sm_id (number).
 -->
 
 <script setup lang="ts">
@@ -20,7 +20,8 @@ import {
 const props = defineProps<{
   homeTeam: string;
   awayTeam: string;
-  sportKey: string;
+  homeSMId?: number;
+  awaySMId?: number;
   context?: MatchContext | null;  // Pre-loaded data from parent (Matchday path)
 }>();
 
@@ -47,12 +48,11 @@ async function loadMoreH2H() {
   if (!data.value?.h2h?.matches.length || !data.value.home_team_id) return;
   h2hLoadingMore.value = true;
   try {
-    const resp = await api.get<{ matches: HistoricalMatch[]; count: number }>(
+    const resp = await api.get<{ matches: HistoricalMatch[]; summary: unknown }>(
       "/historical/h2h",
       {
-        sport_key: props.sportKey,
-        home_team_id: data.value.home_team_id,
-        away_team_id: data.value.away_team_id,
+        home_sm_id: String(data.value.home_team_id),
+        away_sm_id: String(data.value.away_team_id),
         skip: String(data.value.h2h.matches.length),
         limit: "10",
       },
@@ -70,16 +70,16 @@ async function loadMoreH2H() {
 }
 
 // If context is embedded from the API response, use it directly.
-// Otherwise fall back to fetching (Dashboard path via bulk prefetch).
+// Otherwise fall back to fetching (Dashboard path via sm_ids).
 onMounted(() => {
   if (props.context) {
     data.value = props.context;
-  } else {
-    fetchHistory(props.homeTeam, props.awayTeam, props.sportKey);
+  } else if (props.homeSMId && props.awaySMId) {
+    fetchHistory(props.homeSMId, props.awaySMId);
   }
 });
 
-function formResult(match: HistoricalMatch, teamId: string): "W" | "D" | "L" {
+function formResult(match: HistoricalMatch, teamId: number): "W" | "D" | "L" {
   if (match.result.outcome === "X") return "D";
   const isHome = match.home_team_id === teamId;
   if (match.result.outcome === "1") return isHome ? "W" : "L";
@@ -100,7 +100,7 @@ function h2hWinnerClass(match: HistoricalMatch, side: "home" | "away"): string {
   return "text-text-secondary";
 }
 
-function formScore(matches: HistoricalMatch[], teamId: string): number {
+function formScore(matches: HistoricalMatch[], teamId: number): number {
   return matches.reduce((sum, m) => {
     const r = formResult(m, teamId);
     return sum + (r === "W" ? 3 : r === "D" ? 1 : 0);
@@ -142,6 +142,12 @@ function xgTotal(summary: H2HSummary): number {
 
 function showHistoricalXg(summary: H2HSummary): boolean {
   return hasXgAverages(summary) && xgUsed(summary) >= 3;
+}
+
+function finishTypeLabel(ft: string | null | undefined): string | null {
+  if (!ft) return null;
+  const labels: Record<string, string> = { AET: "n.V.", PEN: "i.E." };
+  return labels[ft] ?? null;
 }
 </script>
 
@@ -269,15 +275,19 @@ function showHistoricalXg(summary: H2HSummary): boolean {
                     <div class="flex-1 border-t border-dashed border-surface-3/60" />
                   </div>
 
-                  <div class="grid grid-cols-[3.5rem_1fr_3.5rem_1fr_3.5rem] items-center gap-x-1 text-xs py-0.5">
+                  <div class="grid grid-cols-[3.5rem_1fr_auto_1fr_3.5rem] items-center gap-x-1 text-xs py-0.5">
                     <span class="text-text-muted/60 tabular-nums text-left">
                       {{ formatDate(m.match_date) }}
                     </span>
                     <span class="text-right truncate" :class="h2hWinnerClass(m, 'home')">
                       {{ m.home_team }}
                     </span>
-                    <span class="font-mono text-center tabular-nums">
+                    <span class="font-mono text-center tabular-nums px-1">
                       <span class="font-bold text-text-primary">{{ m.result.home_score }}:{{ m.result.away_score }}</span>
+                      <span
+                        v-if="finishTypeLabel(m.finish_type)"
+                        class="text-[9px] text-text-muted/60 ml-0.5"
+                      >{{ finishTypeLabel(m.finish_type) }}</span>
                       <span
                         v-if="m.result.home_xg != null"
                         class="block text-[9px] font-normal text-text-muted/50 leading-tight"

@@ -21,12 +21,14 @@ async function reload() {
 
     // Prefetch historical data, QuoticoTips, and user bets for all visible matches
     if (matches.matches.length > 0) {
+      const withSmIds = matches.matches.filter(
+        (m) => m.teams?.home?.sm_id && m.teams?.away?.sm_id,
+      );
       const prefetches: Promise<void>[] = [
         prefetchMatchHistory(
-          matches.matches.map((m) => ({
-            home_team: m.home_team,
-            away_team: m.away_team,
-            sport_key: m.sport_key,
+          withSmIds.map((m) => ({
+            home_sm_id: m.teams!.home!.sm_id!,
+            away_sm_id: m.teams!.away!.sm_id!,
           })),
         ),
       ];

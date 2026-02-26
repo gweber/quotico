@@ -181,10 +181,43 @@ async def _ensure_indexes() -> None:
     await db.matchdays.create_index("updated_at")
 
     # ---- Matchday Predictions (squad-scoped) ----
-
-    await db.matchday_predictions.create_index(
-        [("user_id", 1), ("matchday_id", 1), ("squad_id", 1)], unique=True
-    )
+    # v3.1 hard-cut: matchday_id is stored as stable string (v3:sport:season:round).
+    # Rebuild unique index deterministically to avoid stale legacy index definitions.
+    duplicate_probe = await db.matchday_predictions.aggregate(
+        [
+            {
+                "$group": {
+                    "_id": {
+                        "user_id": "$user_id",
+                        "matchday_id": "$matchday_id",
+                        "squad_id": "$squad_id",
+                    },
+                    "n": {"$sum": 1},
+                }
+            },
+            {"$match": {"n": {"$gt": 1}}},
+            {"$limit": 1},
+        ]
+    ).to_list(length=1)
+    if duplicate_probe:
+        logger.warning(
+            "matchday_predictions has duplicate tuples for (user_id, matchday_id, squad_id); "
+            "unique index rebuild skipped until data is cleaned."
+        )
+    else:
+        try:
+            await db.matchday_predictions.drop_index("matchday_predictions_user_matchday_squad_unique")
+        except Exception:
+            pass
+        try:
+            await db.matchday_predictions.drop_index("user_id_1_matchday_id_1_squad_id_1")
+        except Exception:
+            pass
+        await db.matchday_predictions.create_index(
+            [("user_id", 1), ("matchday_id", 1), ("squad_id", 1)],
+            unique=True,
+            name="matchday_predictions_user_matchday_squad_unique",
+        )
     await db.matchday_predictions.create_index([("matchday_id", 1), ("status", 1)])
     await db.matchday_predictions.create_index([("status", 1), ("updated_at", 1)])
     await db.matchday_predictions.create_index(
@@ -237,8 +270,17 @@ async def _ensure_indexes() -> None:
     await db.matches_v3.create_index([("league_id", 1), ("start_at", -1)])
     await db.matches_v3.create_index([("league_id", 1), ("start_at", 1)])
     await db.matches_v3.create_index([("referee_id", 1), ("start_at", -1)])
+    await db.matches_v3.create_index([("status", 1), ("updated_at", -1)])
     await db.matches_v3.create_index([("has_advanced_stats", 1)])
     await db.matches_v3.create_index([("season_id", 1), ("has_advanced_stats", 1)])
+    await db.matches_v3.create_index(
+        [
+            ("odds_meta.summary_1x2.home.avg", 1),
+            ("odds_meta.summary_1x2.draw.avg", 1),
+            ("odds_meta.summary_1x2.away.avg", 1),
+        ],
+        name="matches_v3_odds_summary_avg",
+    )
     try:
         await db.matches_v3.create_index(
             [("season_id", 1), ("start_at", 1)],
@@ -264,7 +306,31 @@ async def _ensure_indexes() -> None:
     await db.matches_v3.create_index([("teams.away.sm_id", 1), ("start_at", -1)])
     await db.teams_v3.create_index([("updated_at", -1)])
     await db.teams_v3.create_index([("name", 1)])
+    await db.teams_v3.create_index([("aliases.normalized", 1)])
+    await db.teams_v3.create_index([("aliases.alias_key", 1)])
     await db.persons.create_index([("type", 1), ("name", 1)])
+
+    # ---- xG raw mirror (Sportmonks expected-fixtures) ----
+    await db.xg_raw.create_index([("fixture_id", 1), ("type_id", 1)])
+    await db.team_alias_resolution_events.create_index([("alias_key", 1), ("resolved_at", -1)])
+    await db.team_alias_resolution_events.create_index([("team_id", 1), ("resolved_at", -1)])
+    await db.team_alias_suggestions_v3.create_index([("status", 1), ("last_seen_at", -1)])
+    await db.team_alias_suggestions_v3.create_index(
+        [("normalized_name", 1), ("source", 1), ("sport_key", 1), ("status", 1)]
+    )
+    await db.team_alias_suggestions_v3.create_index([("confidence_score", -1), ("status", 1)])
+    await db.v3_query_cache.create_index(
+        [("expires_at", 1)],
+        expireAfterSeconds=0,
+        name="v3_query_cache_ttl",
+    )
+    await db.v3_query_cache.create_index([("kind", 1), ("updated_at", -1)], name="v3_query_cache_kind_updated")
+    await db.sportmonks_page_cache.create_index(
+        [("expires_at", 1)],
+        expireAfterSeconds=0,
+        name="sportmonks_page_cache_ttl",
+    )
+    await db.sportmonks_page_cache.create_index([("endpoint", 1)], name="sportmonks_page_cache_endpoint")
 
     # ---- Provider Runtime Settings ----
 
