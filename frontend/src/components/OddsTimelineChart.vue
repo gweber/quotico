@@ -27,18 +27,18 @@ const props = withDefaults(
 );
 
 const hasDrawOdds = computed(() =>
-  props.snapshots.some((s) => s.odds["X"] !== undefined),
+  props.snapshots.some((s) => Number.isFinite(s.draw)),
 );
 
 const chartData = computed(() => {
-  const labels = props.snapshots.map((s) => s.snapshot_at);
+  const labels = props.snapshots.map((s) => s.timestamp);
   const singlePoint = props.snapshots.length === 1;
   const ptRadius = singlePoint ? 4 : props.compact ? 0 : 2;
 
   const datasets = [
     {
       label: props.homeTeam,
-      data: props.snapshots.map((s) => s.odds["1"]),
+      data: props.snapshots.map((s) => s.home),
       borderColor: "#22c55e",
       backgroundColor: "rgba(34, 197, 94, 0.1)",
       borderWidth: props.compact ? 1.5 : 2,
@@ -51,7 +51,7 @@ const chartData = computed(() => {
       ? [
           {
             label: "Unentschieden",
-            data: props.snapshots.map((s) => s.odds["X"]),
+            data: props.snapshots.map((s) => s.draw),
             borderColor: "#f59e0b",
             backgroundColor: "rgba(245, 158, 11, 0.1)",
             borderWidth: props.compact ? 1.5 : 2,
@@ -64,7 +64,7 @@ const chartData = computed(() => {
       : []),
     {
       label: props.awayTeam,
-      data: props.snapshots.map((s) => s.odds["2"]),
+      data: props.snapshots.map((s) => s.away),
       borderColor: "#ef4444",
       backgroundColor: "rgba(239, 68, 68, 0.1)",
       borderWidth: props.compact ? 1.5 : 2,

@@ -58,7 +58,7 @@ export const usePersonsStore = defineStore("persons", () => {
     }
 
     inFlight.value = (async () => {
-      const response = await api.post<{ items: PersonItem[] }>("/persons/batch", { ids: missing });
+      const response = await api.post<{ items: PersonItem[] }>("/v3/persons/batch", { ids: missing });
       const loaded = response.items || [];
       const stamp = Date.now();
       loaded.forEach((row) => {
@@ -79,4 +79,3 @@ export const usePersonsStore = defineStore("persons", () => {
     getPersonName,
   };
 });
-

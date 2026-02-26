@@ -15,7 +15,6 @@ const mobileMenuOpen = ref(false);
 
 const navLinks = [
   { to: "/", labelKey: "nav.bets", icon: "\u26BD" },
-  { to: "/teams", labelKey: "nav.teams", icon: "\uD83C\uDFDF\uFE0F" },
   { to: "/matchday", labelKey: "nav.matchday", icon: "\uD83D\uDCCB" },
   { to: "/squads", labelKey: "nav.squads", icon: "\uD83D\uDC65" },
   { to: "/battles", labelKey: "nav.battles", icon: "\u2694\uFE0F" },

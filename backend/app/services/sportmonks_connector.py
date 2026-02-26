@@ -21,6 +21,7 @@ from datetime import timedelta
 from typing import Any
 
 from bson import ObjectId
+from pymongo import UpdateOne
 
 import app.database as _db
 from app.config import settings
@@ -192,7 +193,7 @@ class SportmonksConnector:
         rounds = (rounds_response.get("payload") or {}).get("data") or []
         total_rounds = len(rounds)
         processed_rounds = 0
-        counters = {"matches_upserted": 0, "persons_upserted": 0, "odds_synced": 0}
+        counters = {"matches_upserted": 0, "persons_upserted": 0, "teams_upserted": 0, "odds_synced": 0}
         await self._job_update(
             job_id,
             total_rounds=total_rounds,
@@ -208,6 +209,8 @@ class SportmonksConnector:
                 if round_id is None:
                     continue
                 round_name = self._norm_name((round_row or {}).get("name") or f"Round {round_id}")
+                teams_bulk_ops: list[UpdateOne] = []
+                seen_team_ids: set[int] = set()
                 await self._pause_if_needed(job_id=job_id)
                 await self._job_update(
                     job_id,
@@ -226,6 +229,12 @@ class SportmonksConnector:
                     if fixture_id is None:
                         continue
                     try:
+                        round_team_ops = self._build_team_upsert_ops_from_fixture(
+                            fixture,
+                            seen_team_ids=seen_team_ids,
+                        )
+                        if round_team_ops:
+                            teams_bulk_ops.extend(round_team_ops)
                         people_count = await self._sync_people_from_fixture(fixture)
                         await self.upsert_match_v3(fixture_id, self._map_fixture_to_match(fixture, season_id))
                         await self._pause_if_needed(job_id=job_id)
@@ -240,6 +249,9 @@ class SportmonksConnector:
                             message=str(row_exc),
                             trace=self._safe_trace(),
                         )
+                if teams_bulk_ops:
+                    await self.db.teams_v3.bulk_write(teams_bulk_ops, ordered=False)
+                    counters["teams_upserted"] += len(teams_bulk_ops)
                 processed_rounds += 1
                 percent = round((processed_rounds / total_rounds) * 100.0, 2) if total_rounds else 0.0
                 await self._job_update(
@@ -429,16 +441,30 @@ class SportmonksConnector:
                 odds_rows = (fixture or {}).get("odds") or []
                 summary, has_market_1 = self._build_1x2_summary_from_rows(odds_rows)
                 del odds_rows
-                update_fields: dict[str, Any] = {"updated_at": utcnow()}
+                now = utcnow()
+                update_fields: dict[str, Any] = {"updated_at": now}
+                push_fields: dict[str, Any] = {}
                 if summary:
                     update_fields["odds_meta.summary_1x2"] = summary
                     update_fields["odds_meta.source"] = "sportmonks_round_bulk"
-                    update_fields["odds_meta.updated_at"] = utcnow()
+                    update_fields["odds_meta.updated_at"] = now
+                    existing = await self.db.matches_v3.find_one(
+                        {"_id": int(fixture_id)},
+                        {"odds_timeline": 1},
+                    )
+                    if self._should_append_odds_timeline(existing, summary, now):
+                        push_fields["odds_timeline"] = {
+                            "$each": [self._build_timeline_entry(summary=summary, source="sportmonks_round_bulk", ts=now)],
+                            "$slice": -20,
+                        }
                 else:
                     repair_candidates.append(int(fixture_id))
+                update_doc: dict[str, Any] = {"$set": update_fields}
+                if push_fields:
+                    update_doc["$push"] = push_fields
                 await self.db.matches_v3.update_one(
                     {"_id": int(fixture_id), "season_id": int(season_id)},
-                    {"$set": update_fields},
+                    update_doc,
                 )
                 if not has_market_1:
                     repair_candidates.append(int(fixture_id))
@@ -581,18 +607,90 @@ class SportmonksConnector:
             return False
 
         now = utcnow()
+        existing = await self.db.matches_v3.find_one(
+            {"_id": int(fixture_id)},
+            {"odds_timeline": 1},
+        )
+        update_doc: dict[str, Any] = {
+            "$set": {
+                "odds_meta.summary_1x2": summary,
+                "odds_meta.source": source,
+                "odds_meta.updated_at": now,
+                "updated_at": now,
+            }
+        }
+        if self._should_append_odds_timeline(existing, summary, now):
+            update_doc["$push"] = {
+                "odds_timeline": {
+                    "$each": [self._build_timeline_entry(summary=summary, source=source, ts=now)],
+                    "$slice": -20,
+                }
+            }
         await self.db.matches_v3.update_one(
             {"_id": int(fixture_id)},
-            {
-                "$set": {
-                    "odds_meta.summary_1x2": summary,
-                    "odds_meta.source": source,
-                    "odds_meta.updated_at": now,
-                    "updated_at": now,
-                }
-            },
+            update_doc,
         )
         return True
+
+    def _build_timeline_entry(
+        self,
+        *,
+        summary: dict[str, dict[str, float | int]],
+        source: str,
+        ts,
+    ) -> dict[str, Any]:
+        return {
+            "timestamp": ts,
+            "home": float(((summary.get("home") or {}).get("avg"))),
+            "draw": float(((summary.get("draw") or {}).get("avg"))),
+            "away": float(((summary.get("away") or {}).get("avg"))),
+            "source": str(source or ""),
+        }
+
+    def _should_append_odds_timeline(
+        self,
+        existing: dict[str, Any] | None,
+        summary: dict[str, dict[str, float | int]],
+        now,
+    ) -> bool:
+        try:
+            home = float(((summary.get("home") or {}).get("avg")))
+            draw = float(((summary.get("draw") or {}).get("avg")))
+            away = float(((summary.get("away") or {}).get("avg")))
+        except (TypeError, ValueError):
+            return False
+        timeline = (existing or {}).get("odds_timeline") if isinstance(existing, dict) else None
+        if not isinstance(timeline, list) or not timeline:
+            return True
+        last = timeline[-1] if isinstance(timeline[-1], dict) else {}
+        last_ts = last.get("timestamp")
+        last_home = self._to_float(last.get("home"))
+        last_draw = self._to_float(last.get("draw"))
+        last_away = self._to_float(last.get("away"))
+        min_delta = float(settings.SPORTMONKS_ODDS_TIMELINE_MIN_DELTA)
+        time_gate = timedelta(minutes=int(settings.SPORTMONKS_ODDS_TIMELINE_MINUTES))
+        if last_ts is not None:
+            try:
+                if now - ensure_utc(last_ts) >= time_gate:
+                    return True
+            except Exception:
+                return True
+        if last_home is None or last_draw is None or last_away is None:
+            return True
+        return (
+            abs(home - last_home) >= min_delta
+            or abs(draw - last_draw) >= min_delta
+            or abs(away - last_away) >= min_delta
+        )
+
+    @staticmethod
+    def _to_float(value: Any) -> float | None:
+        try:
+            if value is None:
+                return None
+            return float(value)
+        except (TypeError, ValueError):
+            return None
 
     def _build_1x2_summary_from_rows(
         self,
@@ -849,6 +947,37 @@ class SportmonksConnector:
                 }
             )
         return out
+
+    def _build_team_upsert_ops_from_fixture(
+        self,
+        fixture: dict[str, Any],
+        *,
+        seen_team_ids: set[int],
+    ) -> list[UpdateOne]:
+        ops: list[UpdateOne] = []
+        for participant in (fixture or {}).get("participants") or []:
+            team_id = self._to_int((participant or {}).get("id"))
+            if team_id is None or team_id in seen_team_ids:
+                continue
+            seen_team_ids.add(team_id)
+            set_payload: dict[str, Any] = {"updated_at": utcnow()}
+            name = self._first_non_empty((participant or {}).get("name"))
+            if name is not None:
+                set_payload["name"] = name
+            short_code = self._first_non_empty((participant or {}).get("short_code"))
+            if short_code is not None:
+                set_payload["short_code"] = short_code
+            image_path = self._first_non_empty((participant or {}).get("image_path"))
+            if image_path is not None:
+                set_payload["image_path"] = image_path
+            ops.append(
+                UpdateOne(
+                    {"_id": int(team_id)},
+                    {"$set": set_payload, "$setOnInsert": {"created_at": utcnow()}},
+                    upsert=True,
+                )
+            )
+        return ops
 
     def _map_penalty_info(self, fixture: dict[str, Any]) -> dict[str, Any]:
         events = (fixture or {}).get("events") or []

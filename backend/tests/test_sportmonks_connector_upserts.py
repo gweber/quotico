@@ -29,14 +29,17 @@ class _FakeCollection:
         self.calls.append({"query": query, "update": update, "upsert": upsert})
         doc_id = int(query["_id"])
         existing = self.docs.get(doc_id)
+        upserted_id = None
         if existing is None and upsert:
             existing = {"_id": doc_id}
             self.docs[doc_id] = existing
+            upserted_id = doc_id
             for key, value in update.get("$setOnInsert", {}).items():
                 existing[key] = value
         if existing is not None:
             for key, value in update.get("$set", {}).items():
                 existing[key] = value
+        return type("Result", (), {"upserted_id": upserted_id})()
 
     async def find_one(self, query, _projection=None):
         doc_id = int(query["_id"])
@@ -44,11 +47,25 @@ class _FakeCollection:
         return dict(existing) if isinstance(existing, dict) else None
 
 
+class _FakeBulkCollection(_FakeCollection):
+    def __init__(self) -> None:
+        super().__init__()
+        self.bulk_calls: list[dict] = []
+
+    async def bulk_write(self, operations, ordered=False):
+        ops = list(operations or [])
+        self.bulk_calls.append({"operations": ops, "ordered": ordered})
+        for op in ops:
+            await self.update_one(op._filter, op._doc, upsert=getattr(op, "_upsert", False))
+        return type("BulkResult", (), {"bulk_api_result": {"nUpserted": len(ops)}})()
+
+
 class _FakeDB:
     def __init__(self) -> None:
         self.matches_v3 = _FakeCollection()
         self.persons = _FakeCollection()
         self.league_registry_v3 = _FakeCollection()
+        self.teams_v3 = _FakeBulkCollection()
 
 
 class _LeagueRegistryCollection(_FakeCollection):
@@ -200,3 +217,70 @@ async def test_sync_fixture_odds_summary_compacts_market_one(monkeypatch):
     assert summary["home"]["max"] == 3.4
     assert summary["draw"]["count"] == 1
     assert "away" in summary
+
+
+@pytest.mark.asyncio
+async def test_ingest_season_bulk_writes_teams_v3_once_per_round_with_dedupe(monkeypatch):
+    fake_db = _FakeDB()
+    connector = connector_module.SportmonksConnector(database=fake_db)
+
+    async def _get_season_rounds(_season_id: int):
+        return {
+            "payload": {"data": [{"id": 501, "name": "Round 1"}]},
+            "remaining": 250,
+            "reset_at": 123456,
+        }
+
+    async def _get_round_fixtures(_round_id: int):
+        return {
+            "payload": {
+                "data": [
+                    {
+                        "id": 1001,
+                        "league_id": 8,
+                        "round_id": 501,
+                        "participants": [
+                            {"id": 11, "name": "A FC", "short_code": "AFC", "image_path": "/a.png"},
+                            {"id": 22, "name": "B FC", "short_code": "BFC", "image_path": "/b.png"},
+                        ],
+                        "statistics": [],
+                        "lineups": [],
+                        "events": [],
+                    },
+                    {
+                        "id": 1002,
+                        "league_id": 8,
+                        "round_id": 501,
+                        "participants": [
+                            {"id": 11, "name": "A FC", "short_code": "AFC", "image_path": "/a.png"},
+                            {"id": 33, "name": "C FC", "short_code": "CFC", "image_path": "/c.png"},
+                        ],
+                        "statistics": [],
+                        "lineups": [],
+                        "events": [],
+                    },
+                ]
+            },
+            "remaining": 249,
+            "reset_at": 123456,
+        }
+
+    async def _sync_people(_fixture):
+        return 0
+
+    async def _sync_odds(_fixture_id):
+        return True
+
+    monkeypatch.setattr(connector_module.sportmonks_provider, "get_season_rounds", _get_season_rounds)
+    monkeypatch.setattr(connector_module.sportmonks_provider, "get_round_fixtures", _get_round_fixtures)
+    monkeypatch.setattr(connector, "_sync_people_from_fixture", _sync_people)
+    monkeypatch.setattr(connector, "sync_fixture_odds_summary", _sync_odds)
+
+    result = await connector.ingest_season(25536)
+
+    assert result["teams_upserted"] == 3
+    assert len(fake_db.teams_v3.bulk_calls) == 1
+    bulk_call = fake_db.teams_v3.bulk_calls[0]
+    assert bulk_call["ordered"] is False
+    assert len(bulk_call["operations"]) == 3
+    assert sorted(fake_db.teams_v3.docs.keys()) == [11, 22, 33]

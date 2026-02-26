@@ -2,7 +2,8 @@
 backend/tests/test_football_data_org_service.py
 
 Purpose:
-    Service tests for football-data.org season import dry-run alias suggestions.
+    Service tests for football-data.org season import result mapping via the
+    unified match ingest pipeline.
 """
 
 from types import SimpleNamespace
@@ -26,28 +27,9 @@ class _FakeLeagues:
         return None
 
 
-class _FakeTeams:
-    def __init__(self, docs):
-        self.docs = docs
-
-    async def find_one(self, query, projection=None):
-        for doc in self.docs:
-            if query.get("external_ids.football_data") and doc.get("external_ids", {}).get("football_data") == query.get("external_ids.football_data"):
-                if projection:
-                    return {k: v for k, v in doc.items() if k in projection or k == "_id"}
-                return dict(doc)
-        return None
-
-
-class _FakeMatches:
-    async def find_one(self, *_args, **_kwargs):
-        return None
-
-
 @pytest.mark.asyncio
-async def test_football_data_dry_run_generates_alias_suggestions(monkeypatch):
+async def test_football_data_dry_run_maps_ingest_counters(monkeypatch):
     league_id = ObjectId()
-    team_id = ObjectId()
     fake_db = SimpleNamespace(
         leagues=_FakeLeagues(
             {
@@ -57,17 +39,6 @@ async def test_football_data_dry_run_generates_alias_suggestions(monkeypatch):
                 "is_active": True,
             }
         ),
-        teams=_FakeTeams(
-            [
-                {
-                    "_id": team_id,
-                    "display_name": "Arsenal",
-                    "sport_key": "soccer_epl",
-                    "external_ids": {"football_data": "57"},
-                }
-            ]
-        ),
-        matches=_FakeMatches(),
     )
     monkeypatch.setattr(service._db, "db", fake_db, raising=False)
 
@@ -75,36 +46,31 @@ async def test_football_data_dry_run_generates_alias_suggestions(monkeypatch):
         async def ensure_for_import(self, *_args, **_kwargs):
             return {"is_active": True}
 
-    class _FakeTeamRegistry:
-        async def resolve_by_external_id_or_name(self, **kwargs):
-            if kwargs.get("external_id") == "57":
-                return None
-            return ObjectId()
-
-    class _FakeProvider:
-        async def get_season_matches(self, *_args, **_kwargs):
-            return [
-                {
-                    "match_id": "200",
-                    "utc_date": "2025-08-10T14:00:00Z",
-                    "status_raw": "SCHEDULED",
-                    "matchday": 1,
-                    "season": 2025,
-                    "stage": "REGULAR_SEASON",
-                    "group": None,
-                    "home_team_id": "57",
-                    "home_team_name": "Arsenal FC",
-                    "away_team_id": "61",
-                    "away_team_name": "Chelsea FC",
-                    "score": {"full_time": {"home": None, "away": None}},
-                }
-            ]
-
     monkeypatch.setattr(service.LeagueRegistry, "get", staticmethod(lambda: _FakeLeagueRegistry()))
-    monkeypatch.setattr(service.TeamRegistry, "get", staticmethod(lambda: _FakeTeamRegistry()))
-    monkeypatch.setattr(service, "football_data_provider", _FakeProvider())
-    result = await service.import_season(league_id, 2025, dry_run=True)
-    assert result["skipped_conflicts"] == 1
-    assert len(result.get("alias_suggestions", [])) == 1
-    assert result["alias_suggestions"][0]["provider"] == "football_data"
+    async def _build_matches(**_kwargs):
+        return ([{"external_id": "fd_org:200"}], 0)
+    monkeypatch.setattr(service, "build_football_data_org_matches", _build_matches)
+    async def _process_matches(_transformed, league_id=None, dry_run=False):
+        _ = league_id, dry_run
+        return {
+            "processed": 1,
+            "created": 0,
+            "updated": 0,
+            "conflicts": 1,
+            "unresolved_team": 1,
+            "team_name_conflict": 0,
+            "conflicts_preview": [{"reason": "team_name_conflict"}],
+            "items_preview": [{"external_id": "fd_org:200"}],
+            "matched_by_external_id": 0,
+            "matched_by_identity_window": 0,
+            "other_conflicts": 1,
+        }
+    monkeypatch.setattr(service.match_ingest_service, "process_matches", _process_matches)
 
+    result = await service.import_season(league_id, 2025, dry_run=True)
+    assert result["processed"] == 1
+    assert result["matched"] == 0
+    assert result["skipped_conflicts"] == 1
+    assert result["unresolved_teams"] == 1
+    assert result["dry_run_preview"]["matches_found"] == 1
+    assert result["dry_run_preview"]["would_create"] == 0

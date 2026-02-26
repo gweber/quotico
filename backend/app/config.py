@@ -69,6 +69,12 @@ class Settings(BaseSettings):
     SPORTMONKS_DISCOVERY_TTL_MINUTES: int = 30
     SPORTMONKS_STALE_JOB_MINUTES: int = 5
     SPORTMONKS_STARTUP_DISCOVERY_ENABLED: bool = True
+    SPORTMONKS_ODDS_TIMELINE_MIN_DELTA: float = 0.02
+    SPORTMONKS_ODDS_TIMELINE_MINUTES: int = 60
+
+    # V3 query transport
+    V3_QUERY_CACHE_TTL_SECONDS: int = 120
+    V3_QUERY_MAX_IDS: int = 500
 
     # Q-Bot: minimum QuoticoTip confidence to auto-bet
     QBOT_MIN_CONFIDENCE: float = 0.55

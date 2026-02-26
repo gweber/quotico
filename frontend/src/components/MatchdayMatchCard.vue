@@ -1,13 +1,11 @@
 <script setup lang="ts">
 import { computed, onMounted, watch } from "vue";
 import { useI18n } from "vue-i18n";
-import { RouterLink } from "vue-router";
 import type { MatchdayMatch } from "@/stores/matchday";
 import { useMatchdayStore } from "@/stores/matchday";
 import MatchHistory from "./MatchHistory.vue";
 import QuoticoTipBadge from "./QuoticoTipBadge.vue";
 import { getCachedTip } from "@/composables/useQuoticoTip";
-import { teamSlug } from "@/composables/useTeam";
 import { toMatchCardVM, toOddsSummary, toOddsBadge } from "@/composables/useMatchV3Adapter";
 import type { MatchV3 } from "@/types/MatchV3";
 import { usePersonsStore } from "@/stores/persons";
@@ -184,9 +182,8 @@ function updateAway(e: Event) {
     <div class="flex items-center gap-3">
       <!-- Home team -->
         <div class="flex-1 text-right">
-          <RouterLink
-            :to="{ name: 'team-detail', params: { teamSlug: teamSlug(match.home_team) }, query: sportKey ? { sport: sportKey } : {} }"
-            class="text-sm font-medium truncate block hover:text-primary transition-colors"
+          <span
+            class="text-sm font-medium truncate block"
             :class="[
               vm.justice.home === 'unlucky' ? 'text-rose-400' : '',
               vm.justice.home === 'overperformed' ? 'text-emerald-400' : '',
@@ -194,7 +191,7 @@ function updateAway(e: Event) {
             ]"
           >
             {{ match.home_team }}
-          </RouterLink>
+          </span>
         </div>
 
       <!-- Score inputs or result -->
@@ -245,9 +242,8 @@ function updateAway(e: Event) {
 
       <!-- Away team -->
         <div class="flex-1">
-          <RouterLink
-            :to="{ name: 'team-detail', params: { teamSlug: teamSlug(match.away_team) }, query: sportKey ? { sport: sportKey } : {} }"
-            class="text-sm font-medium truncate block hover:text-primary transition-colors"
+          <span
+            class="text-sm font-medium truncate block"
             :class="[
               vm.justice.away === 'unlucky' ? 'text-rose-400' : '',
               vm.justice.away === 'overperformed' ? 'text-emerald-400' : '',
@@ -255,7 +251,7 @@ function updateAway(e: Event) {
             ]"
           >
             {{ match.away_team }}
-          </RouterLink>
+          </span>
         </div>
     </div>
 

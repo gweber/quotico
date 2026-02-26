@@ -671,45 +671,14 @@ class AutomationToggleRequest(BaseModel):
 async def trigger_sync(
     body: TriggerSyncRequest, request: Request, admin=Depends(get_admin_user),
 ):
-    """Manually trigger a background worker."""
-    if body.worker_id not in _TRIGGERABLE_WORKERS:
-        raise HTTPException(status_code=400, detail=f"Worker '{body.worker_id}' cannot be triggered manually.")
-
-    # Lazy-import the worker function
-    worker_fn = _get_worker_fn(body.worker_id)
-    if not worker_fn:
-        raise HTTPException(status_code=400, detail=f"Unknown worker: {body.worker_id}")
-
-    admin_id = str(admin["_id"])
-    logger.info("Admin %s triggered manual sync: %s", admin_id, body.worker_id)
-
-    t0 = _time.monotonic()
-    try:
-        await worker_fn()
-    except Exception as e:
-        logger.error("Manual sync %s failed: %s", body.worker_id, e, exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Sync failed for {body.worker_id}. Check server logs.")
-    duration_ms = int((_time.monotonic() - t0) * 1000)
-
-    await log_audit(
-        actor_id=admin_id, target_id=body.worker_id, action="MANUAL_SYNC",
-        metadata={"duration_ms": duration_ms}, request=request,
-    )
-
-    label = _WORKER_REGISTRY[body.worker_id]["label"]
-    return {"message": f"{label} completed", "duration_ms": duration_ms}
+    _ = body, request, admin
+    raise HTTPException(status_code=410, detail="Legacy endpoint disabled in v3.1")
 
 
 @router.get("/workers/automation")
 async def get_automation_state(admin=Depends(get_admin_user)):
-    """Return automatic worker scheduler state."""
-    from app.main import automation_enabled, automated_job_count, scheduler
-
-    return {
-        "enabled": automation_enabled(),
-        "scheduled_jobs": automated_job_count(),
-        "scheduler_running": bool(scheduler.running),
-    }
+    _ = admin
+    raise HTTPException(status_code=410, detail="Legacy endpoint disabled in v3.1")
 
 
 @router.post("/workers/automation")
@@ -718,28 +687,8 @@ async def set_automation_state(
     request: Request,
     admin=Depends(get_admin_user),
 ):
-    """Enable/disable automatic worker jobs at runtime."""
-    from app.main import set_automation_enabled
-
-    result = await set_automation_enabled(
-        body.enabled,
-        run_initial_sync=body.run_initial_sync and body.enabled,
-        persist=True,
-    )
-    await log_audit(
-        actor_id=str(admin["_id"]),
-        target_id="worker_automation",
-        action="WORKER_AUTOMATION_TOGGLE",
-        metadata={
-            "enabled": result["enabled"],
-            "changed": result["changed"],
-            "added_jobs": result["added_jobs"],
-            "removed_jobs": result["removed_jobs"],
-            "run_initial_sync": bool(body.run_initial_sync and body.enabled),
-        },
-        request=request,
-    )
-    return result
+    _ = body, request, admin
+    raise HTTPException(status_code=410, detail="Legacy endpoint disabled in v3.1")
 
 
 def _get_worker_fn(worker_id: str):
@@ -1227,25 +1176,8 @@ async def trigger_matches_sync(
     request: Request,
     admin=Depends(get_admin_user),
 ):
-    league_oid = _parse_object_id(body.league_id, "league_id")
-    league = await _db.db.leagues.find_one({"_id": league_oid}, {"sport_key": 1})
-    if not league:
-        raise HTTPException(status_code=404, detail="League not found.")
-
-    sport_key = str(league.get("sport_key") or "").strip()
-    if not sport_key:
-        raise HTTPException(status_code=400, detail="League has no sport_key.")
-
-    background_tasks.add_task(_run_matches_sync_for_league, sport_key)
-    _admin_matches_cache_invalidate()
-    await log_audit(
-        actor_id=str(admin["_id"]),
-        target_id=body.league_id,
-        action="MATCH_SYNC_TRIGGER",
-        metadata={"sport_key": sport_key},
-        request=request,
-    )
-    return {"message": "Match sync queued.", "sport_key": sport_key}
+    _ = body, background_tasks, request, admin
+    raise HTTPException(status_code=410, detail="Legacy endpoint disabled in v3.1")
 
 
 @router.post("/matches/{match_id}/override")
@@ -2138,15 +2070,8 @@ async def list_leagues_admin(admin=Depends(get_admin_user)):
 
 @router.post("/leagues/seed")
 async def seed_leagues_admin(request: Request, admin=Depends(get_admin_user)):
-    result = await seed_core_leagues()
-    await log_audit(
-        actor_id=str(admin["_id"]),
-        target_id="leagues",
-        action="LEAGUES_SEEDED",
-        metadata=result,
-        request=request,
-    )
-    return result
+    _ = request, admin
+    raise HTTPException(status_code=410, detail="Legacy endpoint disabled in v3.1")
 
 
 @router.put("/leagues/order")
@@ -2352,31 +2277,8 @@ async def trigger_league_sync_admin(
     body: LeagueSyncRequest | None = None,
     admin=Depends(get_admin_user),
 ):
-    league_oid = _parse_object_id(league_id, "league_id")
-    league = await _db.db.leagues.find_one({"_id": league_oid})
-    if not league:
-        raise HTTPException(status_code=404, detail="League not found.")
-
-    sport_key = str(league.get("sport_key") or "").strip()
-    if not sport_key:
-        raise HTTPException(status_code=400, detail="League has no sport_key.")
-
-    season = int(body.season) if body and body.season is not None else None
-    full_season = bool(body.full_season) if body else False
-    background_tasks.add_task(_run_single_league_sync, sport_key, season, full_season)
-    await log_audit(
-        actor_id=str(admin["_id"]),
-        target_id=league_id,
-        action="LEAGUE_SYNC_TRIGGER",
-        metadata={"sport_key": sport_key, "season": season, "full_season": full_season},
-        request=request,
-    )
-    return {
-        "message": "League sync queued.",
-        "sport_key": sport_key,
-        "season": season,
-        "full_season": full_season,
-    }
+    _ = league_id, background_tasks, request, body, admin
+    raise HTTPException(status_code=410, detail="Legacy endpoint disabled in v3.1")
 
 
 @router.post("/leagues/{league_id}/import-football-data")
@@ -2386,74 +2288,8 @@ async def trigger_league_football_data_import_admin(
     request: Request,
     admin=Depends(get_admin_user),
 ):
-    """Run football-data.co.uk import for one league/season with optional dry-run preview."""
-    admin_id = str(admin["_id"])
-    league_oid = _parse_object_id(league_id, "league_id")
-    league = await _db.db.leagues.find_one({"_id": league_oid}, {"_id": 1, "football_data_last_import_at": 1})
-    if not league:
-        raise HTTPException(status_code=404, detail="League not found.")
-
-    await _check_football_data_import_rate_limit(admin_id, league_id)
-
-    t0 = _time.monotonic()
-    result = await import_football_data_stats(
-        league_id=league_oid,
-        season=body.season,
-        dry_run=body.dry_run,
-    )
-    duration_ms = int((_time.monotonic() - t0) * 1000)
-
-    if not body.dry_run:
-        now = utcnow()
-        await _db.db.leagues.update_one(
-            {"_id": league_oid},
-            {
-                "$set": {
-                    "football_data_last_import_at": now,
-                    "football_data_last_import_season": result.get("season"),
-                    "football_data_last_import_by": admin_id,
-                    "football_data_last_import_summary": {
-                        "matched": int(result.get("matched", 0)),
-                        "updated": int(result.get("updated", 0)),
-                        "odds_snapshots_total": int(result.get("odds_snapshots_total", 0)),
-                    },
-                    "updated_at": now,
-                }
-            },
-        )
-
-    response = {
-        "success": True,
-        "league_id": league_id,
-        "season": result.get("season"),
-        "dry_run": body.dry_run,
-        "rate_limit_window_seconds": FOOTBALL_DATA_IMPORT_RATE_LIMIT_SECONDS,
-        "last_import_at": (
-            ensure_utc(league.get("football_data_last_import_at")).isoformat()
-            if league.get("football_data_last_import_at")
-            else None
-        ),
-        "results": result,
-    }
-
-    await log_audit(
-        actor_id=admin_id,
-        target_id=league_id,
-        action="LEAGUE_FOOTBALL_DATA_IMPORT",
-        metadata={
-            "season": body.season,
-            "dry_run": body.dry_run,
-            "duration_ms": duration_ms,
-            "result": {
-                "processed": result.get("processed", 0),
-                "matched": result.get("matched", 0),
-                "updated": result.get("updated", 0),
-                "odds_snapshots_total": result.get("odds_snapshots_total", 0),
-            },
-        },
-        request=request,
-    )
-    return response
+    _ = league_id, body, request, admin
+    raise HTTPException(status_code=410, detail="Legacy endpoint disabled in v3.1")
 
 
 @router.post("/leagues/{league_id}/import-football-data/async")
@@ -2464,67 +2300,8 @@ async def trigger_league_football_data_import_async_admin(
     request: Request,
     admin=Depends(get_admin_user),
 ):
-    """Queue football-data import as async admin job and return a job id."""
-    admin_id = str(admin["_id"])
-    league_oid = _parse_object_id(league_id, "league_id")
-    league = await _db.db.leagues.find_one({"_id": league_oid}, {"_id": 1})
-    if not league:
-        raise HTTPException(status_code=404, detail="League not found.")
-
-    await _check_football_data_import_rate_limit(admin_id, league_id)
-    now = utcnow()
-    job_doc = {
-        "type": "football_data_import",
-        "league_id": league_oid,
-        "admin_id": admin_id,
-        "season": body.season,
-        "dry_run": body.dry_run,
-        "status": "queued",
-        "phase": "queued",
-        "progress": {"processed": 0, "total": 0, "percent": 0.0},
-        "counters": {
-            "matched": 0,
-            "existing_matches": 0,
-            "new_matches": 0,
-            "updated": 0,
-            "odds_snapshots_total": 0,
-            "odds_ingest_inserted": 0,
-            "odds_ingest_deduplicated": 0,
-            "odds_ingest_markets_updated": 0,
-            "odds_ingest_errors": 0,
-        },
-        "results": None,
-        "error": None,
-        "created_at": now,
-        "started_at": None,
-        "updated_at": now,
-        "finished_at": None,
-    }
-    insert_result = await _db.db.admin_import_jobs.insert_one(job_doc)
-    job_id = insert_result.inserted_id
-    background_tasks.add_task(
-        _run_football_data_import_job,
-        job_id,
-        league_oid,
-        body.season,
-        body.dry_run,
-        admin_id,
-    )
-    await log_audit(
-        actor_id=admin_id,
-        target_id=league_id,
-        action="LEAGUE_FOOTBALL_DATA_IMPORT_ASYNC",
-        metadata={"job_id": str(job_id), "season": body.season, "dry_run": body.dry_run},
-        request=request,
-    )
-    return {
-        "accepted": True,
-        "job_id": str(job_id),
-        "league_id": league_id,
-        "season": body.season,
-        "dry_run": body.dry_run,
-        "status": "queued",
-    }
+    _ = league_id, body, background_tasks, request, admin
+    raise HTTPException(status_code=410, detail="Legacy endpoint disabled in v3.1")
 
 
 @router.post("/leagues/{league_id}/match-ingest/async")
@@ -2535,86 +2312,8 @@ async def trigger_unified_match_ingest_async_admin(
     request: Request,
     admin=Depends(get_admin_user),
 ):
-    """Queue unified match ingest from one provider source."""
-    admin_id = str(admin["_id"])
-    league_oid = _parse_object_id(league_id, "league_id")
-    league = await _db.db.leagues.find_one({"_id": league_oid}, {"_id": 1})
-    if not league:
-        raise HTTPException(status_code=404, detail="League not found.")
-
-    source = str(body.source or "").strip().lower()
-    if source not in {"football_data_uk", "football_data", "openligadb", "theoddsapi"}:
-        raise HTTPException(status_code=400, detail="Unsupported source.")
-    if source == "theoddsapi":
-        raise HTTPException(status_code=400, detail="theoddsapi unified match ingest is not available yet.")
-    if source in {"football_data", "openligadb"} and body.season is None:
-        raise HTTPException(status_code=400, detail="season is required for this source.")
-
-    await _check_admin_import_rate_limit(f"match_ingest_{source}", admin_id, league_id)
-    now = utcnow()
-    job_doc = {
-        "type": "match_ingest_unified",
-        "source": source,
-        "league_id": league_oid,
-        "admin_id": admin_id,
-        "season": body.season,
-        "dry_run": bool(body.dry_run),
-        "status": "queued",
-        "phase": "queued",
-        "progress": {"processed": 0, "total": 0, "percent": 0.0},
-        "counters": {
-            "processed": 0,
-            "created": 0,
-            "updated": 0,
-            "matched": 0,
-            "skipped": 0,
-            "conflicts": 0,
-            "matched_by_external_id": 0,
-            "matched_by_identity_window": 0,
-            "unresolved_league": 0,
-            "unresolved_team": 0,
-            "team_name_conflict": 0,
-            "other_conflicts": 0,
-        },
-        "results": None,
-        "error": None,
-        "created_at": now,
-        "started_at": None,
-        "updated_at": now,
-        "finished_at": None,
-    }
-    insert_result = await _db.db.admin_import_jobs.insert_one(job_doc)
-    job_id = insert_result.inserted_id
-    background_tasks.add_task(
-        _run_unified_match_ingest_job,
-        job_id,
-        league_oid,
-        source,
-        body.season,
-        bool(body.dry_run),
-        admin_id,
-    )
-    await log_audit(
-        actor_id=admin_id,
-        target_id=league_id,
-        action="LEAGUE_MATCH_INGEST_UNIFIED_ASYNC",
-        metadata={
-            "job_id": str(job_id),
-            "source": source,
-            "season": body.season,
-            "dry_run": bool(body.dry_run),
-        },
-        request=request,
-    )
-    return {
-        "accepted": True,
-        "job_id": str(job_id),
-        "league_id": league_id,
-        "source": source,
-        "season": body.season,
-        "dry_run": bool(body.dry_run),
-        "status": "queued",
-    }
+    _ = league_id, body, background_tasks, request, admin
+    raise HTTPException(status_code=410, detail="Legacy endpoint disabled in v3.1")
 
 
 @router.post("/enrich-xg/async")
@@ -2624,84 +2323,14 @@ async def trigger_xg_enrichment_async_admin(
     request: Request,
     admin=Depends(get_admin_user),
 ):
-    """Queue xG enrichment (Understat) as async admin job."""
-    admin_id = str(admin["_id"])
-    rate_scope = str(body.sport_key or "__all__")
-    await _check_admin_import_rate_limit("xg_enrichment", admin_id, rate_scope)
-
-    now = utcnow()
-    job_doc = {
-        "type": "xg_enrichment",
-        "source": "understat",
-        "admin_id": admin_id,
-        "sport_key": body.sport_key,
-        "season": body.season,
-        "dry_run": bool(body.dry_run),
-        "force": bool(body.force),
-        "status": "queued",
-        "phase": "queued",
-        "progress": {"processed": 0, "total": 0, "percent": 0.0},
-        "counters": {
-            "total": 0,
-            "matched": 0,
-            "unmatched": 0,
-            "skipped": 0,
-            "already_enriched": 0,
-            "leagues_processed": 0,
-            "seasons_processed": 0,
-            "runs_total": 0,
-            "runs_completed": 0,
-        },
-        "results": None,
-        "error": None,
-        "created_at": now,
-        "started_at": None,
-        "updated_at": now,
-        "finished_at": None,
-    }
-    insert_result = await _db.db.admin_import_jobs.insert_one(job_doc)
-    job_id = insert_result.inserted_id
-    background_tasks.add_task(
-        _run_xg_enrichment_job,
-        job_id,
-        body.sport_key,
-        body.season,
-        bool(body.dry_run),
-        bool(body.force),
-        admin_id,
-    )
-    await log_audit(
-        actor_id=admin_id,
-        target_id="xg_enrichment",
-        action="XG_ENRICHMENT_ASYNC",
-        metadata={
-            "job_id": str(job_id),
-            "sport_key": body.sport_key,
-            "season": body.season,
-            "dry_run": bool(body.dry_run),
-            "force": bool(body.force),
-        },
-        request=request,
-    )
-    return {
-        "accepted": True,
-        "job_id": str(job_id),
-        "source": "understat",
-        "sport_key": body.sport_key,
-        "season": body.season,
-        "dry_run": bool(body.dry_run),
-        "force": bool(body.force),
-        "status": "queued",
-    }
+    _ = body, background_tasks, request, admin
+    raise HTTPException(status_code=410, detail="Legacy endpoint disabled in v3.1")
 
 
 @router.get("/leagues/import-jobs/{job_id}")
 async def get_league_import_job_status_admin(job_id: str, admin=Depends(get_admin_user)):
-    oid = _parse_object_id(job_id, "job_id")
-    doc = await _db.db.admin_import_jobs.find_one({"_id": oid})
-    if not doc:
-        raise HTTPException(status_code=404, detail="Import job not found.")
-    return _serialize_import_job(doc)
+    _ = job_id, admin
+    raise HTTPException(status_code=410, detail="Legacy endpoint disabled in v3.1")
 
 
 @router.post("/leagues/{league_id}/import-stats")
@@ -2711,14 +2340,8 @@ async def trigger_league_stats_import_admin(
     body: LeagueStatsImportBody = LeagueStatsImportBody(),
     admin=Depends(get_admin_user),
 ):
-    """Deprecated alias for football-data import without dry-run."""
-    data = FootballDataImportRequest(season=body.season, dry_run=False)
-    return await trigger_league_football_data_import_admin(
-        league_id=league_id,
-        body=data,
-        request=request,
-        admin=admin,
-    )
+    _ = league_id, request, body, admin
+    raise HTTPException(status_code=410, detail="Legacy endpoint disabled in v3.1")
 
 
 def _team_to_dict(doc: dict) -> dict:

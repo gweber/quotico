@@ -61,6 +61,7 @@ async def test_get_round_fixtures_uses_plural_referees_and_flattens_payload(monk
 
     include = fake_client.calls[0]["params"]["include"]
     include_tokens = set(str(include).split(";"))
+    assert "fixtures.participants" in include_tokens
     assert "fixtures.referees" in include_tokens
     assert "fixtures.referees.referee" in include_tokens
     assert "fixtures.referee" not in include_tokens

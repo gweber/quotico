@@ -100,6 +100,37 @@ export const useBetSlipStore = defineStore("betslip", () => {
 
   const itemCount = computed(() => items.value.length);
 
+  function toMatchCompat(row: any): Match {
+    if (row && typeof row.home_team === "string" && typeof row.away_team === "string") {
+      return row as Match;
+    }
+    const homeId = Number(row?.teams?.home?.sm_id || 0);
+    const awayId = Number(row?.teams?.away?.sm_id || 0);
+    const summary = row?.odds_meta?.summary_1x2 || {};
+    const h2h: Record<string, number> = {};
+    const homeAvg = Number(summary?.home?.avg);
+    const drawAvg = Number(summary?.draw?.avg);
+    const awayAvg = Number(summary?.away?.avg);
+    if (Number.isFinite(homeAvg)) h2h["1"] = homeAvg;
+    if (Number.isFinite(drawAvg)) h2h["X"] = drawAvg;
+    if (Number.isFinite(awayAvg)) h2h["2"] = awayAvg;
+    return {
+      id: String(row?._id ?? row?.id ?? ""),
+      sport_key: "football",
+      home_team: `Team ${homeId || "?"}`,
+      away_team: `Team ${awayId || "?"}`,
+      match_date: String(row?.start_at || ""),
+      start_at: String(row?.start_at || ""),
+      status: String(row?.status || "SCHEDULED").toLowerCase(),
+      odds: { h2h, updated_at: row?.odds_meta?.updated_at || null },
+      result: { home_score: null, away_score: null, outcome: null },
+      odds_meta: row?.odds_meta,
+      has_advanced_stats: Boolean(row?.has_advanced_stats),
+      referee_id: row?.referee_id ?? null,
+      teams: row?.teams,
+    } as Match;
+  }
+
   // ---- Server draft helpers ----
 
   async function ensureDraft(): Promise<string> {
@@ -304,7 +335,8 @@ export const useBetSlipStore = defineStore("betslip", () => {
     // Pre-submit: fetch fresh match data and check for odds drift
     const oddsChanges: OddsChange[] = [];
     try {
-      const freshMatches = await api.get<Match[]>("/matches/", { status: "scheduled" });
+      const query = await api.post<{ items: Match[] }>("/v3/matches/query", { statuses: ["SCHEDULED"], limit: 200 });
+      const freshMatches = (query.items || []).map(toMatchCompat);
       const freshMap = new Map(freshMatches.map((m) => [m.id, m]));
 
       for (const item of validItems.value) {
@@ -419,7 +451,11 @@ export const useBetSlipStore = defineStore("betslip", () => {
       if (draft.selections.length > 0 && items.value.length === 0) {
         const matchIds = draft.selections.map((s) => s.match_id);
         try {
-          const matches = await api.get<Match[]>("/matches/", { ids: matchIds.join(",") });
+          const response = await api.post<{ items: Match[] }>("/v3/matches/query", {
+            ids: matchIds.map((id) => Number(id)).filter((id) => Number.isFinite(id)),
+            limit: 200,
+          });
+          const matches = (response.items || []).map(toMatchCompat);
           const matchMap = new Map(matches.map((m) => [m.id, m]));
 
           items.value = draft.selections.map((sel) => {

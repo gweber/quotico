@@ -85,73 +85,26 @@ class _FakeImportJobsCollection:
 
 
 @pytest.mark.asyncio
-async def test_admin_import_endpoint_success_and_rate_limit(monkeypatch):
-    league_id = ObjectId()
-    fake_db = SimpleNamespace(
-        leagues=_FakeLeaguesCollection({"_id": league_id}),
-        meta=_FakeMetaCollection(),
-        admin_import_jobs=_FakeImportJobsCollection(),
-    )
-    monkeypatch.setattr(admin_router._db, "db", fake_db, raising=False)
-
-    async def _fake_import(*_args, **kwargs):
-        return {
-            "processed": 1,
-            "matched": 1,
-            "updated": 1,
-            "season": kwargs.get("season") or "2425",
-            "division": "E0",
-            "odds_snapshots_total": 3,
-            "odds_providers_seen": 1,
-            "odds_ingest_inserted": 3,
-            "odds_ingest_deduplicated": 0,
-            "odds_ingest_markets_updated": 3,
-            "odds_ingest_errors": 0,
-        }
-
-    async def _noop_audit(**_kwargs):
-        return None
-
-    monkeypatch.setattr(admin_router, "import_football_data_stats", _fake_import)
-    monkeypatch.setattr(admin_router, "log_audit", _noop_audit)
-
+async def test_admin_import_endpoint_is_disabled(monkeypatch):
+    _ = monkeypatch
     request = SimpleNamespace(client=SimpleNamespace(host="127.0.0.1"), headers={})
     admin = {"_id": ObjectId()}
-
     body = admin_router.FootballDataImportRequest(season="2425", dry_run=False)
-    response = await admin_router.trigger_league_football_data_import_admin(
-        league_id=str(league_id),
-        body=body,
-        request=request,
-        admin=admin,
-    )
 
-    assert response["success"] is True
-    assert response["league_id"] == str(league_id)
-    assert response["dry_run"] is False
-    assert response["results"]["updated"] == 1
-
-    # Immediate second call should be rate-limited.
     with pytest.raises(HTTPException) as exc:
         await admin_router.trigger_league_football_data_import_admin(
-            league_id=str(league_id),
+            league_id=str(ObjectId()),
             body=body,
             request=request,
             admin=admin,
         )
-    assert exc.value.status_code == 429
-    assert exc.value.detail["error"] == "rate_limited"
+    assert exc.value.status_code == 410
+    assert "Legacy endpoint disabled in v3.1" in str(exc.value.detail)
 
 
 @pytest.mark.asyncio
 async def test_admin_import_endpoint_invalid_league_id(monkeypatch):
-    fake_db = SimpleNamespace(
-        leagues=_FakeLeaguesCollection({"_id": ObjectId()}),
-        meta=_FakeMetaCollection(),
-        admin_import_jobs=_FakeImportJobsCollection(),
-    )
-    monkeypatch.setattr(admin_router._db, "db", fake_db, raising=False)
-
+    _ = monkeypatch
     request = SimpleNamespace(client=SimpleNamespace(host="127.0.0.1"), headers={})
     admin = {"_id": ObjectId()}
     body = admin_router.FootballDataImportRequest(season="2425", dry_run=True)
@@ -164,41 +117,28 @@ async def test_admin_import_endpoint_invalid_league_id(monkeypatch):
             admin=admin,
         )
 
-    assert exc.value.status_code == 400
+    assert exc.value.status_code == 410
 
 
 @pytest.mark.asyncio
 async def test_admin_async_import_start_and_status(monkeypatch):
-    league_id = ObjectId()
-    jobs = _FakeImportJobsCollection()
-    fake_db = SimpleNamespace(
-        leagues=_FakeLeaguesCollection({"_id": league_id}),
-        meta=_FakeMetaCollection(),
-        admin_import_jobs=jobs,
-    )
-    monkeypatch.setattr(admin_router._db, "db", fake_db, raising=False)
-
-    async def _noop_audit(**_kwargs):
-        return None
-
-    monkeypatch.setattr(admin_router, "log_audit", _noop_audit)
+    _ = monkeypatch
     request = SimpleNamespace(client=SimpleNamespace(host="127.0.0.1"), headers={})
     admin = {"_id": ObjectId()}
     body = admin_router.FootballDataImportRequest(season="2526", dry_run=True)
     from fastapi import BackgroundTasks
     background = BackgroundTasks()
 
-    start = await admin_router.trigger_league_football_data_import_async_admin(
-        league_id=str(league_id),
-        body=body,
-        background_tasks=background,
-        request=request,
-        admin=admin,
-    )
-    assert start["accepted"] is True
-    assert start["status"] == "queued"
-    assert start["job_id"]
+    with pytest.raises(HTTPException) as exc:
+        await admin_router.trigger_league_football_data_import_async_admin(
+            league_id=str(ObjectId()),
+            body=body,
+            background_tasks=background,
+            request=request,
+            admin=admin,
+        )
+    assert exc.value.status_code == 410
 
-    status = await admin_router.get_league_import_job_status_admin(start["job_id"], admin=admin)
-    assert status["status"] == "queued"
-    assert status["phase"] == "queued"
+    with pytest.raises(HTTPException) as status_exc:
+        await admin_router.get_league_import_job_status_admin(str(ObjectId()), admin=admin)
+    assert status_exc.value.status_code == 410

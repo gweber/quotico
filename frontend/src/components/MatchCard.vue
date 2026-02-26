@@ -5,14 +5,12 @@ import type { Match } from "@/stores/matches";
 import { useMatchesStore } from "@/stores/matches";
 import { useAuthStore } from "@/stores/auth";
 import { useBetSlipStore } from "@/stores/betslip";
-import { RouterLink } from "vue-router";
 import OddsButton from "./OddsButton.vue";
 import MatchHistory from "./MatchHistory.vue";
 import OddsTimelineToggle from "./OddsTimelineToggle.vue";
 import QuoticoTipBadge from "./QuoticoTipBadge.vue";
 import { useQuoticoTip } from "@/composables/useQuoticoTip";
 import { getCachedUserBet } from "@/composables/useUserBets";
-import { teamSlug } from "@/composables/useTeam";
 import { sportFlag, sportLabel } from "@/types/sports";
 import { toOddsSummary, toOddsBadge, oddsValueBySelection } from "@/composables/useMatchV3Adapter";
 import type { MatchV3, OddsButtonKey } from "@/types/MatchV3";
@@ -210,18 +208,12 @@ const statusClass = computed(() => {
       <!-- Teams + Score -->
       <div class="flex-1 min-w-0 flex items-center gap-3">
         <div class="flex-1 min-w-0">
-          <RouterLink
-            :to="{ name: 'team-detail', params: { teamSlug: teamSlug(match.home_team) }, query: { sport: match.sport_key } }"
-            class="text-sm font-medium text-text-primary truncate block hover:text-primary transition-colors"
-          >
+          <span class="text-sm font-medium text-text-primary truncate block">
             {{ match.home_team }}
-          </RouterLink>
-          <RouterLink
-            :to="{ name: 'team-detail', params: { teamSlug: teamSlug(match.away_team) }, query: { sport: match.sport_key } }"
-            class="text-sm font-medium text-text-primary truncate block mt-1 hover:text-primary transition-colors"
-          >
+          </span>
+          <span class="text-sm font-medium text-text-primary truncate block mt-1">
             {{ match.away_team }}
-          </RouterLink>
+          </span>
         </div>
 
         <!-- Live / Final score -->

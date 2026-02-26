@@ -2,15 +2,16 @@ import { ref, type Ref } from "vue";
 import { useApi } from "./useApi";
 
 export interface OddsSnapshot {
-  snapshot_at: string;
-  odds: Record<string, number>;
-  totals?: Record<string, number>;
+  timestamp: string;
+  home: number;
+  draw: number;
+  away: number;
+  source?: string;
 }
 
 export interface OddsTimelineResponse {
-  match_id: string;
-  snapshots: OddsSnapshot[];
-  snapshot_count: number;
+  match_id: number;
+  items: OddsSnapshot[];
 }
 
 // Shared cache keyed by match_id
@@ -34,7 +35,7 @@ export function useOddsTimeline() {
 
     try {
       const result = await api.get<OddsTimelineResponse>(
-        `/matches/${matchId}/odds-timeline`,
+        `/v3/matches/${matchId}/odds-timeline`,
       );
       data.value = result;
       cache.set(matchId, result);

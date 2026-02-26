@@ -73,11 +73,6 @@ const router = createRouter({
       component: () => import("@/views/MatchdayView.vue"),
     },
     {
-      path: "/teams",
-      name: "teams",
-      component: () => import("@/views/TeamsView.vue"),
-    },
-    {
       path: "/qbot",
       name: "qbot",
       component: () => import("@/views/QBotView.vue"),
@@ -86,11 +81,6 @@ const router = createRouter({
       path: "/qtip-performance",
       name: "qtip-performance",
       component: () => import("@/views/QTipPerformanceView.vue"),
-    },
-    {
-      path: "/team/:teamSlug",
-      name: "team-detail",
-      component: () => import("@/views/TeamDetailView.vue"),
     },
     {
       path: "/settings",
@@ -111,92 +101,12 @@ const router = createRouter({
     // Admin routes
     {
       path: "/admin",
-      name: "admin",
-      component: () => import("@/views/admin/AdminDashboardView.vue"),
-      meta: { requiresAuth: true, requiresAdmin: true },
-    },
-    {
-      path: "/admin/matches",
-      name: "admin-matches",
-      component: () => import("@/views/admin/AdminMatchManager.vue"),
-      meta: { requiresAuth: true, requiresAdmin: true },
-    },
-    {
-      path: "/admin/matches/:matchId",
-      name: "admin-match-detail",
-      component: () => import("@/views/admin/AdminMatchDetailView.vue"),
-      meta: { requiresAuth: true, requiresAdmin: true },
-    },
-    {
-      path: "/admin/users",
-      name: "admin-users",
-      component: () => import("@/views/admin/AdminUserManager.vue"),
-      meta: { requiresAuth: true, requiresAdmin: true },
-    },
-    {
-      path: "/admin/battles",
-      name: "admin-battles",
-      component: () => import("@/views/admin/AdminBattleManager.vue"),
-      meta: { requiresAuth: true, requiresAdmin: true },
-    },
-    {
-      path: "/admin/audit",
-      name: "admin-audit",
-      component: () => import("@/views/admin/AdminAuditLog.vue"),
-      meta: { requiresAuth: true, requiresAdmin: true },
-    },
-    {
-      path: "/admin/providers",
-      name: "admin-providers",
-      component: () => import("@/views/admin/AdminProviderStatus.vue"),
-      meta: { requiresAuth: true, requiresAdmin: true },
-    },
-    {
-      path: "/admin/event-bus",
-      name: "admin-event-bus",
-      component: () => import("@/views/admin/AdminEventBusMonitor.vue"),
-      meta: { requiresAuth: true, requiresAdmin: true },
-    },
-    {
-      path: "/admin/time-machine-justice",
-      name: "admin-time-machine-justice",
-      component: () => import("@/views/admin/AdminTimeMachineJusticeView.vue"),
-      meta: { requiresAuth: true, requiresAdmin: true },
-    },
-    {
-      path: "/admin/team-tower",
-      name: "admin-team-tower",
-      component: () => import("@/views/admin/AdminTeamTowerView.vue"),
-      meta: { requiresAuth: true, requiresAdmin: true },
-    },
-    {
-      path: "/admin/leagues",
-      name: "admin-leagues",
-      component: () => import("@/views/admin/AdminLeagueTowerView.vue"),
-      meta: { requiresAuth: true, requiresAdmin: true },
+      redirect: "/admin/ingest",
     },
     {
       path: "/admin/ingest",
       name: "admin-ingest",
       component: () => import("@/views/admin/AdminIngestDiscoveryView.vue"),
-      meta: { requiresAuth: true, requiresAdmin: true },
-    },
-    {
-      path: "/admin/qbot-lab",
-      name: "admin-qbot-lab",
-      component: () => import("@/views/admin/QbotLabView.vue"),
-      meta: { requiresAuth: true, requiresAdmin: true },
-    },
-    {
-      path: "/admin/qbot-lab/:strategyId",
-      name: "admin-qbot-lab-detail",
-      component: () => import("@/views/admin/AdminQbotStrategyDetailView.vue"),
-      meta: { requiresAuth: true, requiresAdmin: true },
-    },
-    {
-      path: "/admin/qtips/:matchId",
-      name: "admin-qtip-trace",
-      component: () => import("@/views/admin/AdminQtipTraceView.vue"),
       meta: { requiresAuth: true, requiresAdmin: true },
     },
   ],
@@ -235,8 +145,6 @@ router.beforeEach(async (to) => {
     to.name !== "register" &&
     to.name !== "legal" &&
     to.name !== "join-squad" &&
-    to.name !== "teams" &&
-    to.name !== "team-detail" &&
     to.name !== "qbot" &&
     to.name !== "qtip-performance"
   ) {

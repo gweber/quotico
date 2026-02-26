@@ -44,10 +44,10 @@ watch(expanded, (val) => {
 
       <!-- Snapshot count badge -->
       <span
-        v-if="data?.snapshot_count"
+        v-if="data?.items?.length"
         class="text-text-muted/60 ml-auto tabular-nums"
       >
-        {{ data.snapshot_count }} Punkte
+        {{ data.items.length }} Punkte
       </span>
     </button>
 
@@ -58,8 +58,8 @@ watch(expanded, (val) => {
             Lade Quotenverlauf...
           </div>
           <OddsTimelineChart
-            v-else-if="data?.snapshots"
-            :snapshots="data.snapshots"
+            v-else-if="data?.items"
+            :snapshots="data.items"
             :home-team="homeTeam"
             :away-team="awayTeam"
             compact

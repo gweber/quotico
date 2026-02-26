@@ -67,60 +67,35 @@ class _FakeImportJobsCollection:
 
 @pytest.mark.asyncio
 async def test_start_unified_match_ingest_job(monkeypatch):
-    league_id = ObjectId()
-    fake_db = SimpleNamespace(
-        leagues=_FakeLeaguesCollection({"_id": league_id}),
-        meta=_FakeMetaCollection(),
-        admin_import_jobs=_FakeImportJobsCollection(),
-    )
-    monkeypatch.setattr(admin_router._db, "db", fake_db, raising=False)
-
-    async def _noop_audit(**_kwargs):
-        return None
-
-    monkeypatch.setattr(admin_router, "log_audit", _noop_audit)
+    _ = monkeypatch
     request = SimpleNamespace(client=SimpleNamespace(host="127.0.0.1"), headers={})
     admin = {"_id": ObjectId()}
 
     body = admin_router.UnifiedMatchIngestRequest(source="football_data", season=2025, dry_run=True)
-    result = await admin_router.trigger_unified_match_ingest_async_admin(
-        league_id=str(league_id),
-        body=body,
-        background_tasks=BackgroundTasks(),
-        request=request,
-        admin=admin,
-    )
-    assert result["accepted"] is True
-    assert result["status"] == "queued"
-    assert result["source"] == "football_data"
-    assert result["season"] == 2025
+    with pytest.raises(HTTPException) as exc:
+        await admin_router.trigger_unified_match_ingest_async_admin(
+            league_id=str(ObjectId()),
+            body=body,
+            background_tasks=BackgroundTasks(),
+            request=request,
+            admin=admin,
+        )
+    assert exc.value.status_code == 410
 
 
 @pytest.mark.asyncio
 async def test_unified_match_ingest_rejects_theoddsapi(monkeypatch):
-    league_id = ObjectId()
-    fake_db = SimpleNamespace(
-        leagues=_FakeLeaguesCollection({"_id": league_id}),
-        meta=_FakeMetaCollection(),
-        admin_import_jobs=_FakeImportJobsCollection(),
-    )
-    monkeypatch.setattr(admin_router._db, "db", fake_db, raising=False)
-
-    async def _noop_audit(**_kwargs):
-        return None
-
-    monkeypatch.setattr(admin_router, "log_audit", _noop_audit)
+    _ = monkeypatch
     request = SimpleNamespace(client=SimpleNamespace(host="127.0.0.1"), headers={})
     admin = {"_id": ObjectId()}
     body = admin_router.UnifiedMatchIngestRequest(source="theoddsapi", season=2025, dry_run=True)
 
     with pytest.raises(HTTPException) as exc:
         await admin_router.trigger_unified_match_ingest_async_admin(
-            league_id=str(league_id),
+            league_id=str(ObjectId()),
             body=body,
             background_tasks=BackgroundTasks(),
             request=request,
             admin=admin,
         )
-    assert exc.value.status_code == 400
-    assert "not available yet" in str(exc.value.detail)
+    assert exc.value.status_code == 410

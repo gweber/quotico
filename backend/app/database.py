@@ -12,7 +12,7 @@ Dependencies:
 """
 
 from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorDatabase
-from pymongo.errors import DuplicateKeyError, OperationFailure
+from pymongo.errors import OperationFailure
 
 from app.config import settings
 
@@ -31,7 +31,6 @@ async def connect_db() -> None:
         minPoolSize=5,
     )
     db = client[settings.MONGO_DB]
-    await _migrate_match_date_hour()
     await _ensure_indexes()
 
 
@@ -45,42 +44,6 @@ async def get_db() -> AsyncIOMotorDatabase:
     return db
 
 
-async def _migrate_match_date_hour() -> None:
-    """One-time migration: add match_date_hour field and drop old compound index.
-
-    Old schema stored normalized (hour-floored) time in match_date.
-    New schema: match_date = raw accurate time, match_date_hour = floored (index only).
-    For existing docs, match_date was already floored, so copy it to match_date_hour.
-    """
-    import logging
-    logger = logging.getLogger("quotico.database")
-
-    # Backfill match_date_hour from match_date for docs that lack it
-    result = await db.matches.update_many(
-        {"match_date_hour": {"$exists": False}, "match_date": {"$exists": True}},
-        [{"$set": {"match_date_hour": "$match_date"}}],
-    )
-    if result.modified_count:
-        logger.info("Backfilled match_date_hour for %d matches", result.modified_count)
-
-    # Drop old compound unique index (uses match_date) if it exists
-    try:
-        existing_indexes = await db.matches.index_information()
-        for name, info in existing_indexes.items():
-            keys = [k for k, _ in info["key"]]
-            if (
-                info.get("unique")
-                and "match_date" in keys
-                and "match_date_hour" not in keys
-                and "home_team_id" in keys
-            ):
-                await db.matches.drop_index(name)
-                logger.info("Dropped old compound index %s (used match_date)", name)
-                break
-    except Exception as e:
-        logger.debug("Index migration check: %s", e)
-
-
 async def _ensure_indexes() -> None:
     """Create indexes on startup. Idempotent — safe to run repeatedly."""
 
@@ -89,63 +52,6 @@ async def _ensure_indexes() -> None:
     await db.users.create_index("alias_slug", unique=True, sparse=True)
     await db.users.create_index("google_sub", sparse=True)
     await db.users.create_index("is_deleted")
-
-    # ---- Matches (Greenfield: tower IDs + provider external IDs) ----
-
-    # Canonical dedup key (league/team IDs + hour-floored kickoff).
-    canonical_match_key = [
-        ("league_id", 1), ("home_team_id", 1), ("away_team_id", 1), ("match_date_hour", 1),
-    ]
-    try:
-        await db.matches.create_index(
-            canonical_match_key,
-            unique=True,
-            partialFilterExpression={
-                "league_id": {"$exists": True},
-                "home_team_id": {"$exists": True},
-                "away_team_id": {"$exists": True},
-                "match_date_hour": {"$exists": True},
-            },
-        )
-    except (DuplicateKeyError, OperationFailure) as exc:
-        logger.warning(
-            "Skipped canonical unique matches index due to duplicate data: %s",
-            exc,
-        )
-        await db.matches.create_index(
-            canonical_match_key,
-            name="canonical_match_key_lookup",
-            unique=False,
-        )
-    # TheOddsAPI fast-path lookup (sparse: matchday-only matches lack this)
-    await db.matches.create_index("metadata.theoddsapi_id", unique=True, sparse=True)
-    await db.matches.create_index("external_ids.theoddsapi", unique=True, sparse=True)
-    await db.matches.create_index("external_ids.football_data", unique=True, sparse=True)
-    await db.matches.create_index("external_ids.openligadb", unique=True, sparse=True)
-    # Dashboard / odds polling
-    await db.matches.create_index([("sport_key", 1), ("status", 1)])
-    await db.matches.create_index([("match_date", 1), ("status", 1)])
-    await db.matches.create_index([("sport_key", 1), ("match_date", 1)])
-    await db.matches.create_index([("league_id", 1), ("match_date", -1)])
-    await db.matches.create_index([("league_id", 1), ("season", 1), ("matchday", 1)])
-    await db.matches.create_index([("status", 1), ("match_date", -1)])
-    await db.matches.create_index([("odds_meta.updated_at", -1)])
-    await db.matches.create_index("home_team")
-    await db.matches.create_index("away_team")
-    # Smart sleep (resolver: started-but-unresolved)
-    await db.matches.create_index([("status", 1), ("match_date", 1)])
-    # Matchday lookup
-    await db.matches.create_index(
-        [("sport_key", 1), ("matchday_season", 1), ("matchday_number", 1)]
-    )
-    # H2H + form queries over canonical team IDs
-    await db.matches.create_index(
-        [("home_team_id", 1), ("away_team_id", 1), ("sport_key", 1), ("match_date", -1)]
-    )
-    await db.matches.create_index([("home_team_id", 1), ("sport_key", 1), ("match_date", -1)])
-    await db.matches.create_index([("away_team_id", 1), ("sport_key", 1), ("match_date", -1)])
-    # Season-scoped (EVD, league averages)
-    await db.matches.create_index([("sport_key", 1), ("match_date", -1)])
 
     # ---- Betting Slips ----
 
@@ -223,34 +129,6 @@ async def _ensure_indexes() -> None:
             "status": {"$in": ["pending", "won", "lost", "partial", "resolved"]},
         },
     )
-
-    # ---- Teams (Team-Tower identity) ----
-
-    await db.teams.create_index("normalized_name")
-    await db.teams.create_index([("normalized_name", 1), ("sport_key", 1)], unique=True)
-    await db.teams.create_index("aliases.normalized")
-    await db.teams.create_index("needs_review")
-    await db.teams.create_index("league_ids")
-    await db.teams.create_index("external_ids.football_data", unique=True, sparse=True)
-    await db.teams.create_index("external_ids.openligadb", unique=True, sparse=True)
-    await db.team_alias_suggestions.create_index(
-        [("sport_key", 1), ("league_id", 1), ("source", 1), ("normalized_name", 1)],
-        unique=True,
-        partialFilterExpression={"status": "pending"},
-    )
-    await db.team_alias_suggestions.create_index([("status", 1), ("last_seen_at", -1)])
-    await db.team_alias_suggestions.create_index([("source", 1), ("league_id", 1), ("status", 1)])
-    await db.team_alias_suggestions.create_index("normalized_name")
-
-    # ---- Leagues (League-Tower identity) ----
-
-    await db.leagues.create_index("sport_key", unique=True)
-    await db.leagues.create_index("is_active")
-    await db.leagues.create_index("needs_review")
-    await db.leagues.create_index("provider_mappings.understat")
-    await db.leagues.create_index("provider_mappings.theoddsapi")
-    await db.leagues.create_index("provider_mappings.football_data")
-    await db.leagues.create_index("provider_mappings.openligadb")
 
     # ---- Points / Leaderboard ----
 
@@ -357,6 +235,7 @@ async def _ensure_indexes() -> None:
     await db.league_registry_v3.create_index([("country", 1), ("name", 1)])
     await db.league_registry_v3.create_index([("last_synced_at", -1)])
     await db.matches_v3.create_index([("league_id", 1), ("start_at", -1)])
+    await db.matches_v3.create_index([("league_id", 1), ("start_at", 1)])
     await db.matches_v3.create_index([("referee_id", 1), ("start_at", -1)])
     await db.matches_v3.create_index([("has_advanced_stats", 1)])
     await db.matches_v3.create_index([("season_id", 1), ("has_advanced_stats", 1)])
@@ -381,6 +260,11 @@ async def _ensure_indexes() -> None:
         )
     await db.matches_v3.create_index([("season_id", 1), ("odds_meta.updated_at", -1)])
     await db.matches_v3.create_index([("season_id", 1), ("round_id", 1)])
+    await db.matches_v3.create_index([("teams.home.sm_id", 1), ("start_at", -1)])
+    await db.matches_v3.create_index([("teams.away.sm_id", 1), ("start_at", -1)])
+    await db.teams_v3.create_index([("updated_at", -1)])
+    await db.teams_v3.create_index([("name", 1)])
+    await db.persons.create_index([("type", 1), ("name", 1)])
 
     # ---- Provider Runtime Settings ----
 
@@ -427,15 +311,6 @@ async def _ensure_indexes() -> None:
     await db.device_fingerprints.create_index("ip_truncated")
     await db.device_fingerprints.create_index("fingerprint_hash")
 
-    # ---- Odds Events (Greenfield) ----
-
-    await db.odds_events.create_index([("match_id", 1), ("snapshot_at", 1)])
-    await db.odds_events.create_index([("sport_key", 1), ("snapshot_at", -1)])
-    await db.odds_events.create_index("event_hash", unique=True)
-    await db.odds_events.create_index(
-        "snapshot_at", expireAfterSeconds=60 * 60 * 24 * 180  # TTL: 180 days
-    )
-
     # ---- Event Bus Monitor ----
 
     await db.event_bus_stats.create_index(
@@ -456,14 +331,6 @@ async def _ensure_indexes() -> None:
     await db.archived_quotico_tips.create_index([("merge_job_id", 1), ("archived_at", -1)])
     await db.archived_quotico_tips.create_index([("original_id", 1)])
     await db.archived_quotico_tips.create_index([("merged_into_id", 1)])
-
-    await db.archived_odds_events.create_index("archived_at", expireAfterSeconds=archive_ttl_seconds)
-    await db.archived_odds_events.create_index([("merge_job_id", 1), ("archived_at", -1)])
-    await db.archived_odds_events.create_index([("original_id", 1)])
-    await db.archived_odds_events.create_index([("merged_into_id", 1)])
-
-    # Hot read index for odds_meta-based consumers.
-    await db.matches.create_index([("odds_meta.updated_at", -1)])
 
     await db.quotico_tips.create_index("match_id", unique=True)
     await db.quotico_tips.create_index("home_team_id")

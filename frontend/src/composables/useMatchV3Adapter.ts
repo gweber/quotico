@@ -53,20 +53,7 @@ export function toOddsSummary(match: MatchV3): OddsButtonVM[] {
   };
 
   const rows = (["1", "X", "2"] as OddsButtonKey[]).map(mapFromSummary);
-  if (rows.some((row) => row.avg != null)) return rows;
-
-  // Temporary fallback for legacy payloads that still provide odds.h2h.
-  const h2h = match.odds?.h2h || {};
-  return (["1", "X", "2"] as OddsButtonKey[]).map((key) => {
-    const avg = toNumber(h2h[key]);
-    return {
-      key,
-      avg,
-      min: avg,
-      max: avg,
-      count: avg == null ? null : 1,
-    };
-  });
+  return rows;
 }
 
 export function oddsValueBySelection(match: MatchV3, key: OddsButtonKey): number | null {
@@ -142,3 +129,16 @@ export function toMatchCardVM(match: MatchV3): MatchCardVM {
   };
 }
 
+export function buildLegacyUnavailableMatch(matchId: string | number): MatchV3 {
+  return {
+    id: String(matchId),
+    status: "SCHEDULED",
+    start_at: new Date(0).toISOString(),
+    has_advanced_stats: false,
+    teams: {
+      home: { sm_id: 0, name: "Legacy Match Missing" },
+      away: { sm_id: 0, name: "Legacy Match Missing" },
+    },
+    odds_meta: {},
+  };
+}

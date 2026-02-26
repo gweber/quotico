@@ -74,12 +74,54 @@ export const useMatchesStore = defineStore("matches", () => {
   // Computed: seconds until next refresh
   const refreshCountdown = computed(() => Math.max(0, Math.ceil(nextRefreshIn.value / 1000)));
 
+  function _statusFromV3(status: string | undefined): string {
+    const raw = String(status || "").toUpperCase();
+    if (raw === "FINISHED") return "final";
+    if (raw === "LIVE") return "live";
+    if (raw === "POSTPONED" || raw === "WALKOVER") return "cancelled";
+    return "scheduled";
+  }
+
+  function _toLegacyMatch(row: any): Match {
+    const id = String(row?._id ?? row?.id ?? "");
+    const homeId = Number(row?.teams?.home?.sm_id || 0);
+    const awayId = Number(row?.teams?.away?.sm_id || 0);
+    const summary = row?.odds_meta?.summary_1x2 || {};
+    const h2h: Record<string, number> = {};
+    const homeAvg = Number(summary?.home?.avg);
+    const drawAvg = Number(summary?.draw?.avg);
+    const awayAvg = Number(summary?.away?.avg);
+    if (Number.isFinite(homeAvg)) h2h["1"] = homeAvg;
+    if (Number.isFinite(drawAvg)) h2h["X"] = drawAvg;
+    if (Number.isFinite(awayAvg)) h2h["2"] = awayAvg;
+    return {
+      id,
+      sport_key: "football",
+      home_team: `Team ${homeId || "?"}`,
+      away_team: `Team ${awayId || "?"}`,
+      match_date: String(row?.start_at || ""),
+      start_at: String(row?.start_at || ""),
+      status: _statusFromV3(row?.status),
+      odds: { h2h, updated_at: row?.odds_meta?.updated_at || null },
+      result: {
+        home_score: row?.teams?.home?.score ?? null,
+        away_score: row?.teams?.away?.score ?? null,
+        outcome: null,
+      },
+      odds_meta: row?.odds_meta,
+      has_advanced_stats: Boolean(row?.has_advanced_stats),
+      referee_id: row?.referee_id ?? null,
+      teams: row?.teams,
+    };
+  }
+
   async function fetchMatches(sport?: string) {
     loading.value = true;
     try {
       const params: Record<string, string> = {};
       if (sport) params.sport = sport;
-      const freshMatches = await api.get<Match[]>("/matches/", params);
+      const response = await api.get<{ items: any[] }>("/v3/matches", params);
+      const freshMatches = (response.items || []).map(_toLegacyMatch);
       _detectOddsChanges(freshMatches);
       matches.value = freshMatches;
       lastRefreshAt.value = Date.now();
@@ -96,7 +138,8 @@ export const useMatchesStore = defineStore("matches", () => {
     try {
       const params: Record<string, string> = {};
       if (activeSport.value) params.sport = activeSport.value;
-      const freshMatches = await api.get<Match[]>("/matches/", params);
+      const response = await api.get<{ items: any[] }>("/v3/matches", params);
+      const freshMatches = (response.items || []).map(_toLegacyMatch);
       _detectOddsChanges(freshMatches);
       matches.value = freshMatches;
       lastRefreshAt.value = Date.now();

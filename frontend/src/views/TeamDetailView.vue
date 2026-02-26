@@ -3,7 +3,7 @@ import { onMounted, computed, ref } from "vue";
 import { useRoute, useRouter, RouterLink } from "vue-router";
 import { useI18n } from "vue-i18n";
 import { useTeam, teamSlug } from "@/composables/useTeam";
-import { useOddsTimeline } from "@/composables/useOddsTimeline";
+import { useOddsTimeline, type OddsTimelineResponse } from "@/composables/useOddsTimeline";
 import OddsTimelineChart from "@/components/OddsTimelineChart.vue";
 import { sportLabel } from "@/types/sports";
 
@@ -85,7 +85,7 @@ const gdSign = computed(() => {
 
 // Upcoming match odds timeline expansion
 const expandedTimeline = ref<string | null>(null);
-const timelineCache = ref<Map<string, { snapshots: { snapshot_at: string; odds: Record<string, number> }[] }>>(new Map());
+const timelineCache = ref<Map<string, OddsTimelineResponse>>(new Map());
 const timelineLoading = ref<string | null>(null);
 
 async function toggleTimeline(matchId: string) {
@@ -308,8 +308,8 @@ function getOddsEntries(m: { home_team: string; away_team: string; odds: Record<
                   Lade...
                 </div>
                 <OddsTimelineChart
-                  v-else-if="timelineCache.get(um.id)?.snapshots"
-                  :snapshots="timelineCache.get(um.id)!.snapshots"
+                  v-else-if="timelineCache.get(um.id)?.items"
+                  :snapshots="timelineCache.get(um.id)!.items"
                   :home-team="um.home_team"
                   :away-team="um.away_team"
                   compact

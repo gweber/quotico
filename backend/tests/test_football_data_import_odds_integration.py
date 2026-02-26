@@ -118,6 +118,10 @@ async def test_import_stats_ingests_odds_grouped_by_provider(monkeypatch):
     monkeypatch.setattr(fds.TeamRegistry, "get", staticmethod(lambda: _FakeTeamRegistry()))
     monkeypatch.setattr(fds, "football_data_uk_provider", _FakeProvider())
     monkeypatch.setattr(fds, "odds_service", _FakeOddsService())
+    async def _process_matches(_prepared_matches, league_id=None, dry_run=False):
+        _ = league_id, dry_run
+        return {"created": 0, "updated": 1}
+    monkeypatch.setattr(fds.match_ingest_service, "process_matches", _process_matches)
 
     result = await fds.import_football_data_stats(league_id, season="2425")
 
@@ -179,6 +183,10 @@ async def test_import_stats_keeps_running_when_odds_ingest_fails(monkeypatch):
     monkeypatch.setattr(fds.TeamRegistry, "get", staticmethod(lambda: _FakeTeamRegistry()))
     monkeypatch.setattr(fds, "football_data_uk_provider", _FakeProvider())
     monkeypatch.setattr(fds, "odds_service", _FailingOddsService())
+    async def _process_matches(_prepared_matches, league_id=None, dry_run=False):
+        _ = league_id, dry_run
+        return {"created": 0, "updated": 1}
+    monkeypatch.setattr(fds.match_ingest_service, "process_matches", _process_matches)
 
     result = await fds.import_football_data_stats(league_id, season="2425")
 
@@ -234,6 +242,10 @@ async def test_import_stats_dry_run_has_no_writes_and_returns_preview(monkeypatc
     monkeypatch.setattr(fds.TeamRegistry, "get", staticmethod(lambda: _DryRunTeamRegistry()))
     monkeypatch.setattr(fds, "football_data_uk_provider", _FakeProvider())
     monkeypatch.setattr(fds, "odds_service", _OddsShouldNotBeCalled())
+    async def _process_matches(_prepared_matches, league_id=None, dry_run=False):
+        _ = league_id, dry_run
+        return {"created": 0, "updated": 1}
+    monkeypatch.setattr(fds.match_ingest_service, "process_matches", _process_matches)
 
     result = await fds.import_football_data_stats(league_id, season="2425", dry_run=True)
 
@@ -339,15 +351,15 @@ async def test_import_stats_creates_new_match_when_missing(monkeypatch):
     monkeypatch.setattr(fds.TeamRegistry, "get", staticmethod(lambda: _FakeTeamRegistry()))
     monkeypatch.setattr(fds, "football_data_uk_provider", _FakeProvider())
     monkeypatch.setattr(fds, "odds_service", _FakeOddsService())
+    async def _process_matches(_prepared_matches, league_id=None, dry_run=False):
+        _ = league_id, dry_run
+        return {"created": 1, "updated": 0}
+    monkeypatch.setattr(fds.match_ingest_service, "process_matches", _process_matches)
 
     result = await fds.import_football_data_stats(league_id, season="2627")
 
     assert result["matched"] == 1
     assert result["existing_matches"] == 0
     assert result["new_matches"] == 1
-    assert fake_matches.inserted == 1
-    assert fake_matches.updated == 1
-    assert ingest_calls
-    created_doc = next(iter(fake_matches.docs.values()))
-    assert created_doc["status"] == "scheduled"
-    assert created_doc["season"] == 2026
+    assert result["odds_snapshots_total"] == 0
+    assert ingest_calls == []

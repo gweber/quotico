@@ -149,6 +149,7 @@ class SportmonksProvider:
             params={
                 "include": (
                     "fixtures;"
+                    "fixtures.participants;"
                     "fixtures.referees;"
                     "fixtures.referees.referee;"
                     "fixtures.events;"
