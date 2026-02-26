@@ -2,6 +2,8 @@ import { defineStore } from "pinia";
 import { ref, computed } from "vue";
 import { useApi } from "@/composables/useApi";
 import { prefetchUserBets } from "@/composables/useUserBets";
+import { oddsValueBySelection } from "@/composables/useMatchV3Adapter";
+import type { MatchV3, OddsMetaV3 } from "@/types/MatchV3";
 
 export interface MatchOdds {
   h2h: Record<string, number>;
@@ -22,9 +24,14 @@ export interface Match {
   home_team: string;
   away_team: string;
   match_date: string;
+  start_at?: string;
   status: string;  // scheduled, live, final, cancelled
   odds: MatchOdds;
   result: MatchResult;
+  odds_meta?: OddsMetaV3;
+  has_advanced_stats?: boolean;
+  referee_id?: number | string | null;
+  teams?: MatchV3["teams"];
 }
 
 export interface LiveScore {
@@ -106,10 +113,10 @@ export const useMatchesStore = defineStore("matches", () => {
     for (const fresh of freshMatches) {
       const old = oldMap.get(fresh.id);
       if (!old) continue;
-      const oldH2h = old.odds.h2h;
-      const newH2h = fresh.odds.h2h;
-      for (const key of Object.keys(newH2h)) {
-        if (oldH2h[key] !== newH2h[key]) {
+      for (const key of ["1", "X", "2"] as const) {
+        const oldValue = oddsValueBySelection(old as unknown as MatchV3, key);
+        const newValue = oddsValueBySelection(fresh as unknown as MatchV3, key);
+        if (oldValue !== newValue) {
           changed.add(fresh.id);
           break;
         }

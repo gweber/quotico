@@ -14,6 +14,8 @@ import { useQuoticoTip } from "@/composables/useQuoticoTip";
 import { getCachedUserBet } from "@/composables/useUserBets";
 import { teamSlug } from "@/composables/useTeam";
 import { sportFlag, sportLabel } from "@/types/sports";
+import { toOddsSummary, toOddsBadge, oddsValueBySelection } from "@/composables/useMatchV3Adapter";
+import type { MatchV3, OddsButtonKey } from "@/types/MatchV3";
 
 const { t, locale } = useI18n();
 const localeTag = computed(() => (locale.value === "en" ? "en-US" : "de-DE"));
@@ -99,21 +101,23 @@ const totals = computed(() => {
 });
 
 // --- Odds logic ---
-const isThreeWay = computed(() => props.match.odds.h2h["X"] !== undefined);
-
-const oddsEntries = computed(() => {
-  const m = props.match;
-  if (isThreeWay.value) {
-    return [
-      { key: "1", label: m.home_team },
-      { key: "X", label: t('match.draw') },
-      { key: "2", label: m.away_team },
-    ];
-  }
-  return [
-    { key: "1", label: m.home_team },
-    { key: "2", label: m.away_team },
-  ];
+const oddsSummary = computed(() => toOddsSummary(props.match as unknown as MatchV3));
+const oddsBadge = computed(() => toOddsBadge(props.match as unknown as MatchV3));
+const oddsEntries = computed(() => [
+  { key: "1" as OddsButtonKey, label: props.match.home_team },
+  { key: "X" as OddsButtonKey, label: t("match.draw") },
+  { key: "2" as OddsButtonKey, label: props.match.away_team },
+]);
+const oddsByKey = computed<Record<OddsButtonKey, { avg: number | null; min: number | null; max: number | null; count: number | null }>>(() => {
+  const out: Record<OddsButtonKey, { avg: number | null; min: number | null; max: number | null; count: number | null }> = {
+    "1": { avg: null, min: null, max: null, count: null },
+    "X": { avg: null, min: null, max: null, count: null },
+    "2": { avg: null, min: null, max: null, count: null },
+  };
+  oddsSummary.value.forEach((row) => {
+    out[row.key] = { avg: row.avg, min: row.min, max: row.max, count: row.count };
+  });
+  return out;
 });
 
 // Live bet projection: is the user's pending bet currently winning?
@@ -133,12 +137,13 @@ const liveProjectedPoints = computed(() => {
   return userTip.value.locked_odds * 10;
 });
 
-const hasOdds = computed(() => Object.keys(props.match.odds.h2h || {}).length > 0);
+const hasOdds = computed(() => oddsSummary.value.some((row) => row.avg != null));
 const buttonsDisabled = computed(() => !isUpcoming.value || isExpired.value || !!userTip.value || !hasOdds.value);
 
 function handleSelect(prediction: string) {
   if (buttonsDisabled.value) return;
-  if (props.match.odds.h2h[prediction] == null) return;
+  const selected = oddsValueBySelection(props.match as unknown as MatchV3, prediction as OddsButtonKey);
+  if (selected == null) return;
   betslip.addItem(props.match, prediction);
 }
 
@@ -238,15 +243,24 @@ const statusClass = computed(() => {
           :match-id="match.id"
           :prediction="entry.key"
           :label="entry.label"
-          :odds="match.odds.h2h[entry.key]"
+          :odds="oddsByKey[entry.key].avg ?? undefined"
+          :min="oddsByKey[entry.key].min"
+          :max="oddsByKey[entry.key].max"
+          :count="oddsByKey[entry.key].count"
           :disabled="buttonsDisabled"
           :user-tip="userTip"
           @click="handleSelect(entry.key)"
         />
       </div>
       <div v-else class="shrink-0 text-xs text-text-muted italic px-2">
-        {{ $t('match.oddsUnavailable') }}
+        {{ $t('match.noOddsAvailable') }}
       </div>
+    </div>
+
+    <div v-if="oddsBadge !== 'none'" class="mt-2">
+      <span class="inline-flex rounded-full border border-surface-3/70 bg-surface-2 px-2 py-0.5 text-[10px] font-medium text-text-secondary">
+        {{ oddsBadge === "live" ? $t("match.liveOdds") : $t("match.closingLine") }}
+      </span>
     </div>
 
     <!-- User tip status -->

@@ -335,6 +335,53 @@ async def _ensure_indexes() -> None:
     await db.audit_logs.create_index([("target_id", 1), ("timestamp", -1)])
     await db.audit_logs.create_index("timestamp")
 
+    # ---- Admin Import Jobs ----
+
+    await db.admin_import_jobs.create_index([("type", 1), ("status", 1), ("updated_at", -1)])
+    await db.admin_import_jobs.create_index([("season_id", 1), ("status", 1)])
+    await db.admin_import_jobs.create_index(
+        [("season_id", 1), ("active_lock", 1)],
+        unique=True,
+        partialFilterExpression={"active_lock": True, "type": "sportmonks_deep_ingest"},
+        name="admin_import_jobs_sportmonks_season_lock",
+    )
+    await db.admin_import_jobs.create_index(
+        [("season_id", 1), ("active_lock", 1)],
+        unique=True,
+        partialFilterExpression={"active_lock": True, "type": "sportmonks_metrics_sync"},
+        name="admin_import_jobs_sportmonks_metrics_lock",
+    )
+
+    # ---- V3 Sportmonks Collections ----
+
+    await db.league_registry_v3.create_index([("country", 1), ("name", 1)])
+    await db.league_registry_v3.create_index([("last_synced_at", -1)])
+    await db.matches_v3.create_index([("league_id", 1), ("start_at", -1)])
+    await db.matches_v3.create_index([("referee_id", 1), ("start_at", -1)])
+    await db.matches_v3.create_index([("has_advanced_stats", 1)])
+    await db.matches_v3.create_index([("season_id", 1), ("has_advanced_stats", 1)])
+    try:
+        await db.matches_v3.create_index(
+            [("season_id", 1), ("start_at", 1)],
+            partialFilterExpression={"odds_meta.summary_1x2": {"$exists": False}},
+            name="matches_v3_missing_odds_summary_scan",
+        )
+    except OperationFailure as exc:
+        # Some MongoDB deployments do not support $exists:false in partial indexes.
+        if int(getattr(exc, "code", 0) or 0) != 67 and "Expression not supported in partial index" not in str(exc):
+            raise
+        logger.warning(
+            "Partial repair index unsupported on this MongoDB (%s). "
+            "Using non-partial fallback index for season/start scan.",
+            exc,
+        )
+        await db.matches_v3.create_index(
+            [("season_id", 1), ("start_at", 1)],
+            name="matches_v3_repair_scan_fallback",
+        )
+    await db.matches_v3.create_index([("season_id", 1), ("odds_meta.updated_at", -1)])
+    await db.matches_v3.create_index([("season_id", 1), ("round_id", 1)])
+
     # ---- Provider Runtime Settings ----
 
     await db.provider_settings.create_index(

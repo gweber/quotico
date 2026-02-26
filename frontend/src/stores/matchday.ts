@@ -2,6 +2,7 @@ import { defineStore } from "pinia";
 import { ref, computed } from "vue";
 import { useApi } from "@/composables/useApi";
 import { populateTipCache, type QuoticoTip } from "@/composables/useQuoticoTip";
+import type { MatchV3, OddsMetaV3 } from "@/types/MatchV3";
 
 export interface MatchdaySport {
   sport_key: string;
@@ -27,9 +28,14 @@ export interface MatchdayMatch {
   home_team: string;
   away_team: string;
   match_date: string;
+  start_at?: string;
   status: string;  // scheduled, live, final, cancelled
   odds: Record<string, unknown>;
   result: Record<string, unknown>;
+  odds_meta?: OddsMetaV3;
+  has_advanced_stats?: boolean;
+  referee_id?: number | string | null;
+  teams?: MatchV3["teams"];
   is_locked: boolean;
   h2h_context?: Record<string, unknown> | null;
   quotico_tip?: QuoticoTip | null;

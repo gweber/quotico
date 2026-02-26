@@ -2,6 +2,8 @@ import { defineStore } from "pinia";
 import { ref, computed, onUnmounted } from "vue";
 import { useApi, HttpError } from "@/composables/useApi";
 import type { Match } from "./matches";
+import { oddsValueBySelection } from "@/composables/useMatchV3Adapter";
+import type { MatchV3, OddsButtonKey } from "@/types/MatchV3";
 
 export interface BetSlipItem {
   matchId: string;
@@ -125,6 +127,12 @@ export const useBetSlipStore = defineStore("betslip", () => {
   // ---- Public actions ----
 
   function addItem(match: Match, prediction: string) {
+    const selectedOdds = oddsValueBySelection(
+      match as unknown as MatchV3,
+      prediction as OddsButtonKey
+    );
+    if (selectedOdds == null) return;
+
     // Remove existing bet for same match
     items.value = items.value.filter((i) => i.matchId !== match.id);
 
@@ -140,7 +148,7 @@ export const useBetSlipStore = defineStore("betslip", () => {
       awayTeam: match.away_team,
       prediction,
       predictionLabel: labels[prediction] || prediction,
-      odds: match.odds.h2h[prediction],
+      odds: selectedOdds,
       sportKey: match.sport_key,
       matchDate: match.match_date,
       addedAt: Date.now(),
@@ -149,7 +157,7 @@ export const useBetSlipStore = defineStore("betslip", () => {
     isOpen.value = true; // Auto-open on mobile
 
     // Background server sync (fire-and-forget)
-    syncAddSelection(match.id, prediction, match.odds.h2h[prediction]);
+    syncAddSelection(match.id, prediction, selectedOdds);
   }
 
   async function syncAddSelection(matchId: string, pick: string, displayedOdds: number) {
@@ -302,7 +310,10 @@ export const useBetSlipStore = defineStore("betslip", () => {
       for (const item of validItems.value) {
         const fresh = freshMap.get(item.matchId);
         if (!fresh) continue;
-        const currentOdds = fresh.odds.h2h[item.prediction];
+        const currentOdds = oddsValueBySelection(
+          fresh as unknown as MatchV3,
+          item.prediction as OddsButtonKey
+        );
         if (currentOdds != null && currentOdds !== item.odds) {
           oddsChanges.push({
             matchId: item.matchId,

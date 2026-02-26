@@ -12,6 +12,9 @@ const props = defineProps<{
   prediction: string;
   label: string;
   odds: number | undefined;
+  min?: number | null;
+  max?: number | null;
+  count?: number | null;
   disabled?: boolean;
   userTip?: UserBet;
 }>();
@@ -44,6 +47,46 @@ const displayedOdds = computed(() => {
 const formattedOdds = computed(() =>
   displayedOdds.value != null ? displayedOdds.value.toFixed(2) : "-"
 );
+
+const tooltipId = computed(() => `odds-tip-${props.matchId}-${props.prediction}`);
+const tooltipOpen = ref(false);
+let longPressTimer: ReturnType<typeof setTimeout> | null = null;
+
+const hasTooltipData = computed(() =>
+  props.min != null || props.max != null || props.count != null
+);
+
+function clearLongPressTimer() {
+  if (longPressTimer) {
+    clearTimeout(longPressTimer);
+    longPressTimer = null;
+  }
+}
+
+function onPointerDown(event: PointerEvent) {
+  if (!hasTooltipData.value) return;
+  if (event.pointerType === "touch") {
+    clearLongPressTimer();
+    longPressTimer = setTimeout(() => {
+      tooltipOpen.value = true;
+    }, 350);
+  }
+}
+
+function onPointerUp() {
+  clearLongPressTimer();
+}
+
+function toggleTooltipTouch(event: PointerEvent) {
+  if (!hasTooltipData.value) return;
+  if (event.pointerType === "touch") {
+    tooltipOpen.value = !tooltipOpen.value;
+  }
+}
+
+function closeTooltip() {
+  tooltipOpen.value = false;
+}
 
 const ariaLabel = computed(() => {
   if (isTipped.value) return `${props.label}, ${t("match.betPlaced", { odds: formattedOdds.value })}`;
@@ -84,7 +127,7 @@ watch(
 
 <template>
   <button
-    class="flex flex-col items-center justify-center min-w-[3.5rem] h-touch rounded-lg border transition-all"
+    class="relative flex flex-col items-center justify-center min-w-[3.5rem] h-touch rounded-lg border transition-all"
     :class="[
       isTipped
         ? 'bg-success/15 border-success ring-1 ring-success cursor-default'
@@ -101,8 +144,18 @@ watch(
     ]"
     :disabled="disabled || !!userTip"
     :aria-label="ariaLabel"
+    :aria-describedby="hasTooltipData ? tooltipId : undefined"
     :aria-pressed="isSelected || isTipped"
     role="switch"
+    @mouseenter="tooltipOpen = hasTooltipData"
+    @mouseleave="closeTooltip"
+    @focus="tooltipOpen = hasTooltipData"
+    @blur="closeTooltip"
+    @keydown.esc="closeTooltip"
+    @pointerdown="onPointerDown"
+    @pointerup="onPointerUp"
+    @pointercancel="onPointerUp"
+    @click="toggleTooltipTouch"
   >
     <span class="text-[10px] leading-none" :class="isTipped ? 'text-success' : 'text-text-muted'">
       {{ prediction }}
@@ -117,6 +170,19 @@ watch(
     >
       {{ formattedOdds }}
     </span>
+
+    <div
+      v-if="tooltipOpen && hasTooltipData"
+      :id="tooltipId"
+      role="tooltip"
+      class="absolute z-20 -top-16 left-1/2 -translate-x-1/2 whitespace-nowrap rounded-md border border-surface-3/70 bg-surface-1 px-2 py-1 text-[10px] text-text-secondary shadow-lg"
+    >
+      {{ t("match.oddsTooltip", {
+        min: props.min != null ? Number(props.min).toFixed(2) : "-",
+        max: props.max != null ? Number(props.max).toFixed(2) : "-",
+        count: props.count ?? "-",
+      }) }}
+    </div>
   </button>
 </template>
 

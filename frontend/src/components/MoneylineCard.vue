@@ -7,6 +7,8 @@ import { useToast } from "@/composables/useToast";
 import MatchHistory from "./MatchHistory.vue";
 import QuoticoTipBadge from "./QuoticoTipBadge.vue";
 import { getCachedTip } from "@/composables/useQuoticoTip";
+import { oddsValueBySelection } from "@/composables/useMatchV3Adapter";
+import type { MatchV3, OddsButtonKey } from "@/types/MatchV3";
 
 const props = defineProps<{
   match: MatchdayMatch;
@@ -26,9 +28,11 @@ const existingTip = computed(() =>
   matchday.moneylineBets.get(props.match.id),
 );
 
-const h2hOdds = computed(() =>
-  (props.match.odds?.h2h ?? {}) as Record<string, number>
-);
+const h2hOdds = computed<Record<string, number>>(() => ({
+  "1": oddsValueBySelection(props.match as unknown as MatchV3, "1") || 0,
+  X: oddsValueBySelection(props.match as unknown as MatchV3, "X") || 0,
+  "2": oddsValueBySelection(props.match as unknown as MatchV3, "2") || 0,
+}));
 
 const matchResult = computed(() =>
   (props.match.result ?? {}) as { outcome?: string; home_score?: number | null; away_score?: number | null }
@@ -58,7 +62,7 @@ function selectPrediction(pred: string) {
 
 async function submitTip() {
   if (!selectedPrediction.value) return;
-  const odds = h2hOdds.value[selectedPrediction.value];
+  const odds = h2hOdds.value[selectedPrediction.value as OddsButtonKey];
   if (!odds) return;
 
   submitting.value = true;

@@ -182,6 +182,7 @@ async def lifespan(app: FastAPI):
     from app.services.event_bus import event_bus
     from app.services.event_bus_monitor import event_bus_monitor
     from app.services.event_handlers import register_event_handlers
+    from app.services.sportmonks_connector import sportmonks_connector
     from app.services.websocket_manager import websocket_manager
 
     seed_result = await seed_core_leagues()
@@ -190,6 +191,11 @@ async def lifespan(app: FastAPI):
     logger.info("Provider settings seeded on startup: %s", provider_settings_seed)
     team_seed_result = await seed_core_teams()
     logger.info("Core teams seeded on startup: %s", team_seed_result)
+    try:
+        await sportmonks_connector.sync_leagues_on_startup()
+        logger.info("Sportmonks v3 discovery sync finished on startup")
+    except Exception:
+        logger.exception("Sportmonks v3 discovery sync failed on startup")
 
     registry = TeamRegistry.get()
     await registry.initialize()
@@ -282,6 +288,8 @@ from app.routers.teams import router as teams_router
 from app.routers.leagues import router as leagues_router
 from app.routers.qbot import router as qbot_router
 from app.routers.betting_slips import router as betting_slips_router
+from app.routers.admin_ingest import router as admin_ingest_router
+from app.routers.persons import router as persons_router
 
 app.include_router(auth_router)
 app.include_router(user_router)
@@ -307,6 +315,8 @@ app.include_router(teams_router)
 app.include_router(leagues_router)
 app.include_router(qbot_router)
 app.include_router(betting_slips_router)
+app.include_router(admin_ingest_router)
+app.include_router(persons_router)
 
 
 @app.exception_handler(InvalidId)

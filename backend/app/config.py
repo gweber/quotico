@@ -51,18 +51,24 @@ class Settings(BaseSettings):
 
     # API key for local tools (scraper import etc.)
     IMPORT_API_KEY: str = ""
+    SM_API_KEY: str = ""
 
     # Provider runtime settings fallback (DB-first: DB > ENV > defaults)
     THEODDSAPI_BASE_URL: str = "https://api.the-odds-api.com/v4"
     OPENLIGADB_BASE_URL: str = "https://api.openligadb.de"
     FOOTBALL_DATA_UK_BASE_URL: str = "https://www.football-data.co.uk/mmz4281"
     UNDERSTAT_BASE_URL: str = "https://understat.com"
+    SPORTMONKS_BASE_URL: str = "https://api.sportmonks.com/v3"
     PROVIDER_SETTINGS_CACHE_TTL: int = 15
     THEODDSAPI_RATE_LIMIT_RPM: int = 30
     FOOTBALL_DATA_RATE_LIMIT_RPM: int = 10
     OPENLIGADB_RATE_LIMIT_RPM: int = 120
     FOOTBALL_DATA_UK_RATE_LIMIT_RPM: int = 30
     UNDERSTAT_RATE_LIMIT_RPM: int = 30
+    SPORTMONKS_RESERVE_CREDITS: int = 50
+    SPORTMONKS_DISCOVERY_TTL_MINUTES: int = 30
+    SPORTMONKS_STALE_JOB_MINUTES: int = 5
+    SPORTMONKS_STARTUP_DISCOVERY_ENABLED: bool = True
 
     # Q-Bot: minimum QuoticoTip confidence to auto-bet
     QBOT_MIN_CONFIDENCE: float = 0.55

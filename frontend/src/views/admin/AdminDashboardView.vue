@@ -48,6 +48,7 @@ const cards = [
   { to: "/admin/time-machine-justice", label: "Time Machine Justice", icon: "\u23F2\uFE0F" },
   { to: "/admin/leagues", label: "League Tower", icon: "\uD83D\uDCCA" },
   { to: "/admin/team-tower", label: "Team Tower", icon: "\uD83C\uDFAF" },
+  { to: "/admin/ingest", label: "Sportmonks Ingest", icon: "\u2699\uFE0F" },
   { to: "/admin/qbot-lab", label: "Qbot Lab", icon: "\uD83E\uDDEC" },
 ];
 </script>

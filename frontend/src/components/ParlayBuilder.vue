@@ -4,6 +4,8 @@ import { useI18n } from "vue-i18n";
 import type { MatchdayMatch } from "@/stores/matchday";
 import { useWalletStore } from "@/stores/wallet";
 import { useToast } from "@/composables/useToast";
+import { oddsValueBySelection } from "@/composables/useMatchV3Adapter";
+import type { MatchV3, OddsButtonKey } from "@/types/MatchV3";
 
 const props = defineProps<{
   matches: MatchdayMatch[];
@@ -55,7 +57,11 @@ const predictionLabels = computed<Record<string, string>>(() => ({
 }));
 
 function h2hOdds(match: MatchdayMatch): Record<string, number> {
-  return ((match.odds as Record<string, unknown>)?.h2h ?? {}) as Record<string, number>;
+  return {
+    "1": oddsValueBySelection(match as unknown as MatchV3, "1") || 0,
+    X: oddsValueBySelection(match as unknown as MatchV3, "X") || 0,
+    "2": oddsValueBySelection(match as unknown as MatchV3, "2") || 0,
+  };
 }
 
 function toggleLeg(match: MatchdayMatch, prediction: string) {
@@ -70,7 +76,7 @@ function toggleLeg(match: MatchdayMatch, prediction: string) {
 
   if (legs.value.length >= REQUIRED_LEGS) return;
 
-  const odds = h2hOdds(match)[prediction] || 0;
+  const odds = h2hOdds(match)[prediction as OddsButtonKey] || 0;
   if (!odds) return;
 
   legs.value.push({

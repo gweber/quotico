@@ -5,6 +5,8 @@ import type { MatchdayMatch } from "@/stores/matchday";
 import { useWalletStore } from "@/stores/wallet";
 import { useToast } from "@/composables/useToast";
 import HighBetWarning from "./HighBetWarning.vue";
+import { oddsValueBySelection } from "@/composables/useMatchV3Adapter";
+import type { MatchV3, OddsButtonKey } from "@/types/MatchV3";
 
 const props = defineProps<{
   match: MatchdayMatch;
@@ -23,11 +25,15 @@ const existingBet = computed(() =>
   walletStore.bets.find((b) => b.match_id === props.match.id),
 );
 
-const h2hOdds = computed(() => ((props.match.odds as any)?.h2h || {}) as Record<string, number>);
+const h2hOdds = computed<Record<string, number>>(() => ({
+  "1": oddsValueBySelection(props.match as unknown as MatchV3, "1") || 0,
+  X: oddsValueBySelection(props.match as unknown as MatchV3, "X") || 0,
+  "2": oddsValueBySelection(props.match as unknown as MatchV3, "2") || 0,
+}));
 
 const selectedOdds = computed(() => {
   if (!selectedPrediction.value) return 0;
-  return h2hOdds.value[selectedPrediction.value] || 0;
+  return h2hOdds.value[selectedPrediction.value as OddsButtonKey] || 0;
 });
 
 const potentialWin = computed(() =>

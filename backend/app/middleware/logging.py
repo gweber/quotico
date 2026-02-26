@@ -1,3 +1,15 @@
+"""
+backend/app/middleware/logging.py
+
+Purpose:
+    Request logging middleware and global logging setup for backend services.
+    Enforces structured request logs and redacts noisy third-party HTTP logs.
+
+Dependencies:
+    - starlette.middleware.base
+    - python logging/json/hashlib/uuid/time
+"""
+
 import hashlib
 import json
 import logging
@@ -45,3 +57,6 @@ def setup_logging() -> None:
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
         datefmt="%Y-%m-%dT%H:%M:%S",
     )
+    # Avoid leaking sensitive query params from third-party HTTP client INFO logs.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
