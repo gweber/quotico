@@ -3,7 +3,7 @@ frontend/src/components/layout/SportNav.vue
 
 Purpose:
     Dynamic sport navigation sourced from League Tower instead of hardcoded keys.
-    Renders active+tippable leagues in backend-defined order for sidebar/bar use.
+    Renders active leagues in backend-defined order for sidebar/bar use.
 -->
 <script setup lang="ts">
 /**

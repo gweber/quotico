@@ -26,6 +26,15 @@ async def seed_initial_user() -> None:
     if not settings.SEED_ADMIN_EMAIL or not settings.SEED_ADMIN_PASSWORD:
         logger.debug("SEED_ADMIN_EMAIL not set, skipping seed")
         return
+    existing_users = await _db.db.users.count_documents({})
+    existing_squads = await _db.db.squads.count_documents({})
+    if existing_users > 0 or existing_squads > 0:
+        logger.info(
+            "Seed bootstrap skipped (existing users=%d, squads=%d)",
+            existing_users,
+            existing_squads,
+        )
+        return
 
     now = utcnow()
 
@@ -85,6 +94,15 @@ async def seed_qbot_user() -> str:
 
     Returns the Q-Bot user_id (str) for use by workers.
     """
+    existing_users = await _db.db.users.count_documents({})
+    if existing_users > 0:
+        existing = await _db.db.users.find_one({"email": QBOT_EMAIL})
+        if existing:
+            logger.info("Q-Bot user already exists: %s", existing["_id"])
+            return str(existing["_id"])
+        logger.info("Q-Bot seed bootstrap skipped (users already present)")
+        return ""
+
     existing = await _db.db.users.find_one({"email": QBOT_EMAIL})
     if existing:
         logger.info("Q-Bot user already exists: %s", existing["_id"])

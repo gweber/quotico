@@ -122,6 +122,12 @@ const router = createRouter({
       meta: { requiresAuth: true, requiresAdmin: true },
     },
     {
+      path: "/admin/matches/:matchId",
+      name: "admin-match-detail",
+      component: () => import("@/views/admin/AdminMatchDetailView.vue"),
+      meta: { requiresAuth: true, requiresAdmin: true },
+    },
+    {
       path: "/admin/users",
       name: "admin-users",
       component: () => import("@/views/admin/AdminUserManager.vue"),
@@ -146,8 +152,20 @@ const router = createRouter({
       meta: { requiresAuth: true, requiresAdmin: true },
     },
     {
-      path: "/admin/team-aliases",
-      name: "admin-team-aliases",
+      path: "/admin/event-bus",
+      name: "admin-event-bus",
+      component: () => import("@/views/admin/AdminEventBusMonitor.vue"),
+      meta: { requiresAuth: true, requiresAdmin: true },
+    },
+    {
+      path: "/admin/time-machine-justice",
+      name: "admin-time-machine-justice",
+      component: () => import("@/views/admin/AdminTimeMachineJusticeView.vue"),
+      meta: { requiresAuth: true, requiresAdmin: true },
+    },
+    {
+      path: "/admin/team-tower",
+      name: "admin-team-tower",
       component: () => import("@/views/admin/AdminTeamTowerView.vue"),
       meta: { requiresAuth: true, requiresAdmin: true },
     },

@@ -1,9 +1,23 @@
-"""Historical match data API — receives data from the local scraper tool."""
+"""
+backend/app/routers/historical.py
+
+Purpose:
+    Historical import and read endpoints for match context/statistics using
+    Team Tower identities and canonical match references.
+
+Dependencies:
+    - app.database
+    - app.services.historical_service
+    - app.services.team_registry_service
+"""
 
 import logging
 import secrets
 from datetime import datetime
+import re
 
+from bson import ObjectId
+from bson.errors import InvalidId
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
 from pydantic import BaseModel, Field
 
@@ -15,12 +29,30 @@ from app.services.historical_service import (
     clear_context_cache,
     sport_keys_for,
 )
-from app.services.team_registry_service import TeamRegistry
-from app.services.team_mapping_service import normalize_match_date, team_name_key
+from app.services.team_registry_service import TeamRegistry, normalize_team_name
 from app.utils import utcnow
 
 logger = logging.getLogger("quotico.historical")
 router = APIRouter(prefix="/api/historical", tags=["historical"])
+
+
+def _normalize_match_date(dt: datetime) -> datetime:
+    return dt.replace(minute=0, second=0, microsecond=0)
+
+
+def _serialize_team_ids(rows: list[dict]) -> list[dict]:
+    """Convert Team Tower ObjectIds to API-safe strings."""
+    normalized: list[dict] = []
+    for match in rows:
+        row = dict(match)
+        home_id = row.get("home_team_id")
+        away_id = row.get("away_team_id")
+        if isinstance(home_id, ObjectId):
+            row["home_team_id"] = str(home_id)
+        if isinstance(away_id, ObjectId):
+            row["away_team_id"] = str(away_id)
+        normalized.append(row)
+    return normalized
 
 
 # ---------------------------------------------------------------------------
@@ -80,8 +112,6 @@ class HistoricalMatch(BaseModel):
     match_date: datetime
     home_team: str
     away_team: str
-    home_team_key: str
-    away_team_key: str
     home_goals: int
     away_goals: int
     result: str | None = None
@@ -107,7 +137,6 @@ class ImportResult(BaseModel):
 class TeamAlias(BaseModel):
     sport_key: str
     team_name: str
-    team_key: str
 
 
 class AliasBatch(BaseModel):
@@ -177,41 +206,13 @@ async def import_matches(batch: ImportBatch, _=Depends(verify_import_key)):
         doc["updated_at"] = now
 
         # match_date_hour: floored to hour for compound unique index dedup
-        doc["match_date_hour"] = normalize_match_date(doc["match_date"])
+        doc["match_date_hour"] = _normalize_match_date(doc["match_date"])
 
         # Resolve persistent team identity for match uniqueness and references
         home_team_id = await registry.resolve(doc["home_team"], doc["sport_key"])
         away_team_id = await registry.resolve(doc["away_team"], doc["sport_key"])
         doc["home_team_id"] = home_team_id
         doc["away_team_id"] = away_team_id
-
-        # Keep legacy keys populated for compatibility with existing read paths.
-        home_key = doc.get("home_team_key") or team_name_key(doc["home_team"])
-        away_key = doc.get("away_team_key") or team_name_key(doc["away_team"])
-        doc["home_team_key"] = home_key
-        doc["away_team_key"] = away_key
-
-        # First, try to update an existing legacy keyed match (pre-team_id era).
-        legacy_match = await _db.db.matches.find_one(
-            {
-                "sport_key": doc["sport_key"],
-                "season": doc["season"],
-                "home_team_key": home_key,
-                "away_team_key": away_key,
-                "match_date": doc["match_date"],
-            },
-            {"_id": 1},
-        )
-        if legacy_match:
-            ops.append(UpdateOne(
-                {"_id": legacy_match["_id"]},
-                {
-                    "$set": doc,
-                    "$setOnInsert": {"imported_at": now},
-                },
-                upsert=True,
-            ))
-            continue
 
         ops.append(UpdateOne(
             {
@@ -250,28 +251,28 @@ async def import_matches(batch: ImportBatch, _=Depends(verify_import_key)):
 async def import_aliases(batch: AliasBatch, _=Depends(verify_import_key)):
     """Bulk upsert team name variants into team_mappings.
 
-    For each alias, finds or creates a team_mapping by canonical_id
-    (derived from team_key) and adds the team_name to its names array.
+    For each alias, finds or creates a Team Tower document and adds the alias.
     """
-    from app.services.team_mapping_service import make_canonical_id
     from pymongo import UpdateOne
 
     now = utcnow()
     ops = []
 
     for alias in batch.aliases:
-        canonical_id = make_canonical_id(alias.team_name)
+        normalized_name = normalize_team_name(alias.team_name)
+        if not normalized_name:
+            continue
         ops.append(UpdateOne(
-            {"canonical_id": canonical_id},
+            {"normalized_name": normalized_name, "sport_key": alias.sport_key},
             {
                 "$addToSet": {
-                    "names": alias.team_name,
-                    "sport_keys": alias.sport_key,
+                    "aliases": {"name": alias.team_name, "sport_key": alias.sport_key},
                 },
                 "$setOnInsert": {
-                    "canonical_id": canonical_id,
+                    "normalized_name": normalized_name,
+                    "sport_key": alias.sport_key,
                     "display_name": alias.team_name,
-                    "external_ids": {},
+                    "needs_review": False,
                     "created_at": now,
                 },
                 "$set": {"updated_at": now},
@@ -282,7 +283,7 @@ async def import_aliases(batch: AliasBatch, _=Depends(verify_import_key)):
     if not ops:
         return {"received": 0, "upserted": 0}
 
-    result = await _db.db.team_mappings.bulk_write(ops, ordered=False)
+    result = await _db.db.teams.bulk_write(ops, ordered=False)
     return {
         "received": len(batch.aliases),
         "upserted": result.upserted_count,
@@ -297,48 +298,61 @@ async def import_aliases(batch: AliasBatch, _=Depends(verify_import_key)):
 @router.get("/h2h")
 async def head_to_head(
     sport_key: str = Query(...),
-    home_team_key: str = Query(...),
-    away_team_key: str = Query(...),
+    home_team_id: str = Query(...),
+    away_team_id: str = Query(...),
     limit: int = Query(10, ge=1, le=50),
     skip: int = Query(0, ge=0, le=200),
 ):
     """Get head-to-head history between two teams (either direction)."""
+    try:
+        home_oid = ObjectId(home_team_id)
+        away_oid = ObjectId(away_team_id)
+    except (InvalidId, TypeError):
+        raise HTTPException(status_code=400, detail="Invalid team id.") from None
+
     related_keys = sport_keys_for(sport_key)
     matches = await _db.db.matches.find(
         {
             "sport_key": {"$in": related_keys},
             "status": "final",
             "$or": [
-                {"home_team_key": home_team_key, "away_team_key": away_team_key},
-                {"home_team_key": away_team_key, "away_team_key": home_team_key},
+                {"home_team_id": home_oid, "away_team_id": away_oid},
+                {"home_team_id": away_oid, "away_team_id": home_oid},
             ],
         },
         {
             "_id": 0,
             "match_date": 1, "home_team": 1, "away_team": 1,
-            "home_team_key": 1, "away_team_key": 1,
+            "home_team_id": 1, "away_team_id": 1,
             "result.home_score": 1, "result.away_score": 1, "result.outcome": 1,
             "season_label": 1,
         },
     ).sort("match_date", -1).skip(skip).to_list(length=limit)
 
-    return {"matches": matches, "count": len(matches)}
+    normalized_matches = _serialize_team_ids(matches)
+
+    return {"matches": normalized_matches, "count": len(normalized_matches)}
 
 
 @router.get("/team-form")
 async def team_form(
     sport_key: str = Query(...),
-    team_key: str = Query(...),
+    team_id: str = Query(...),
     limit: int = Query(10, ge=1, le=50),
 ):
     """Get recent form for a team (last N matches)."""
+    try:
+        team_oid = ObjectId(team_id)
+    except (InvalidId, TypeError):
+        raise HTTPException(status_code=400, detail="Invalid team id.") from None
+
     matches = await _db.db.matches.find(
         {
             "sport_key": sport_key,
             "status": "final",
             "$or": [
-                {"home_team_key": team_key},
-                {"away_team_key": team_key},
+                {"home_team_id": team_oid},
+                {"away_team_id": team_oid},
             ],
         },
         {
@@ -349,7 +363,8 @@ async def team_form(
         },
     ).sort("match_date", -1).to_list(length=limit)
 
-    return {"matches": matches, "count": len(matches)}
+    normalized_matches = _serialize_team_ids(matches)
+    return {"matches": normalized_matches, "count": len(normalized_matches)}
 
 
 @router.get("/match-context")
@@ -412,7 +427,7 @@ async def collection_stats(admin=Depends(get_admin_user)):
 
     results = await _db.db.matches.aggregate(pipeline).to_list(length=500)
     total = await _db.db.matches.count_documents(final_filter)
-    aliases = await _db.db.team_mappings.count_documents({})
+    aliases = await _db.db.teams.count_documents({})
 
     return {
         "total_matches": total,

@@ -7,6 +7,7 @@ upcoming soccer matches. Uses smart sleep to skip when no odds have been updated
 import logging
 
 import app.database as _db
+from app.services.odds_meta_service import get_current_market, get_market_updated_at
 from app.services.quotico_tip_service import generate_quotico_tip
 from app.utils import ensure_utc, utcnow
 from app.workers._state import get_synced_at, set_synced
@@ -29,12 +30,12 @@ async def generate_quotico_tips() -> None:
     if last_run:
         last_run = ensure_utc(last_run)
         recent_odds_update = await _db.db.matches.find_one(
-            {"odds.updated_at": {"$gte": last_run}, "status": {"$in": target_statuses}},
+            {"odds_meta.updated_at": {"$gte": last_run}, "status": {"$in": target_statuses}},
         )
         if not recent_odds_update:
             # Still generate tips for live matches that have none
             missing_tip = await _db.db.matches.find_one(
-                {"status": "live", "odds.h2h": {"$ne": {}}},
+                {"status": "live", "odds_meta.markets.h2h.current": {"$ne": {}}},
             )
             if missing_tip:
                 existing_tip = await _db.db.quotico_tips.find_one(
@@ -71,7 +72,9 @@ async def generate_quotico_tips() -> None:
             {"generated_at": 1},
         )
         if existing:
-            odds_updated = ensure_utc(match.get("odds", {}).get("updated_at") or now)
+            odds_updated = ensure_utc(get_market_updated_at(match, "h2h") or now)
+            if not get_current_market(match, "h2h"):
+                continue
             bet_generated = ensure_utc(existing["generated_at"])
             if bet_generated >= odds_updated:
                 fresh += 1
@@ -82,7 +85,7 @@ async def generate_quotico_tips() -> None:
             # Enrich with Qbot intelligence (graceful — skips if no strategy)
             try:
                 from app.services.qbot_intelligence_service import enrich_tip
-                bet = await enrich_tip(bet)
+                bet = await enrich_tip(bet, match=match)
             except Exception:
                 logger.warning("Qbot enrichment failed for %s", match_id, exc_info=True)
             await _db.db.quotico_tips.update_one(

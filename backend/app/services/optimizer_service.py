@@ -1,17 +1,14 @@
-"""Self-optimizing calibration engine for Dixon-Coles parameters.
+"""
+backend/app/services/optimizer_service.py
 
-Finds per-league optimal (rho, alpha, alpha_weight_floor) by minimizing the
-Regularized Brier Score (RBS) via grid search on resolved matches.
+Purpose:
+    Calibration engine for Dixon-Coles model parameters (rho, alpha, floor)
+    using resolved matches and canonical Team Tower ids.
 
-Two modes:
-- **Exploration** (monthly): full grid across the entire parameter space.
-- **Refinement** (weekly): narrow grid around the current calibrated values.
-
-The L2 regularization penalty shrinks parameters toward their hardcoded
-defaults with strength λ_reg = 1/√N, preventing overfitting on small samples.
-
-Daily evaluation monitors Brier score drift and triggers early recalibration
-when accuracy degrades relative to the rolling history average.
+Dependencies:
+    - app.database
+    - app.services.quotico_tip_service
+    - app.services.historical_service
 """
 
 import logging
@@ -42,7 +39,6 @@ from app.services.quotico_tip_service import (
     _time_weighted_average,
     blend_goals,
 )
-from app.services.team_mapping_service import resolve_team_key
 from app.utils import ensure_utc, utcnow
 
 logger = logging.getLogger("quotico.optimizer")
@@ -136,14 +132,13 @@ async def _fetch_calibration_matches(
             "match_date": {"$gte": cutoff, "$lt": reference},
             "result.home_score": {"$exists": True},
             "result.away_score": {"$exists": True},
-            "odds.h2h.1": {"$gt": 0},
-            "odds.h2h.X": {"$gt": 0},
-            "odds.h2h.2": {"$gt": 0},
+            "odds_meta.markets.h2h.current.1": {"$gt": 0},
+            "odds_meta.markets.h2h.current.X": {"$gt": 0},
+            "odds_meta.markets.h2h.current.2": {"$gt": 0},
         },
         {
-            "result": 1, "odds.h2h": 1, "match_date": 1,
-            "home_team": 1, "away_team": 1, "home_team_key": 1,
-            "away_team_key": 1, "sport_key": 1,
+            "result": 1, "odds_meta.markets.h2h.current": 1, "match_date": 1,
+            "home_team_id": 1, "away_team_id": 1, "sport_key": 1,
         },
     ).sort("match_date", 1).to_list(length=500)
 
@@ -180,21 +175,18 @@ async def _prefetch_match_data(
     """
     related_keys = sport_keys_for(sport_key)
 
-    # --- 1. Collect unique team keys ---
-    team_keys: set[str] = set()
+    # --- 1. Collect unique team ids ---
+    team_ids: set = set()
     for m in matches:
-        hk = m.get("home_team_key")
-        ak = m.get("away_team_key")
+        hk = m.get("home_team_id")
+        ak = m.get("away_team_id")
         if not hk or not ak:
-            # Resolve if not stored on the match doc
-            hk = hk or await resolve_team_key(m["home_team"], related_keys)
-            ak = ak or await resolve_team_key(m["away_team"], related_keys)
-            m["home_team_key"] = hk
-            m["away_team_key"] = ak
+            # Greenfield rule: skip legacy matches missing canonical ids.
+            continue
         if hk:
-            team_keys.add(hk)
+            team_ids.add(hk)
         if ak:
-            team_keys.add(ak)
+            team_ids.add(ak)
 
     # --- 2. Bulk-fetch team match histories ---
     # Per-team: home matches (goals scored at home), away matches (goals scored away),
@@ -206,18 +198,18 @@ async def _prefetch_match_data(
 
     projection = {"result.home_score": 1, "result.away_score": 1,
                   "result.home_xg": 1, "result.away_xg": 1,
-                  "match_date": 1, "home_team_key": 1, "away_team_key": 1}
+                  "match_date": 1, "home_team_id": 1, "away_team_id": 1}
 
     # When before_date is set, cap team history to avoid loading future data
     date_cap: dict = {}
     if before_date:
         date_cap = {"match_date": {"$lt": before_date}}
 
-    total_teams = len(team_keys)
-    for ti, tk in enumerate(team_keys, 1):
+    total_teams = len(team_ids)
+    for ti, tk in enumerate(team_ids, 1):
         # Home matches
         home_docs = await _db.db.matches.find(
-            {"home_team_key": tk, "sport_key": {"$in": related_keys}, "status": "final",
+            {"home_team_id": tk, "sport_key": {"$in": related_keys}, "status": "final",
              **date_cap},
             projection,
         ).sort("match_date", 1).to_list(length=200)
@@ -225,7 +217,7 @@ async def _prefetch_match_data(
 
         # Away matches
         away_docs = await _db.db.matches.find(
-            {"away_team_key": tk, "sport_key": {"$in": related_keys}, "status": "final",
+            {"away_team_id": tk, "sport_key": {"$in": related_keys}, "status": "final",
              **date_cap},
             projection,
         ).sort("match_date", 1).to_list(length=200)
@@ -233,7 +225,7 @@ async def _prefetch_match_data(
 
         # All matches for rest days (cross-competition but within soccer)
         all_docs = await _db.db.matches.find(
-            {"$or": [{"home_team_key": tk}, {"away_team_key": tk}],
+            {"$or": [{"home_team_id": tk}, {"away_team_id": tk}],
              "sport_key": {"$in": related_keys}, "status": "final",
              **date_cap},
             {"match_date": 1},
@@ -275,8 +267,8 @@ async def _prefetch_match_data(
     result: list[MatchCalibrationData] = []
 
     for m in matches:
-        hk = m.get("home_team_key")
-        ak = m.get("away_team_key")
+        hk = m.get("home_team_id")
+        ak = m.get("away_team_id")
         if not hk or not ak:
             continue
 
@@ -284,7 +276,7 @@ async def _prefetch_match_data(
         if not actual:
             continue
 
-        odds_h2h = m.get("odds", {}).get("h2h", {})
+        odds_h2h = (((m.get("odds_meta") or {}).get("markets") or {}).get("h2h") or {}).get("current", {})
         if not all(odds_h2h.get(k, 0) > 0 for k in ("1", "X", "2")):
             continue
 
@@ -327,13 +319,13 @@ async def _prefetch_match_data(
         home_rest = _rest_from_all(hk)
         away_rest = _rest_from_all(ak)
 
-        # H2H lambdas (filter home team's matches for away_team_key, and vice versa)
+        # H2H lambdas (filter home team's matches for away team id, and vice versa)
         h2h_matches_raw: list[dict] = []
         for doc in h_home_docs[:cut_idx]:
-            if doc.get("away_team_key") == ak and ensure_utc(doc["match_date"]) < match_dt:
+            if doc.get("away_team_id") == ak and ensure_utc(doc["match_date"]) < match_dt:
                 h2h_matches_raw.append(doc)
         for doc in team_home.get(ak, []):
-            if doc.get("away_team_key") == hk and ensure_utc(doc["match_date"]) < match_dt:
+            if doc.get("away_team_id") == hk and ensure_utc(doc["match_date"]) < match_dt:
                 h2h_matches_raw.append(doc)
         # Sort by date descending (most recent first) for _compute_h2h_lambdas
         h2h_matches_raw.sort(key=lambda d: d["match_date"], reverse=True)
@@ -357,7 +349,7 @@ async def _prefetch_match_data(
         ))
 
     logger.info("Prefetched %d calibration data points for %s (%d teams)",
-                len(result), sport_key, len(team_keys))
+                len(result), sport_key, len(team_ids))
     return result
 
 
@@ -773,9 +765,9 @@ async def evaluate_engine_performance() -> dict:
                 "match_date": {"$gte": cutoff},
                 "result.home_score": {"$exists": True},
                 "result.away_score": {"$exists": True},
-                "odds.h2h.1": {"$gt": 0},
-                "odds.h2h.X": {"$gt": 0},
-                "odds.h2h.2": {"$gt": 0},
+                "odds_meta.markets.h2h.current.1": {"$gt": 0},
+                "odds_meta.markets.h2h.current.X": {"$gt": 0},
+                "odds_meta.markets.h2h.current.2": {"$gt": 0},
             },
         ).sort("match_date", 1).to_list(length=200)
 

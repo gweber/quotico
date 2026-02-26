@@ -75,12 +75,12 @@ def _build_automated_job_specs() -> list[dict]:
     )
     return [
         {"id": "odds_poller", "func": poll_odds, "trigger": "interval", "trigger_kwargs": {"minutes": 15}},
-        {"id": "match_resolver", "func": resolve_matches, "trigger": "interval", "trigger_kwargs": {"minutes": 30}},
-        {"id": "leaderboard", "func": materialize_leaderboard, "trigger": "interval", "trigger_kwargs": {"minutes": 30}},
+        {"id": "match_resolver", "func": resolve_matches, "trigger": "interval", "trigger_kwargs": {"hours": 3}},
+        {"id": "leaderboard", "func": materialize_leaderboard, "trigger": "interval", "trigger_kwargs": {"hours": 3}},
         {"id": "badge_engine", "func": check_badges, "trigger": "interval", "trigger_kwargs": {"minutes": 30}},
         {"id": "matchday_sync", "func": sync_matchdays, "trigger": "interval", "trigger_kwargs": {"minutes": 30}},
         {"id": "matchday_resolver", "func": resolve_matchday_predictions, "trigger": "interval", "trigger_kwargs": {"minutes": 30}},
-        {"id": "matchday_leaderboard", "func": materialize_matchday_leaderboard, "trigger": "interval", "trigger_kwargs": {"minutes": 30}},
+        {"id": "matchday_leaderboard", "func": materialize_matchday_leaderboard, "trigger": "interval", "trigger_kwargs": {"hours": 6}},
         {"id": "wallet_maintenance", "func": run_wallet_maintenance, "trigger": "interval", "trigger_kwargs": {"hours": 6}},
         {"id": "qbot_bets", "func": run_qbot_bets, "trigger": "interval", "trigger_kwargs": {"minutes": 5}},
         {"id": "calibration_eval", "func": run_daily_evaluation, "trigger": "cron", "trigger_kwargs": {"hour": 3, "minute": 0}},
@@ -176,10 +176,20 @@ async def lifespan(app: FastAPI):
     setup_logging()
     await connect_db()
     from app.services.league_service import seed_core_leagues
+    from app.services.provider_settings_seed_service import seed_provider_settings_defaults
+    from app.services.team_seed_service import seed_core_teams
     from app.services.team_registry_service import TeamRegistry
+    from app.services.event_bus import event_bus
+    from app.services.event_bus_monitor import event_bus_monitor
+    from app.services.event_handlers import register_event_handlers
+    from app.services.websocket_manager import websocket_manager
 
     seed_result = await seed_core_leagues()
     logger.info("Core leagues seeded on startup: %s", seed_result)
+    provider_settings_seed = await seed_provider_settings_defaults()
+    logger.info("Provider settings seeded on startup: %s", provider_settings_seed)
+    team_seed_result = await seed_core_teams()
+    logger.info("Core teams seeded on startup: %s", team_seed_result)
 
     registry = TeamRegistry.get()
     await registry.initialize()
@@ -192,11 +202,33 @@ async def lifespan(app: FastAPI):
 
     scheduler.start()
     await set_automation_enabled(False, run_initial_sync=False, persist=False)
+    if settings.WS_EVENTS_ENABLED:
+        await websocket_manager.start()
+        logger.info("WebSocket realtime manager enabled")
+    else:
+        logger.info("WebSocket realtime manager disabled via config")
+    if settings.EVENT_BUS_ENABLED:
+        register_event_handlers(event_bus)
+        await event_bus.start()
+        logger.info("Event bus enabled")
+        if settings.QBUS_MONITOR_ENABLED:
+            await event_bus_monitor.start()
+            logger.info("Event bus monitor enabled")
+        else:
+            logger.info("Event bus monitor disabled via config")
+    else:
+        logger.info("Event bus disabled via config")
     logger.info("Automated workers disabled on startup. Use Admin to activate.")
     logger.info("Background scheduler started")
 
     yield
 
+    if settings.EVENT_BUS_ENABLED:
+        if settings.QBUS_MONITOR_ENABLED:
+            await event_bus_monitor.stop()
+        await event_bus.stop()
+    if settings.WS_EVENTS_ENABLED:
+        await websocket_manager.stop()
     await registry.stop_background_refresh()
     if scheduler.running:
         scheduler.shutdown(wait=False)

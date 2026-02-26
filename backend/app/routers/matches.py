@@ -1,4 +1,18 @@
+"""
+backend/app/routers/matches.py
+
+Purpose:
+    Match read API including live scores and odds timeline views backed by the
+    greenfield odds architecture (`odds_events` + `matches.odds_meta`).
+
+Dependencies:
+    - app.services.match_service
+    - app.models.match
+    - app.database
+"""
+
 import logging
+from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -9,15 +23,16 @@ logger = logging.getLogger("quotico.matches")
 import app.database as _db
 from app.models.match import LiveScoreResponse, MatchResponse, db_to_response
 from app.services.match_service import get_matches, get_match_by_id
+from app.services.odds_meta_service import build_legacy_like_odds
 from app.services.auth_service import get_admin_user
 from app.utils import parse_utc
 from app.providers.odds_api import odds_provider
 from app.providers.football_data import (
     SPORT_TO_COMPETITION,
     football_data_provider,
-    teams_match,
 )
 from app.providers.openligadb import openligadb_provider, SPORT_TO_LEAGUE
+from app.utils.team_matching import teams_match
 
 router = APIRouter(prefix="/api/matches", tags=["matches"])
 
@@ -121,30 +136,88 @@ async def _match_live_score(sport_key: str, score: dict) -> Optional[dict]:
 
 @router.get("/{match_id}/odds-timeline")
 async def match_odds_timeline(match_id: str):
-    """Odds snapshots for a single match, sorted chronologically."""
-    raw = await _db.db.odds_snapshots.find(
-        {"match_id": match_id},
-        {"_id": 0, "snapshot_at": 1, "odds": 1, "totals": 1, "totals_odds": 1},
-    ).sort("snapshot_at", 1).to_list(length=500)
+    """Odds snapshots for a single match, sorted chronologically from odds_events."""
+    from bson import ObjectId
+    from bson.errors import InvalidId
 
-    # Normalize: old docs have totals_odds, new docs have totals
+    try:
+        oid = ObjectId(match_id)
+    except (InvalidId, TypeError):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid match id.") from None
+    raw = await _db.db.odds_events.find(
+        {"match_id": oid},
+        {"_id": 0, "snapshot_at": 1, "provider": 1, "market": 1, "selection_key": 1, "price": 1, "line": 1},
+    ).sort("snapshot_at", 1).to_list(length=5000)
+
+    grouped: dict[datetime, dict] = {}
+    for ev in raw:
+        ts = ev["snapshot_at"]
+        group = grouped.setdefault(
+            ts,
+            {"providers": defaultdict(lambda: {"odds": {}, "totals": {}, "spreads": {}})},
+        )
+        p = str(ev.get("provider") or "unknown")
+        m = str(ev.get("market") or "")
+        k = str(ev.get("selection_key") or "")
+        v = ev.get("price")
+        if not isinstance(v, (int, float)):
+            continue
+        line = ev.get("line")
+        node = group["providers"][p]
+        if m == "h2h":
+            node["odds"][k] = float(v)
+        elif m == "totals":
+            node["totals"][k] = float(v)
+            if isinstance(line, (int, float)):
+                node["totals"]["line"] = float(line)
+        elif m == "spreads":
+            node["spreads"][k] = float(v)
+            if isinstance(line, (int, float)):
+                node["spreads"]["line"] = float(line)
+
     snapshots = []
-    for s in raw:
-        # Ensure snapshot_at is a clean ISO string (no microseconds — JS compat)
-        snap_at = s.get("snapshot_at")
-        if isinstance(snap_at, datetime):
-            snap_at = snap_at.replace(microsecond=0, tzinfo=snap_at.tzinfo or timezone.utc).isoformat()
-        entry: dict = {"snapshot_at": snap_at, "odds": s.get("odds", {})}
-        totals = s.get("totals") or s.get("totals_odds")
-        if totals:
-            entry["totals"] = totals
-        snapshots.append(entry)
+    for ts in sorted(grouped.keys()):
+        providers = grouped[ts]["providers"]
+        odds_vals = [pv for pnode in providers.values() for pv in [pnode["odds"]] if pnode["odds"]]
+        totals_vals = [pv for pnode in providers.values() for pv in [pnode["totals"]] if pnode["totals"]]
+
+        avg_odds: dict[str, float] = {}
+        for key in ("1", "X", "2"):
+            vals = [o[key] for o in odds_vals if key in o]
+            if vals:
+                avg_odds[key] = round(sum(vals) / len(vals), 4)
+
+        avg_totals: dict[str, float] = {}
+        for key in ("over", "under", "line"):
+            vals = [o[key] for o in totals_vals if key in o]
+            if vals:
+                avg_totals[key] = round(sum(vals) / len(vals), 4)
+
+        snapshots.append(
+            {
+                "snapshot_at": ts.replace(microsecond=0, tzinfo=ts.tzinfo or timezone.utc).isoformat(),
+                "odds": avg_odds,
+                "totals": avg_totals,
+                "providers": {
+                    pname: pvals for pname, pvals in providers.items()
+                },
+            }
+        )
 
     return {
         "match_id": match_id,
         "snapshots": snapshots,
         "snapshot_count": len(snapshots),
     }
+
+
+@router.get("/{match_id}/odds")
+async def get_match_odds(match_id: str):
+    """Get current aggregated odds meta for one match."""
+    match = await get_match_by_id(match_id)
+    if not match:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Match not found.")
+    return {"match_id": match_id, "odds_meta": match.get("odds_meta", {}), "odds": build_legacy_like_odds(match)}
 
 
 @router.get("/{match_id}", response_model=MatchResponse)

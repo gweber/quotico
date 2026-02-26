@@ -17,7 +17,7 @@ const error = ref(false);
 async function reload() {
   error.value = false;
   try {
-    await matches.fetchMatches();
+    await matches.fetchMatches(matches.activeSport ?? undefined);
 
     // Prefetch historical data, QuoticoTips, and user bets for all visible matches
     if (matches.matches.length > 0) {

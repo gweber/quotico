@@ -1,9 +1,17 @@
+<!--
+frontend/src/components/QuoticoTipBadge.vue
+
+Purpose:
+    Compact and expanded card for QuoticoTip details inside match views.
+    Includes optional ExpertAnalysis rendering when qbot_logic is present.
+-->
 <script setup lang="ts">
 import { ref, computed } from "vue";
 import { useI18n } from "vue-i18n";
 import { useAuthStore } from "@/stores/auth";
 import type { QuoticoTip } from "@/composables/useQuoticoTip";
 import { refreshSingleTip } from "@/composables/useQuoticoTip";
+import ExpertAnalysis from "@/components/ExpertAnalysis.vue";
 
 const { t } = useI18n();
 const auth = useAuthStore();
@@ -97,18 +105,6 @@ const tierCount = computed(() =>
 
 // Qbot Intelligence
 const qbot = computed(() => props.tip.qbot_logic ?? null);
-const qbotArchetypeLabel = computed(() => {
-  if (!qbot.value?.archetype) return "";
-  return t(`qbot.archetypes.${qbot.value.archetype}`);
-});
-const qbotReasoning = computed(() => {
-  if (!qbot.value?.reasoning_key) return "";
-  return t(qbot.value.reasoning_key, qbot.value.reasoning_params ?? {});
-});
-const qbotBayesPct = computed(() => {
-  if (!qbot.value?.bayesian_confidence) return 0;
-  return Math.round(qbot.value.bayesian_confidence * 100);
-});
 
 // Player Mode
 const playerData = computed(() => qbot.value?.player ?? null);
@@ -388,45 +384,13 @@ function fmtSignedPct(v: number | undefined, decimals = 1): string {
             {{ localizedJustification }}
           </p>
 
-          <!-- Qbot Intelligence section (only if enriched) -->
-          <div v-if="qbot" class="space-y-2">
-            <div class="text-text-muted font-semibold uppercase tracking-wider text-[10px]">
-              Qbot Intelligence
-            </div>
-            <!-- Archetype + reasoning -->
-            <div class="bg-surface-2/50 rounded-lg p-2.5">
-              <div class="flex items-center gap-2 mb-1.5">
-                <span class="px-2 py-0.5 rounded-full text-[10px] font-bold bg-primary/15 text-primary">
-                  {{ qbotArchetypeLabel }}
-                </span>
-                <span class="text-[10px] text-text-muted">v{{ qbot.strategy_version }}</span>
-              </div>
-              <p class="text-[11px] text-text-secondary leading-relaxed">
-                {{ qbotReasoning }}
-              </p>
-            </div>
-            <!-- Stats row -->
-            <div class="grid grid-cols-3 gap-2">
-              <div class="bg-surface-2/50 rounded-lg p-2 text-center">
-                <div class="text-text-muted text-[10px]">{{ $t('qbot.clusterWinRate') }}</div>
-                <div class="font-mono font-bold text-sm tabular-nums" :class="qbotBayesPct >= 50 ? 'text-emerald-400' : 'text-text-secondary'">
-                  {{ qbotBayesPct }}%
-                </div>
-              </div>
-              <div class="bg-surface-2/50 rounded-lg p-2 text-center">
-                <div class="text-text-muted text-[10px]">{{ $t('qbot.stakeLabel') }}</div>
-                <div class="font-mono font-bold text-sm tabular-nums text-text-primary">
-                  {{ qbot.stake_units }}u
-                </div>
-              </div>
-              <div class="bg-surface-2/50 rounded-lg p-2 text-center">
-                <div class="text-text-muted text-[10px]">{{ $t('qtipPerformance.tips') }}</div>
-                <div class="font-mono font-bold text-sm tabular-nums text-text-primary">
-                  {{ qbot.cluster_sample_size }}
-                </div>
-              </div>
-            </div>
-          </div>
+          <ExpertAnalysis
+            v-if="qbot"
+            :qbot-logic="qbot"
+            :compact="true"
+            :expandable="true"
+            :initial-expanded="false"
+          />
 
           <!-- Player Mode section (when player data exists) -->
           <div v-if="playerData" class="space-y-2">

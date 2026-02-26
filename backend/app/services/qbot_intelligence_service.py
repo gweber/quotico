@@ -1,20 +1,22 @@
-"""Qbot Intelligence Service — Bayesian signal clustering + reasoning engine.
+"""
+backend/app/services/qbot_intelligence_service.py
 
-Enriches QuoticoTips with:
-- Bayesian confidence from historical signal clusters
-- Kelly-based stake recommendation from evolved strategy DNA
-- Archetypal reasoning strings (i18n key + params)
+Purpose:
+    Qbot intelligence enrichment for tips: Bayesian cluster confidence,
+    archetype reasoning, and Kelly-based staking metadata.
 
-Cluster stats are pre-computed daily by the calibration worker and cached
-in-memory with a 1-hour TTL.  Live tip enrichment is a pure lookup — no
-DB queries on the hot path.
+Dependencies:
+    - app.database
+    - app.utils
 """
 
 import logging
 import time as _time
-from datetime import datetime, timezone
+
+from bson import ObjectId
 
 import app.database as _db
+from app.utils import utcnow
 
 logger = logging.getLogger("quotico.qbot_intelligence")
 
@@ -38,7 +40,9 @@ ARCHETYPES = [
     ("sharp_hunter",    "qbot.reasoning.sharpHunter"),
     ("momentum_rider",  "qbot.reasoning.momentumRider"),
     ("kings_prophet",   "qbot.reasoning.kingsProphet"),
+    ("steam_snatcher",  "qbot.reasoning.steamSnatcher"),  # CLV awareness
     ("contrarian",      "qbot.reasoning.contrarian"),
+    ("night_owl",       "qbot.reasoning.nightOwl"),      # Temporal bias
     ("steady_hand",     "qbot.reasoning.steadyHand"),
     ("the_strategist",  "qbot.reasoning.strategist"),  # Player Mode only
 ]
@@ -63,6 +67,40 @@ LEAGUE_DISPLAY = {
     "soccer_portugal_primeira_liga": "Primeira Liga",
 }
 
+# Qbot Intelligence 2.0 constants
+CLUSTER_VERSION = 2
+CLUSTER_MIN_SAMPLES = 5  # Hierarchical fallback threshold
+
+# Volatility binning thresholds
+VOLATILITY_STABLE_PCT = 0.03   # < 3%
+VOLATILITY_EXTREME_PCT = 0.07  # > 7%
+
+# Market trust factors (multiplicative)
+VOLATILITY_DISCOUNT = {
+    "stable": 1.0,
+    "volatile": 0.95,
+    "extreme": 0.85,
+    "NA": 0.90,
+}
+
+# Stats anomaly thresholds (post-match)
+SHOTS_RATIO_EXTREME = 0.65  # > 65% of total shots = dominant
+XG_EFFICIENCY_THRESHOLD = 1.3
+XG_BETRAYAL_DELTA_THRESHOLD = 0.8
+
+# Qbot Intelligence 2.3 constants
+# Temporal binning thresholds (UTC hours)
+TEMPORAL_DAY_MAX = 18    # day: < 18:00
+TEMPORAL_PRIME_MAX = 22  # prime: 18:00 - 22:00, late: > 22:00
+
+# Market synergy thresholds
+SYNERGY_POSITIVE_LINE = 2.5    # totals_line >= 2.5 for positive synergy
+SYNERGY_POSITIVE_OVER_PRICE = 1.70  # over_price < 1.70
+SYNERGY_NEGATIVE_LINE = 2.0    # totals_line <= 2.0 for negative synergy (low-scoring)
+SYNERGY_MULTIPLIER_BOUNDS = (0.90, 1.10)  # min, max multiplier bounds
+SYNERGY_POSITIVE_MULTIPLIER = 1.05
+SYNERGY_NEGATIVE_MULTIPLIER = 0.95
+
 
 # ---------------------------------------------------------------------------
 # Bayesian smoothing
@@ -76,13 +114,205 @@ def bayesian_win_rate(wins: int, total: int) -> float:
 
 
 # ---------------------------------------------------------------------------
+# Qbot Intelligence 2.3 Helper Functions
+# ---------------------------------------------------------------------------
+
+def _get_temporal_dim(match_hour: int | None) -> str:
+    """Convert UTC hour to temporal dimension (day/prime/late)."""
+    if match_hour is None:
+        return "day"  # default
+    
+    if match_hour < TEMPORAL_DAY_MAX:
+        return "day"
+    elif match_hour < TEMPORAL_PRIME_MAX:
+        return "prime"
+    else:
+        return "late"
+
+
+def _get_market_synergy(pick: str, market_ctx: dict) -> float:
+    """Calculate market synergy multiplier based on totals correlation.
+    
+    Positive synergy (1.05): H2H pick + totals_line >= 2.5 + over_price < 1.70
+    Negative synergy (0.95): H2H pick + totals_line <= 2.0 (low-scoring environment)
+    Default: 1.0 (no synergy)
+    
+    Returns multiplier bounded between 0.90 and 1.10.
+    """
+    # Check provider count for totals market (ghost protection)
+    totals_provider_count = market_ctx.get("totals_provider_count", 0)
+    if totals_provider_count < 1:
+        return 1.0  # No data, no synergy
+    
+    totals_line = market_ctx.get("totals_line")
+    totals_over = market_ctx.get("totals_over")
+    
+    if totals_line is None or totals_over is None:
+        return 1.0
+    
+    try:
+        line_val = float(totals_line)
+        over_val = float(totals_over)
+    except (ValueError, TypeError):
+        return 1.0
+    
+    # Positive synergy: high-scoring environment supports win pick
+    if pick in ["1", "2"]:
+        if line_val >= SYNERGY_POSITIVE_LINE and over_val < SYNERGY_POSITIVE_OVER_PRICE:
+            return SYNERGY_POSITIVE_MULTIPLIER
+        
+        # Negative synergy: low-scoring environment increases draw risk
+        if line_val <= SYNERGY_NEGATIVE_LINE:
+            return SYNERGY_NEGATIVE_MULTIPLIER
+    
+    return 1.0
+
+
+# ---------------------------------------------------------------------------
+# Market context extraction (Qbot Intelligence 2.0)
+# ---------------------------------------------------------------------------
+
+def _extract_market_context(match: dict | None, pick: str) -> dict:
+    """Extract odds_meta market data + stats from a match document.
+    
+    Fully null-safe: returns neutral defaults when data is unavailable.
+    """
+    default = {
+        "provider_count": 0,
+        "spread_pct": None,
+        "volatility_dim": "NA",
+        "h2h_current": {},
+        "h2h_max": {},
+        "h2h_min": {},
+        "market_trust_factor": VOLATILITY_DISCOUNT["NA"],
+        "stats": None,
+    }
+    if not match or not isinstance(match, dict):
+        return default
+
+    odds_meta = match.get("odds_meta") or {}
+    markets = odds_meta.get("markets") or {}
+    h2h_node = markets.get("h2h") or {}
+    
+    # Totals market data
+    totals_node = markets.get("totals") or {}
+    totals_current = totals_node.get("current") or {}
+    totals_provider_count = int(totals_node.get("provider_count") or 0)
+
+    h2h_current = h2h_node.get("current") or {}
+    h2h_max = h2h_node.get("max") or {}
+    h2h_min = h2h_node.get("min") or {}
+    provider_count = int(h2h_node.get("provider_count") or 0)
+
+    # Compute spread for the pick's outcome
+    spread_pct: float | None = None
+    volatility_dim = "NA"
+
+    current_val = h2h_current.get(pick)
+    max_val = h2h_max.get(pick)
+    min_val = h2h_min.get(pick)
+
+    if (
+        current_val is not None
+        and max_val is not None
+        and min_val is not None
+        and float(current_val) > 0
+    ):
+        spread_pct = (float(max_val) - float(min_val)) / float(current_val)
+        if spread_pct < VOLATILITY_STABLE_PCT:
+            volatility_dim = "stable"
+        elif spread_pct < VOLATILITY_EXTREME_PCT:
+            volatility_dim = "volatile"
+        else:
+            volatility_dim = "extreme"
+
+    # Market trust factor: provider depth × volatility discount
+    provider_factor = min(1.0, provider_count / 2.0) if provider_count > 0 else 0.5
+    vol_discount = VOLATILITY_DISCOUNT.get(volatility_dim, 0.90)
+    market_trust_factor = round(provider_factor * vol_discount, 4)
+
+    # Extract stats from match
+    stats = match.get("stats") if isinstance(match.get("stats"), dict) else None
+    result_node = match.get("result") if isinstance(match.get("result"), dict) else {}
+
+    def _safe_float(value: object, fallback: float = 0.0) -> float:
+        try:
+            return float(value or 0)
+        except (TypeError, ValueError):
+            return fallback
+    
+    # Temporal context extraction
+    match_date_hour = match.get("match_date_hour")
+    match_hour = None
+    is_weekend = True  # default to True (conservative)
+    is_midweek = False
+    temporal_dim = "day"  # default
+    
+    if match_date_hour:
+        # Ensure UTC handling (match_date_hour should already be UTC)
+        try:
+            # match_date_hour could be datetime or string, we'll assume it's a datetime
+            # with hour attribute, or we can parse it
+            if hasattr(match_date_hour, 'hour'):
+                match_hour = match_date_hour.hour
+                weekday = match_date_hour.weekday()  # Monday = 0, Sunday = 6
+                is_weekend = weekday >= 5  # Saturday (5) or Sunday (6)
+                is_midweek = weekday in [1, 2]  # Tuesday (1) or Wednesday (2)
+                temporal_dim = _get_temporal_dim(match_hour)
+        except (AttributeError, TypeError):
+            # Fallback if match_date_hour is not a datetime
+            pass
+
+    return {
+        "provider_count": provider_count,
+        "spread_pct": round(spread_pct, 4) if spread_pct is not None else None,
+        "volatility_dim": volatility_dim,
+        "h2h_current": h2h_current,
+        "h2h_max": h2h_max,
+        "h2h_min": h2h_min,
+        "market_trust_factor": market_trust_factor,
+        "xg_home": _safe_float(result_node.get("home_xg")),
+        "xg_away": _safe_float(result_node.get("away_xg")),
+        "stats": {
+            "shots_home": stats.get("shots_home") if stats else None,
+            "shots_away": stats.get("shots_away") if stats else None,
+            "cards_yellow_home": int(stats.get("cards_yellow_home", 0) or 0) if stats else 0,
+            "cards_yellow_away": int(stats.get("cards_yellow_away", 0) or 0) if stats else 0,
+            "cards_red_home": int(stats.get("cards_red_home", 0) or 0) if stats else 0,
+            "cards_red_away": int(stats.get("cards_red_away", 0) or 0) if stats else 0,
+            "red_card_minute": stats.get("red_card_minute") if stats else None,  # Future timestamp support
+            "corners_home": int(stats.get("corners_home", 0) or 0) if stats else 0,
+            "corners_away": int(stats.get("corners_away", 0) or 0) if stats else 0,
+            "fouls_home": int(stats.get("fouls_home", 0) or 0) if stats else 0,
+            "fouls_away": int(stats.get("fouls_away", 0) or 0) if stats else 0,
+            "xg_home": _safe_float(result_node.get("home_xg")),
+            "xg_away": _safe_float(result_node.get("away_xg")),
+        },
+        "market_move": {
+            "opening": h2h_node.get("opening", {}).get(pick),
+            "current": h2h_node.get("current", {}).get(pick),
+        },
+        # Qbot Intelligence 2.3 additions
+        "totals_line": totals_current.get("line"),
+        "totals_over": totals_current.get("over"),
+        "totals_provider_count": totals_provider_count,
+        "match_hour": match_hour,
+        "temporal_dim": temporal_dim,
+        "is_weekend": is_weekend,
+        "is_midweek": is_midweek,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Cluster key computation
 # ---------------------------------------------------------------------------
 
-def compute_cluster_key(tip: dict) -> str:
-    """Compute the signal cluster key for a tip document."""
+def compute_cluster_key(tip: dict, market_ctx: dict | None = None) -> str:
+    """Compute the signal cluster key for a tip document.
+    
+    v3 format: {sport_key}|{sharp_dim}|{edge_dim}|{momentum_dim}|{volatility_dim}|{temporal_dim}
+    """
     sport_key = tip.get("sport_key", "unknown")
-
     signals = tip.get("tier_signals", {})
 
     # Sharp dimension
@@ -103,7 +333,78 @@ def compute_cluster_key(tip: dict) -> str:
     gap = momentum.get("gap", 0.0)
     momentum_dim = "strong" if gap > MOMENTUM_GAP_STRONG else "weak"
 
-    return f"{sport_key}|{sharp_dim}|{edge_dim}|{momentum_dim}"
+    # Volatility dimension (from market context)
+    volatility_dim = "NA"
+    if market_ctx:
+        volatility_dim = market_ctx.get("volatility_dim", "NA")
+
+    # Temporal dimension (Qbot Intelligence 2.3)
+    temporal_dim = "day"  # default
+    if market_ctx:
+        temporal_dim = market_ctx.get("temporal_dim", "day")
+
+    return f"{sport_key}|{sharp_dim}|{edge_dim}|{momentum_dim}|{volatility_dim}|{temporal_dim}"
+
+
+def _lookup_cluster_with_fallback(
+    cluster_key: str, cluster_stats: dict[str, dict],
+) -> tuple[float, int, str]:
+    """Look up Bayesian confidence with hierarchical fallback.
+    
+    v3 cluster key format: {sport}|{sharp}|{edge}|{momentum}|{volatility}|{temporal}
+    
+    Fallback hierarchy:
+    1. Try full 6-dim key
+    2. Strip temporal (6th dimension) -> 5-dim key
+    3. Strip volatility (5th dimension) -> 4-dim key  
+    4. Ultimate fallback: pure prior
+    
+    Returns (bayesian_confidence, sample_size, used_key).
+    """
+    cluster = cluster_stats.get(cluster_key, {})
+    total = cluster.get("total", 0)
+
+    if total >= CLUSTER_MIN_SAMPLES:
+        return (
+            bayesian_win_rate(cluster.get("wins", 0), total),
+            total,
+            cluster_key,
+        )
+
+    # Hierarchical fallback levels
+    fallback_levels = []
+    
+    # Level 1: Strip temporal dimension (6th dimension)
+    if "|" in cluster_key:
+        parts = cluster_key.rsplit("|", 1)  # Strip last dimension (temporal)
+        if len(parts) == 2:
+            fallback_levels.append(parts[0])  # 5-dim key without temporal
+    
+    # Level 2: Strip volatility dimension (5th dimension, now last)
+    for parent_key in fallback_levels:
+        if "|" in parent_key:
+            grandparent_parts = parent_key.rsplit("|", 1)
+            if len(grandparent_parts) == 2:
+                fallback_levels.append(grandparent_parts[0])  # 4-dim key without volatility
+    
+    # Try each fallback level in order (most specific to least)
+    for fallback_key in fallback_levels:
+        # Aggregate all clusters that start with this prefix
+        agg_wins = 0
+        agg_total = 0
+        for k, v in cluster_stats.items():
+            if k.startswith(fallback_key + "|"):
+                agg_wins += v.get("wins", 0)
+                agg_total += v.get("total", 0)
+        if agg_total >= CLUSTER_MIN_SAMPLES:
+            return (
+                bayesian_win_rate(agg_wins, agg_total),
+                agg_total,
+                f"{fallback_key}|*",
+            )
+
+    # Ultimate fallback: pure prior
+    return bayesian_win_rate(0, 0), 0, cluster_key
 
 
 # ---------------------------------------------------------------------------
@@ -164,7 +465,7 @@ async def _get_cluster_stats() -> dict[str, dict]:
 # Archetype selection
 # ---------------------------------------------------------------------------
 
-def _select_archetype(tip: dict) -> tuple[str, str]:
+def _select_archetype(tip: dict, market_ctx: dict | None = None) -> tuple[str, str]:
     """Determine the dominant archetype from signal patterns.
 
     Returns (archetype_key, i18n_reasoning_key).
@@ -180,9 +481,19 @@ def _select_archetype(tip: dict) -> tuple[str, str]:
 
     # Priority-ordered archetype checks
 
-    # 1. Value Oracle: high edge + high confidence
+    # 1. Value Oracle: high edge + confidence + market ceiling check
     if edge > 12.0 and confidence > 0.65:
-        return "value_oracle", "qbot.reasoning.valueOracle"
+        is_near_ceiling = True  # default: pass if no market data
+        if market_ctx and market_ctx.get("h2h_current") and market_ctx.get("h2h_max"):
+            current_val = market_ctx["h2h_current"].get(pick)
+            max_val = market_ctx["h2h_max"].get(pick)
+            provider_count = market_ctx.get("provider_count", 0)
+            if current_val and max_val and provider_count >= 2:
+                is_near_ceiling = float(current_val) >= float(max_val) * 0.98
+            elif current_val and max_val:
+                is_near_ceiling = True  # low providers → don't block, just can't confirm
+        if is_near_ceiling:
+            return "value_oracle", "qbot.reasoning.valueOracle"
 
     # 2. Sharp Hunter: sharp movement agrees with pick
     if sharp.get("has_sharp_movement") and sharp.get("direction") == pick:
@@ -200,20 +511,196 @@ def _select_archetype(tip: dict) -> tuple[str, str]:
     if kings.get("has_kings_choice") and kings.get("kings_pick") == pick:
         return "kings_prophet", "qbot.reasoning.kingsProphet"
 
-    # 5. Contrarian: pick disagrees with market favorite
+    # 5. Steam Snatcher: CLV awareness - significant market movement
+    if market_ctx and market_ctx.get("market_move"):
+        opening = market_ctx["market_move"].get("opening")
+        current = market_ctx["market_move"].get("current")
+        if opening and current and float(current) < float(opening) * 0.90:
+            # Quote ist um mehr als 10% gefallen -> Markt-Vertrauen
+            return "steam_snatcher", "qbot.reasoning.steamSnatcher"
+
+    # 6. Contrarian: pick disagrees with market favorite
     imp = tip.get("implied_probability", 0.33)
     if imp < 0.50:  # our pick is the underdog (implied < 50%)
         return "contrarian", "qbot.reasoning.contrarian"
 
-    # 6. Steady Hand: fallback — balanced multi-signal
+    # 7. Night Owl: temporal bias for late games (>= 22:00 UTC)
+    if market_ctx:
+        match_hour = market_ctx.get("match_hour")
+        if match_hour is not None and match_hour >= 22:
+            return "night_owl", "qbot.reasoning.nightOwl"
+
+    # 8. Steady Hand: fallback — balanced multi-signal
     return "steady_hand", "qbot.reasoning.steadyHand"
+
+
+def _compute_post_match_reasoning(
+    tip: dict, stats: dict | None,
+) -> dict | None:
+    """Compute post-match anomaly reasoning with discipline validation and pressure/flow analytics."""
+    if not stats or tip.get("was_correct") is None:
+        return None
+
+    pick = tip.get("recommended_selection", "-")
+    was_correct = tip.get("was_correct", False)
+    
+    red_home = stats.get("cards_red_home", 0)
+    red_away = stats.get("cards_red_away", 0)
+
+    # 1. Check for Discipline Collapse (Single Team)
+    if not was_correct:
+        if (pick == "1" and red_home > 0 and red_away == 0) or (pick == "2" and red_away > 0 and red_home == 0):
+            return {
+                "type": "discipline_collapse",
+                "red_cards": red_home if pick == "1" else red_away,
+                "interpretation": "A red card invalidated the pre-match statistical edge. Performance was impaired by discipline issues."
+            }
+
+    # 2. Check for Total Collapse (Both Teams)
+    if red_home > 0 and red_away > 0:
+        return {
+            "type": "total_collapse", 
+            "red_cards_home": red_home,
+            "red_cards_away": red_away,
+            "interpretation": "Both teams received red cards, neutralizing numerical advantage. Falling back to statistical analysis."
+        }
+
+    # 3. xG-first post-match checks (Qbot Intelligence 2.4)
+    try:
+        xg_home = float(stats.get("xg_home", 0) or 0)
+    except (TypeError, ValueError):
+        xg_home = 0.0
+    try:
+        xg_away = float(stats.get("xg_away", 0) or 0)
+    except (TypeError, ValueError):
+        xg_away = 0.0
+
+    goals_home = None
+    goals_away = None
+    actual_result = tip.get("actual_result")
+    if isinstance(actual_result, str) and ":" in actual_result:
+        parts = actual_result.split(":", 1)
+        try:
+            goals_home = int(parts[0].strip())
+            goals_away = int(parts[1].strip())
+        except (TypeError, ValueError):
+            goals_home = None
+            goals_away = None
+
+    if goals_home is None or goals_away is None:
+        try:
+            goals_home = int(stats.get("goals_home")) if stats.get("goals_home") is not None else None
+            goals_away = int(stats.get("goals_away")) if stats.get("goals_away") is not None else None
+        except (TypeError, ValueError):
+            goals_home = None
+            goals_away = None
+
+    if (xg_home > 0 or xg_away > 0) and goals_home is not None and goals_away is not None:
+        efficiency_home = goals_home / max(xg_home, 0.01)
+        efficiency_away = goals_away / max(xg_away, 0.01)
+        max_eff = max(efficiency_home, efficiency_away)
+        if max_eff > XG_EFFICIENCY_THRESHOLD:
+            return {
+                "type": "clinical_efficiency",
+                "xg_home": round(xg_home, 3),
+                "xg_away": round(xg_away, 3),
+                "goals_home": goals_home,
+                "goals_away": goals_away,
+                "efficiency_home": round(efficiency_home, 3),
+                "efficiency_away": round(efficiency_away, 3),
+                "efficient_team": "home" if efficiency_home >= efficiency_away else "away",
+                "interpretation": "Clinical finishing exceeded chance quality expectations.",
+            }
+
+        xg_delta = abs(xg_home - xg_away)
+        if xg_delta > XG_BETRAYAL_DELTA_THRESHOLD:
+            expected_winner = "home" if xg_home > xg_away else "away"
+            if goals_home > goals_away:
+                actual_outcome = "home"
+            elif goals_away > goals_home:
+                actual_outcome = "away"
+            else:
+                actual_outcome = "draw"
+            if expected_winner != actual_outcome:
+                return {
+                    "type": "xg_betrayal",
+                    "xg_home": round(xg_home, 3),
+                    "xg_away": round(xg_away, 3),
+                    "xg_delta": round(xg_delta, 3),
+                    "goals_home": goals_home,
+                    "goals_away": goals_away,
+                    "expected_winner": expected_winner,
+                    "actual_outcome": actual_outcome,
+                    "interpretation": "Superior chance quality did not convert into the expected result.",
+                }
+
+    # 4. Pressure & Flow Analytics (Qbot Intelligence 2.2)
+    shots_home = stats.get("shots_home", 0)
+    shots_away = stats.get("shots_away", 0)
+    corners_home = stats.get("corners_home", 0)
+    corners_away = stats.get("corners_away", 0)
+    fouls_home = stats.get("fouls_home", 0)
+    fouls_away = stats.get("fouls_away", 0)
+    
+    # 4a. Pressure Index Check
+    pressure_home = (shots_home or 0) + (corners_home * 1.5)
+    pressure_away = (shots_away or 0) + (corners_away * 1.5)
+    
+    if not was_correct:
+        # Siege Failure: High pressure but no win
+        if pick == "1" and pressure_home > pressure_away * 1.8:
+            return {
+                "type": "siege_failure",
+                "pressure_home": pressure_home,
+                "pressure_away": pressure_away,
+                "interpretation": "High pressure (shots + corners) didn't convert into goals. Dominant performance, poor finishing."
+            }
+        elif pick == "2" and pressure_away > pressure_home * 1.8:
+            return {
+                "type": "siege_failure",
+                "pressure_home": pressure_home,
+                "pressure_away": pressure_away,
+                "interpretation": "High pressure (shots + corners) didn't convert into goals. Dominant performance, poor finishing."
+            }
+    
+    # 4b. Game Flow Check (Fouls)
+    total_fouls = (fouls_home or 0) + (fouls_away or 0)
+    if total_fouls > 30 and not was_correct:
+        return {
+            "type": "disrupted_flow",
+            "fouls_home": fouls_home,
+            "fouls_away": fouls_away,
+            "interpretation": "Extremely high foul count (30+) disrupted the game flow, penalizing the technical advantage."
+        }
+
+    # 5. Statistical Anomaly Detection (Shots) - Only if no discipline/xG reason exists
+    if shots_home is not None and shots_away is not None:
+        total_shots = shots_home + shots_away
+        if total_shots >= 5:
+            home_ratio = shots_home / total_shots
+            
+            # Dominant team lost (but check for red cards first)
+            if pick == "1" and home_ratio > SHOTS_RATIO_EXTREME and not was_correct:
+                return {"type": "home_dominant_lost", "interpretation": "Statistically correct tip — result was an outlier (shots dominance)."}
+            elif pick == "2" and (1 - home_ratio) > SHOTS_RATIO_EXTREME and not was_correct:
+                return {"type": "away_dominant_lost", "interpretation": "Statistically correct tip — result was an outlier (shots dominance)."}
+            
+            # Underdog won (Lucky result)
+            elif pick == "1" and home_ratio < (1 - SHOTS_RATIO_EXTREME) and was_correct:
+                return {"type": "home_underdog_won", "interpretation": "Lucky result — stats didn't support the pick."}
+            elif pick == "2" and (1 - home_ratio) < (1 - SHOTS_RATIO_EXTREME) and was_correct:
+                return {"type": "away_underdog_won", "interpretation": "Lucky result — stats didn't support the pick."}
+
+    return None
 
 
 # ---------------------------------------------------------------------------
 # Kelly stake calculation
 # ---------------------------------------------------------------------------
 
-def _compute_kelly_stake_single(tip: dict, dna: dict) -> tuple[float, float]:
+def _compute_kelly_stake_single(
+    tip: dict, dna: dict, market_ctx: dict | None = None,
+) -> tuple[float, float]:
     """Compute Kelly-based stake from a single DNA dict.
 
     Returns (stake_units, kelly_raw).
@@ -249,16 +736,30 @@ def _compute_kelly_stake_single(tip: dict, dna: dict) -> tuple[float, float]:
     implied_prob = tip.get("implied_probability", 0.33)
     odds = (1.0 / implied_prob) if implied_prob > 0.01 else 10.0
 
-    # Kelly with volatility buffer
+    # Kelly with volatility buffer (DNA-evolved)
     edge = confidence - implied_prob - vol_buffer
     denom = max(odds - 1.0, 0.01)
     kelly_raw = kelly_f * max(edge, 0.0) / denom
-    stake = min(kelly_raw, max_stake)
 
+    # Apply multiplicative market trust factor
+    if market_ctx:
+        kelly_raw *= market_ctx.get("market_trust_factor", 1.0)
+
+    # Qbot Intelligence 2.3: Apply market synergy multiplier
+    if market_ctx:
+        synergy_multiplier = _get_market_synergy(pick, market_ctx)
+        # Bound the multiplier to prevent extreme values
+        min_bound, max_bound = SYNERGY_MULTIPLIER_BOUNDS
+        synergy_multiplier = max(min_bound, min(max_bound, synergy_multiplier))
+        kelly_raw *= synergy_multiplier
+
+    stake = min(kelly_raw, max_stake)
     return round(stake, 2), round(kelly_raw, 4)
 
 
-def _compute_kelly_stake(tip: dict, strategy: dict) -> tuple[float, float]:
+def _compute_kelly_stake(
+    tip: dict, strategy: dict, market_ctx: dict | None = None,
+) -> tuple[float, float]:
     """Compute Kelly-based stake, supporting ensemble mode.
 
     Returns (stake_units, kelly_raw).
@@ -266,12 +767,11 @@ def _compute_kelly_stake(tip: dict, strategy: dict) -> tuple[float, float]:
     ensemble_dna = strategy.get("ensemble_dna")
 
     if ensemble_dna and len(ensemble_dna) > 1:
-        # Ensemble mode: compute Kelly for each bot, take median
         stakes = []
         raws = []
         for dna_list in ensemble_dna:
             dna = {_DNA_GENES[i]: v for i, v in enumerate(dna_list) if i < len(_DNA_GENES)}
-            s, r = _compute_kelly_stake_single(tip, dna)
+            s, r = _compute_kelly_stake_single(tip, dna, market_ctx)
             stakes.append(s)
             raws.append(r)
         stakes.sort()
@@ -282,7 +782,7 @@ def _compute_kelly_stake(tip: dict, strategy: dict) -> tuple[float, float]:
         return round(median_stake, 2), round(median_raw, 4)
     else:
         dna = strategy.get("dna", {})
-        return _compute_kelly_stake_single(tip, dna)
+        return _compute_kelly_stake_single(tip, dna, market_ctx)
 
 
 def _effective_dna_from_strategy(strategy: dict) -> tuple[dict, str]:
@@ -314,6 +814,7 @@ def _build_decision_trace(
     bayes_conf: float | None = None,
     stake_units: float | None = None,
     kelly_raw: float | None = None,
+    market_ctx: dict | None = None,
 ) -> dict:
     """Build a forensic decision trace for one tip."""
     edge_pct = float(tip.get("edge_pct", 0.0))
@@ -493,6 +994,23 @@ def _build_decision_trace(
             "final_stake": round(final_stake, 4),
             "stake_capped": stake_capped,
         },
+        "market_context": {
+            "provider_count": (market_ctx or {}).get("provider_count", 0),
+            "spread_pct": (market_ctx or {}).get("spread_pct"),
+            "volatility_dim": (market_ctx or {}).get("volatility_dim", "NA"),
+            "market_trust_factor": (market_ctx or {}).get("market_trust_factor", 1.0),
+            "xg_home": (market_ctx or {}).get("xg_home", 0.0),
+            "xg_away": (market_ctx or {}).get("xg_away", 0.0),
+            # Qbot Intelligence 2.3 additions
+            "totals_line": (market_ctx or {}).get("totals_line"),
+            "totals_over": (market_ctx or {}).get("totals_over"),
+            "totals_provider_count": (market_ctx or {}).get("totals_provider_count", 0),
+            "match_hour": (market_ctx or {}).get("match_hour"),
+            "temporal_dim": (market_ctx or {}).get("temporal_dim", "day"),
+            "is_weekend": (market_ctx or {}).get("is_weekend", True),
+            "is_midweek": (market_ctx or {}).get("is_midweek", False),
+            "synergy_factor": _get_market_synergy(pick, market_ctx) if market_ctx else 1.0,
+        } if market_ctx else None,
         "kill_point": kill_point,
     }
 
@@ -501,13 +1019,34 @@ def _build_decision_trace(
 # Main enrichment function
 # ---------------------------------------------------------------------------
 
-async def enrich_tip(tip: dict) -> dict:
+async def enrich_tip(tip: dict, match: dict | None = None) -> dict:
     """Enrich a tip document with qbot_logic field (dual-mode: investor + player).
 
     Active tips get both investor enrichment and player prediction.
     No-signal tips get only player prediction (investor fields are empty).
     Gracefully returns the tip unchanged if no active strategy exists.
+    
+    Args:
+        tip: The tip document to enrich.
+        match: The associated match document (odds_meta + stats).
+               If not provided, lazy-loads via match_id (with warning).
     """
+    # Lazy-load match if not passed (callers should pass it)
+    if match is None:
+        match_id_str = tip.get("match_id")
+        if match_id_str:
+            try:
+                match = await _db.db.matches.find_one(
+                    {"_id": ObjectId(match_id_str)},
+                    {"odds_meta": 1, "stats": 1, "result": 1},
+                )
+                logger.warning(
+                    "enrich_tip lazy-load for match=%s — caller should pass match",
+                    match_id_str,
+                )
+            except Exception:
+                logger.warning("Failed to lazy-load match %s", match_id_str, exc_info=True)
+
     strategy = await _get_active_strategy(tip.get("sport_key", "all"))
     if not strategy:
         # Still consume transient field
@@ -520,6 +1059,10 @@ async def enrich_tip(tip: dict) -> dict:
         tip.get("sport_key", ""), tip.get("sport_key", "")
     )
 
+    # Extract market context (null-safe)
+    pick = tip.get("recommended_selection", "-")
+    market_ctx = _extract_market_context(match, pick)
+
     # --- Investor enrichment (active tips only) ---
     investor_data = {}
     bayes_conf: float | None = None
@@ -527,15 +1070,13 @@ async def enrich_tip(tip: dict) -> dict:
     kelly_raw: float | None = None
     if not is_no_signal:
         cluster_stats = await _get_cluster_stats()
-        cluster_key = compute_cluster_key(tip)
-        cluster = cluster_stats.get(cluster_key, {})
+        cluster_key = compute_cluster_key(tip, market_ctx)
+        bayes_conf, cluster_total, used_cluster_key = _lookup_cluster_with_fallback(
+            cluster_key, cluster_stats,
+        )
 
-        cluster_wins = cluster.get("wins", 0)
-        cluster_total = cluster.get("total", 0)
-        bayes_conf = bayesian_win_rate(cluster_wins, cluster_total)
-
-        archetype, reasoning_key = _select_archetype(tip)
-        stake_units, kelly_raw = _compute_kelly_stake(tip, strategy)
+        archetype, reasoning_key = _select_archetype(tip, market_ctx)
+        stake_units, kelly_raw = _compute_kelly_stake(tip, strategy, market_ctx)
 
         signal_name = {
             "value_oracle": "Edge",
@@ -561,10 +1102,11 @@ async def enrich_tip(tip: dict) -> dict:
             "kelly_raw": kelly_raw,
             "bayesian_confidence": round(bayes_conf, 4),
             "cluster_key": cluster_key,
+            "cluster_key_used": used_cluster_key,
             "cluster_sample_size": cluster_total,
         }
 
-    # --- Player mode enrichment (always, when player_prediction available) ---
+    # --- Player mode enrichment (unchanged) ---
     player_data = None
     player_pred = tip.pop("player_prediction", None)
     if player_pred:
@@ -586,23 +1128,35 @@ async def enrich_tip(tip: dict) -> dict:
             "is_mandatory_tip": True,
         }
 
+    # --- Post-match reasoning (stats anomaly) ---
+    post_match = _compute_post_match_reasoning(tip, market_ctx.get("stats"))
+
     # --- Build combined qbot_logic ---
+    synergy_factor = _get_market_synergy(pick, market_ctx)
     qbot_logic: dict = {
         "strategy_version": strategy.get("version", "v1"),
         **investor_data,
-        "applied_at": datetime.now(timezone.utc),
+        "market_synergy_factor": round(synergy_factor, 4),
+        "market_trust_factor": round(float(market_ctx.get("market_trust_factor", 1.0)), 4),
+        "market_context": {
+            "volatility_dim": market_ctx.get("volatility_dim", "NA"),
+        },
+        "is_weekend": bool(market_ctx.get("is_weekend", True)),
+        "is_midweek": bool(market_ctx.get("is_midweek", False)),
+        "applied_at": utcnow(),
     }
-
     if player_data:
         qbot_logic["player"] = player_data
+    if post_match:
+        qbot_logic["post_match_reasoning"] = post_match
 
     tip["qbot_logic"] = qbot_logic
     tip["decision_trace"] = _build_decision_trace(
-        tip,
-        strategy,
+        tip, strategy,
         bayes_conf=bayes_conf,
         stake_units=stake_units,
         kelly_raw=kelly_raw,
+        market_ctx=market_ctx,
     )
     return tip
 
@@ -622,16 +1176,29 @@ async def update_cluster_stats() -> dict:
 
     query = {"status": "resolved", "was_correct": {"$ne": None}}
     projection = {
-        "sport_key": 1, "edge_pct": 1, "was_correct": 1, "tier_signals": 1,
+        "match_id": 1, "sport_key": 1, "edge_pct": 1, "was_correct": 1, "tier_signals": 1,
     }
 
     tips = await _db.db.quotico_tips.find(query, projection).to_list(length=100_000)
     logger.info("Computing cluster stats from %d resolved tips", len(tips))
 
+    # Batch pre-fetch matches for market context (match_id -> match)
+    match_ids = [ObjectId(t["match_id"]) for t in tips if t.get("match_id")]
+    matches_by_id: dict[str, dict] = {}
+    if match_ids:
+        matches = await _db.db.matches.find(
+            {"_id": {"$in": match_ids}},
+            {"odds_meta": 1, "stats": 1},
+        ).to_list(length=len(match_ids))
+        matches_by_id = {str(m["_id"]): m for m in matches}
+
     # Tally wins/total per cluster
     clusters: dict[str, dict] = {}
     for tip in tips:
-        key = compute_cluster_key(tip)
+        pick = tip.get("recommended_selection", "-")
+        match = matches_by_id.get(tip.get("match_id"))
+        market_ctx = _extract_market_context(match, pick)
+        key = compute_cluster_key(tip, market_ctx)
         if key not in clusters:
             clusters[key] = {"wins": 0, "total": 0, "sport_key": tip.get("sport_key")}
         clusters[key]["total"] += 1
@@ -639,7 +1206,7 @@ async def update_cluster_stats() -> dict:
             clusters[key]["wins"] += 1
 
     # Build upsert operations
-    now = datetime.now(timezone.utc)
+    now = utcnow()
     ops = []
     for key, stats in clusters.items():
         bwr = bayesian_win_rate(stats["wins"], stats["total"])
@@ -713,6 +1280,16 @@ async def backfill_enrich_tips(
     # Running tally: cluster_key → {wins, total}
     running_tally: dict[str, dict] = {}
 
+    # Batch pre-fetch matches for market context (match_id -> match)
+    match_ids = [ObjectId(t["match_id"]) for t in tips if t.get("match_id")]
+    matches_by_id: dict[str, dict] = {}
+    if match_ids:
+        matches = await _db.db.matches.find(
+            {"_id": {"$in": match_ids}},
+            {"odds_meta": 1, "stats": 1},
+        ).to_list(length=len(match_ids))
+        matches_by_id = {str(m["_id"]): m for m in matches}
+
     ops = []
     enriched = 0
 
@@ -736,6 +1313,12 @@ async def backfill_enrich_tips(
             "contrarian": "Contrarian", "steady_hand": "Multi-Signal",
         }.get(archetype, "Multi-Signal")
 
+        # Extract market context for this tip (null-safe)
+        pick = tip.get("recommended_selection", "-")
+        match = matches_by_id.get(tip.get("match_id"))
+        market_ctx = _extract_market_context(match, pick)
+
+        synergy_factor = _get_market_synergy(pick, market_ctx)
         qbot_logic = {
             "strategy_version": strategy.get("version", "v1"),
             "archetype": archetype,
@@ -752,8 +1335,16 @@ async def backfill_enrich_tips(
             "kelly_raw": kelly_raw,
             "bayesian_confidence": round(bayes_conf, 4),
             "cluster_key": cluster_key,
+            "cluster_key_used": cluster_key,
             "cluster_sample_size": tally["total"],
-            "applied_at": datetime.now(timezone.utc),
+            "market_synergy_factor": round(synergy_factor, 4),
+            "market_trust_factor": round(float(market_ctx.get("market_trust_factor", 1.0)), 4),
+            "market_context": {
+                "volatility_dim": market_ctx.get("volatility_dim", "NA"),
+            },
+            "is_weekend": bool(market_ctx.get("is_weekend", True)),
+            "is_midweek": bool(market_ctx.get("is_midweek", False)),
+            "applied_at": utcnow(),
         }
 
         ops.append(UpdateOne(

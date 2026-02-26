@@ -1,16 +1,30 @@
-"""Team identity registry service (Team-Tower)."""
+"""
+backend/app/services/team_registry_service.py
+
+Purpose:
+    Team identity registry (Team Tower) for resolving raw team names to
+    canonical ObjectIds with in-memory caching and auto-create fallback.
+
+Dependencies:
+    - app.database
+    - app.services.league_service
+    - app.utils
+"""
 
 import asyncio
 import logging
 import re
 import unicodedata
-from datetime import datetime, timezone
+from datetime import datetime
+from typing import Any
 
 from bson import ObjectId
 from pymongo.errors import DuplicateKeyError
 
 import app.database as _db
 from app.services.league_service import LeagueRegistry
+from app.utils.team_matching import teams_match
+from app.utils import utcnow
 
 logger = logging.getLogger("quotico.team_registry")
 
@@ -44,6 +58,44 @@ def normalize_team_name(raw: str) -> str:
     tokens = [t for t in tokens if t not in _NOISE_TOKENS]
     tokens.sort()
     return " ".join(tokens)
+
+
+def create_alias_suggestion(
+    provider: str,
+    external_team_id: str,
+    incoming_name: str,
+    matched_team_id: ObjectId,
+    matched_team_name: str,
+    sport_key: str | None = None,
+) -> dict[str, Any]:
+    """Create a standardized alias suggestion payload for dry-run admin reviews."""
+    return {
+        "provider": str(provider or "").strip().lower(),
+        "external_team_id": str(external_team_id or "").strip(),
+        "incoming_name": str(incoming_name or "").strip(),
+        "team_id": str(matched_team_id),
+        "team_name": str(matched_team_name or "").strip(),
+        "sport_key": str(sport_key or "").strip() or None,
+        "confidence": "high",
+        "reason": "name_mismatch",
+    }
+
+
+ALIAS_SUGGESTION_SAMPLE_REFS_LIMIT = 10
+
+
+def _external_id_query(source_key: str, external_id_text: str) -> dict[str, Any]:
+    """Build a robust external-id query that matches both string and legacy numeric values."""
+    field = f"external_ids.{source_key}"
+    values: list[Any] = [external_id_text]
+    if external_id_text.isdigit():
+        try:
+            values.append(int(external_id_text))
+        except ValueError:
+            pass
+    if len(values) == 1:
+        return {field: values[0]}
+    return {field: {"$in": values}}
 
 
 class TeamRegistry:
@@ -97,7 +149,7 @@ class TeamRegistry:
                     self._global_candidates.setdefault(a_norm, set()).add(team_id)
 
         self._rebuild_global_lookup()
-        self._last_refresh = datetime.now(timezone.utc)
+        self._last_refresh = utcnow()
         self._initialized = True
         logger.info(
             "TeamRegistry initialized: %d sport entries, %d global, %d ambiguous",
@@ -126,13 +178,20 @@ class TeamRegistry:
         self._refresh_task = None
         logger.info("TeamRegistry background refresh stopped")
 
-    async def resolve(self, raw_name: str, sport_key: str) -> ObjectId:
-        """Resolve team name to team identity with cache -> DB fallback -> create."""
+    async def resolve(
+        self,
+        raw_name: str,
+        sport_key: str,
+        create_if_missing: bool = True,
+    ) -> ObjectId | None:
+        """Resolve team name to team identity with cache -> DB fallback -> optional create."""
         if not self._initialized:
             await self.initialize()
 
         normalized = normalize_team_name(raw_name)
         if not normalized:
+            if not create_if_missing:
+                return None
             return await self._auto_create(raw_name, normalized, sport_key, reason="empty_normalization")
 
         # 1) Sport-scoped cache
@@ -153,8 +212,175 @@ class TeamRegistry:
             return team_id
 
         # 4) Auto-create (true miss)
+        if not create_if_missing:
+            return None
         reason = "global_ambiguous" if normalized in self._global_ambiguous else "no_match"
         return await self._auto_create(raw_name, normalized, sport_key, reason=reason)
+
+    async def resolve_by_external_id_or_name(
+        self,
+        source: str,
+        external_id: str,
+        name: str,
+        sport_key: str,
+        create_if_missing: bool = True,
+    ) -> ObjectId | None:
+        """Resolve team by provider external id first, then fallback to Team Tower name logic."""
+        source_key = (source or "").strip().lower()
+        external_id_text = str(external_id or "").strip()
+        if not source_key:
+            raise ValueError("source is required")
+
+        if external_id_text:
+            id_query = _external_id_query(source_key, external_id_text)
+            team_doc = await _db.db.teams.find_one(id_query, {"_id": 1, "display_name": 1, "aliases": 1})
+            if team_doc:
+                display_name = str(team_doc.get("display_name") or "")
+                aliases = [str(alias.get("name") or "") for alias in team_doc.get("aliases", []) if isinstance(alias, dict)]
+                names = [display_name, *aliases]
+                if name and any(teams_match(name, candidate) for candidate in names if candidate):
+                    return team_doc["_id"]
+                logger.warning(
+                    "Team external-id/name mismatch source=%s external_id=%s input_name=%s team_id=%s",
+                    source_key,
+                    external_id_text,
+                    name,
+                    str(team_doc.get("_id")),
+                )
+                return None
+
+        resolved = await self.resolve(name, sport_key, create_if_missing=create_if_missing)
+        if not resolved:
+            return None
+
+        if external_id_text and create_if_missing:
+            now = utcnow()
+            await _db.db.teams.update_one(
+                {"_id": resolved, f"external_ids.{source_key}": {"$exists": False}},
+                {"$set": {f"external_ids.{source_key}": external_id_text, "updated_at": now}},
+            )
+        return resolved
+
+    async def add_alias(
+        self,
+        team_id: ObjectId,
+        alias: str,
+        *,
+        sport_key: str | None = None,
+        source: str = "admin_alias_suggestion",
+        refresh_cache: bool = True,
+    ) -> bool:
+        """Add an alias idempotently to a team and refresh in-memory lookup cache."""
+        alias_text = str(alias or "").strip()
+        if not alias_text:
+            raise ValueError("Alias is empty")
+        normalized = normalize_team_name(alias_text)
+        if not normalized:
+            raise ValueError("Alias normalization is empty")
+
+        team = await _db.db.teams.find_one({"_id": team_id})
+        if not team:
+            raise ValueError("Team not found")
+
+        alias_sport_key = str(sport_key or team.get("sport_key") or "").strip() or None
+        for existing in team.get("aliases", []):
+            if not isinstance(existing, dict):
+                continue
+            if (
+                str(existing.get("normalized") or "") == normalized
+                and (existing.get("sport_key") or None) == alias_sport_key
+            ):
+                return False
+
+        alias_doc = {
+            "name": alias_text,
+            "normalized": normalized,
+            "sport_key": alias_sport_key,
+            "source": source,
+        }
+        now = utcnow()
+        await _db.db.teams.update_one(
+            {"_id": team_id},
+            {"$addToSet": {"aliases": alias_doc}, "$set": {"updated_at": now}},
+        )
+        if refresh_cache:
+            await self.initialize()
+        return True
+
+    async def record_alias_suggestion(
+        self,
+        *,
+        source: str,
+        raw_team_name: str,
+        sport_key: str | None = None,
+        league_id: ObjectId | None = None,
+        league_external_id: str | None = None,
+        reason: str = "unresolved_team",
+        sample_ref: dict[str, Any] | None = None,
+        suggested_team_id: ObjectId | None = None,
+        suggested_team_name: str | None = None,
+        confidence: float | None = None,
+    ) -> ObjectId | None:
+        """Persist or bump a pending alias suggestion (used by dry-runs and live imports)."""
+        source_key = str(source or "").strip().lower()
+        incoming_name = str(raw_team_name or "").strip()
+        normalized_name = normalize_team_name(incoming_name)
+        if not source_key or not incoming_name or not normalized_name:
+            return None
+
+        now = utcnow()
+        sport_value = str(sport_key or "").strip() or None
+        league_external = str(league_external_id or "").strip() or None
+        query: dict[str, Any] = {
+            "status": "pending",
+            "source": source_key,
+            "sport_key": sport_value,
+            "league_id": league_id,
+            "normalized_name": normalized_name,
+        }
+        set_fields: dict[str, Any] = {
+            "raw_team_name": incoming_name,
+            "reason": str(reason or "unresolved_team").strip().lower(),
+            "last_seen_at": now,
+            "updated_at": now,
+            "league_external_id": league_external,
+        }
+        if suggested_team_id is not None:
+            set_fields["suggested_team_id"] = suggested_team_id
+            set_fields["suggested_team_name"] = str(suggested_team_name or "").strip() or None
+        if confidence is not None:
+            set_fields["confidence"] = float(confidence)
+
+        update: dict[str, Any] = {
+            "$set": set_fields,
+            "$setOnInsert": {
+                "status": "pending",
+                "source": source_key,
+                "sport_key": sport_value,
+                "league_id": league_id,
+                "normalized_name": normalized_name,
+                "first_seen_at": now,
+                "created_at": now,
+                "sample_refs": [],
+            },
+            "$inc": {"seen_count": 1},
+        }
+        if isinstance(sample_ref, dict) and sample_ref:
+            update["$setOnInsert"].pop("sample_refs", None)
+            ref_doc = dict(sample_ref)
+            ref_doc["ts"] = now
+            update["$push"] = {
+                "sample_refs": {
+                    "$each": [ref_doc],
+                    "$slice": -ALIAS_SUGGESTION_SAMPLE_REFS_LIMIT,
+                }
+            }
+
+        result = await _db.db.team_alias_suggestions.update_one(query, update, upsert=True)
+        if result.upserted_id is not None:
+            return result.upserted_id
+        doc = await _db.db.team_alias_suggestions.find_one(query, {"_id": 1})
+        return doc.get("_id") if doc else None
 
     async def _db_lookup(self, normalized: str, sport_key: str) -> ObjectId | None:
         """Check DB for team created by another worker since cache load."""
@@ -181,7 +407,7 @@ class TeamRegistry:
         self, raw_name: str, normalized: str, sport_key: str, *, reason: str
     ) -> ObjectId:
         """Create team doc with race-safe duplicate handling across workers."""
-        now = datetime.now(timezone.utc)
+        now = utcnow()
 
         existing = self.lookup_by_sport.get((normalized, sport_key))
         if existing:
@@ -295,7 +521,7 @@ class TeamRegistry:
             added += 1
 
         self._rebuild_global_lookup()
-        self._last_refresh = datetime.now(timezone.utc)
+        self._last_refresh = utcnow()
         self._stats["refreshes"] += 1
         self._stats["refresh_teams_loaded"] += added
 

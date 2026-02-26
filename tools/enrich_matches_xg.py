@@ -44,25 +44,6 @@ logging.basicConfig(
 log = logging.getLogger("enrich_xg")
 
 
-def parse_season_spec(spec: str | None) -> list[int]:
-    """Parse season specification.
-
-    None → current season only
-    "2024" → [2024]
-    "2014-2025" → [2014, 2015, ..., 2025]
-    """
-    if spec is None:
-        from app.services.team_mapping_service import derive_season_year
-        from app.utils import utcnow
-        return [derive_season_year(utcnow())]
-
-    if "-" in spec:
-        start, end = spec.split("-", 1)
-        return list(range(int(start), int(end) + 1))
-
-    return [int(spec)]
-
-
 async def run_enrichment(
     sport_key: str | None,
     season_spec: str | None,
@@ -71,25 +52,19 @@ async def run_enrichment(
 ) -> None:
     import app.database as _db
     from app.services.xg_enrichment_service import (
-        match_and_enrich,
-        SPORT_KEY_TO_UNDERSTAT,
-        SUPPORTED_SPORT_KEYS,
+        enrich_matches,
+        list_xg_target_sport_keys,
+        parse_season_spec,
     )
 
     await _db.connect_db()
     log.info("Connected to MongoDB: %s", _db.db.name)
 
     # Determine target leagues
-    if sport_key:
-        if sport_key not in SPORT_KEY_TO_UNDERSTAT:
-            log.error(
-                "Sport key %s not supported for xG enrichment. Supported: %s",
-                sport_key, SUPPORTED_SPORT_KEYS,
-            )
-            return
-        target_leagues = [sport_key]
-    else:
-        target_leagues = SUPPORTED_SPORT_KEYS
+    target_leagues = await list_xg_target_sport_keys(sport_key)
+    if not target_leagues:
+        log.error("No eligible leagues found for xG enrichment.")
+        return
 
     # Determine target seasons
     seasons = parse_season_spec(season_spec)
@@ -115,7 +90,7 @@ async def run_enrichment(
             t0 = time.monotonic()
 
             try:
-                result = await match_and_enrich(
+                result = await enrich_matches(
                     league, season_year, dry_run=dry_run, force=force,
                 )
             except Exception as e:

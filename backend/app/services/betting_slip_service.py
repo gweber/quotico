@@ -1,9 +1,14 @@
-"""Betting slip service — unified slip management for all game modes.
+"""
+backend/app/services/betting_slip_service.py
 
-All 7 game modes write to the `betting_slips` collection. This service handles:
-- Draft lifecycle: create, edit legs, submit, discard
-- Mode-specific creation: classic, bankroll, over/under, parlay, survivor, fantasy
-- Query and serialization
+Purpose:
+    Unified betting slip service for all game modes. Handles draft lifecycle,
+    validation, lock-in, and submission using aggregated odds from odds_meta.
+
+Dependencies:
+    - app.database
+    - app.services.matchday_service
+    - app.services.odds_meta_service
 """
 
 import logging
@@ -19,6 +24,7 @@ from pymongo.errors import DuplicateKeyError
 from app.config import settings
 import app.database as _db
 from app.services.matchday_service import LOCK_MINUTES, is_match_locked
+from app.services.odds_meta_service import build_legacy_like_odds
 from app.services.team_registry_service import TeamRegistry
 from app.utils import ensure_utc, utcnow
 
@@ -116,7 +122,7 @@ async def create_slip(
             )
 
         # Get odds for the market
-        odds_data = match.get("odds", {})
+        odds_data = build_legacy_like_odds(match)
         market = sel.get("market", "h2h")
 
         if market == "h2h":
@@ -233,7 +239,7 @@ async def create_slip_internal(
     if not match or match.get("status") != "scheduled":
         return None
 
-    odds = match.get("odds", {}).get("h2h", {})
+    odds = build_legacy_like_odds(match).get("h2h", {})
     locked_odds = odds.get(prediction)
     if not locked_odds:
         return None
@@ -346,7 +352,7 @@ async def create_or_get_draft(
 
 def _get_current_odds(match: dict, market: str, pick: str) -> float | None:
     """Get current server-side odds for a match + market + pick."""
-    odds = match.get("odds", {})
+    odds = build_legacy_like_odds(match)
     if market == "h2h":
         return odds.get("h2h", {}).get(pick)
     elif market == "totals":
@@ -449,7 +455,7 @@ async def patch_selection(
             "status": "draft",
         }
         if market == "totals":
-            totals = match.get("odds", {}).get("totals", {})
+            totals = build_legacy_like_odds(match).get("totals", {})
             sel["line"] = totals.get("line", 2.5)
 
         await _db.db.betting_slips.update_one(
@@ -654,7 +660,7 @@ async def create_bankroll_bet(
         raise HTTPException(status.HTTP_400_BAD_REQUEST, f"Minimum bet is {min_bet}.")
 
     # Lock odds + drift guard
-    odds = match.get("odds", {}).get("h2h", {})
+    odds = build_legacy_like_odds(match).get("h2h", {})
     locked_odds = odds.get(prediction)
     if not locked_odds:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, f"Invalid prediction '{prediction}'.")
@@ -750,7 +756,7 @@ async def create_over_under_bet(
     if prediction not in ("over", "under"):
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Prediction must be 'over' or 'under'.")
 
-    totals = match.get("odds", {}).get("totals", {})
+    totals = build_legacy_like_odds(match).get("totals", {})
     locked_odds = totals.get(prediction)
     if not locked_odds:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "No over/under odds available.")
@@ -865,14 +871,14 @@ async def create_parlay(
         displayed = leg["displayed_odds"]
 
         if prediction in ("over", "under"):
-            totals = match.get("odds", {}).get("totals", {})
+            totals = build_legacy_like_odds(match).get("totals", {})
             locked_odds = totals.get(prediction)
             if not locked_odds:
                 raise HTTPException(status.HTTP_400_BAD_REQUEST, f"No O/U odds for match {leg['match_id']}.")
             market = "totals"
             line = totals.get("line", 2.5)
         else:
-            h2h = match.get("odds", {}).get("h2h", {})
+            h2h = build_legacy_like_odds(match).get("h2h", {})
             locked_odds = h2h.get(prediction)
             if not locked_odds:
                 raise HTTPException(status.HTTP_400_BAD_REQUEST, f"Invalid prediction '{prediction}'.")

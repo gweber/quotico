@@ -1,4 +1,14 @@
-"""Matchday mode: scoring, predictions, and auto-bet logic."""
+"""
+backend/app/services/matchday_service.py
+
+Purpose:
+    Matchday scoring, prediction locking, and auto-bet helper logic based on
+    canonical match identity and aggregated odds_meta data.
+
+Dependencies:
+    - app.database
+    - app.services.odds_meta_service
+"""
 
 import logging
 from datetime import timedelta
@@ -9,6 +19,7 @@ from fastapi import HTTPException, status
 from pymongo.errors import DuplicateKeyError
 
 import app.database as _db
+from app.services.odds_meta_service import build_legacy_like_odds
 from app.utils import ensure_utc, utcnow
 
 logger = logging.getLogger("quotico.matchday_service")
@@ -56,7 +67,7 @@ def calculate_points(
 
 def _favorite_prediction(match: dict) -> tuple[int, int]:
     """Predict based on odds favorite, fallback to 1:1."""
-    odds = match.get("odds", {}).get("h2h", {})
+    odds = build_legacy_like_odds(match).get("h2h", {})
     home_odds = odds.get("1", 0)
     away_odds = odds.get("2", 0)
 

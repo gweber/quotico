@@ -1,4 +1,15 @@
-"""Parlay (combo bet) — combine 3 bets, multiply odds."""
+"""
+backend/app/services/parlay_service.py
+
+Purpose:
+    Parlay betting service for multi-leg bets with aggregated odds_meta market
+    validation and optional wallet funding integration.
+
+Dependencies:
+    - app.database
+    - app.services.wallet_service
+    - app.services.odds_meta_service
+"""
 
 import logging
 import math
@@ -9,6 +20,7 @@ from pymongo.errors import DuplicateKeyError
 
 import app.database as _db
 from app.models.wallet import BetStatus
+from app.services.odds_meta_service import build_legacy_like_odds
 from app.services import wallet_service
 from app.utils import utcnow, ensure_utc
 
@@ -78,12 +90,12 @@ async def create_parlay(
 
         # Determine which odds map to use
         if prediction in ("over", "under"):
-            totals = match.get("odds", {}).get("totals", {})
+            totals = build_legacy_like_odds(match).get("totals", {})
             if not totals or prediction not in totals:
                 raise HTTPException(status.HTTP_400_BAD_REQUEST, f"No over/under odds for match {leg['match_id']}.")
             locked_odds = totals[prediction]
         else:
-            current_odds = match.get("odds", {}).get("h2h", {})
+            current_odds = build_legacy_like_odds(match).get("h2h", {})
             if prediction not in current_odds:
                 raise HTTPException(status.HTTP_400_BAD_REQUEST, f"Invalid prediction '{prediction}'.")
             locked_odds = current_odds[prediction]

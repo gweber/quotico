@@ -44,8 +44,10 @@ const cards = [
   { to: "/admin/battles", label: "Battle Management", icon: "\u2694\uFE0F" },
   { to: "/admin/audit", label: "Audit Log", icon: "\uD83D\uDCDC" },
   { to: "/admin/providers", label: "Provider Status", icon: "\uD83D\uDCE1" },
+  { to: "/admin/event-bus", label: "QBus Monitor", icon: "\uD83D\uDE9A" },
+  { to: "/admin/time-machine-justice", label: "Time Machine Justice", icon: "\u23F2\uFE0F" },
   { to: "/admin/leagues", label: "League Tower", icon: "\uD83D\uDCCA" },
-  { to: "/admin/team-aliases", label: "Team Aliases", icon: "\uD83C\uDFAF" },
+  { to: "/admin/team-tower", label: "Team Tower", icon: "\uD83C\uDFAF" },
   { to: "/admin/qbot-lab", label: "Qbot Lab", icon: "\uD83E\uDDEC" },
 ];
 </script>

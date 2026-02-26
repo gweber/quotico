@@ -1,3 +1,15 @@
+"""
+backend/app/providers/openligadb.py
+
+Purpose:
+    OpenLigaDB adapter for German competitions (Bundesliga, 2. Bundesliga)
+    with normalized payloads for finished/live/matchday/season ingest paths.
+
+Dependencies:
+    - app.providers.http_client
+    - app.utils
+"""
+
 import logging
 import time
 from datetime import datetime
@@ -6,10 +18,12 @@ from app.utils import parse_utc, utcnow
 from typing import Any, Optional
 
 from app.providers.http_client import ResilientClient
+from app.services.provider_rate_limiter import provider_rate_limiter
+from app.services.provider_settings_service import provider_settings_service
 
 logger = logging.getLogger("quotico.openligadb")
 
-BASE_URL = "https://api.openligadb.de"
+PROVIDER_NAME = "openligadb"
 
 # German football leagues supported
 SPORT_TO_LEAGUE = {
@@ -31,6 +45,28 @@ class OpenLigaDBProvider:
         self._client = ResilientClient("openligadb")
         self._cache: dict[str, dict[str, Any]] = {}
         self._cache_ttl = 300  # 5 min for finished, overridden for live
+        self._runtime_fingerprint: tuple[float, int, float] | None = None
+
+    async def _runtime(self, sport_key: str | None = None) -> dict[str, Any]:
+        payload = await provider_settings_service.get_effective(
+            PROVIDER_NAME,
+            sport_key=sport_key,
+            include_secret=False,
+        )
+        effective = dict(payload.get("effective_config") or {})
+        timeout = float(effective.get("timeout_seconds") or 15.0)
+        retries = int(effective.get("max_retries") or 3)
+        base_delay = float(effective.get("base_delay_seconds") or 10.0)
+        fp = (timeout, retries, base_delay)
+        if fp != self._runtime_fingerprint:
+            if hasattr(self._client, "_max_retries"):
+                self._client._max_retries = retries
+            if hasattr(self._client, "_base_delay"):
+                self._client._base_delay = base_delay
+            if hasattr(self._client, "_client"):
+                self._client._client.timeout = timeout
+            self._runtime_fingerprint = fp
+        return effective
 
     def _get_cached(self, key: str, ttl: Optional[int] = None) -> Optional[list[dict]]:
         entry = self._cache.get(key)
@@ -53,10 +89,17 @@ class OpenLigaDBProvider:
             return cached
 
         try:
+            runtime = await self._runtime(sport_key=sport_key)
+            if not bool(runtime.get("enabled", True)):
+                return []
+            base_url = str(runtime.get("base_url") or "")
+            if not base_url:
+                return []
+            await provider_rate_limiter.acquire(PROVIDER_NAME, runtime.get("rate_limit_rpm"))
             season = _current_season()
 
             # Current matchday
-            resp = await self._client.get(f"{BASE_URL}/getmatchdata/{league}")
+            resp = await self._client.get(f"{base_url}/getmatchdata/{league}")
             resp.raise_for_status()
             current_matches = resp.json()
 
@@ -65,8 +108,9 @@ class OpenLigaDBProvider:
             if current_matches:
                 group_id = current_matches[0].get("group", {}).get("groupOrderID")
                 if group_id and group_id > 1:
+                    await provider_rate_limiter.acquire(PROVIDER_NAME, runtime.get("rate_limit_rpm"))
                     resp2 = await self._client.get(
-                        f"{BASE_URL}/getmatchdata/{league}/{season}/{group_id - 1}"
+                        f"{base_url}/getmatchdata/{league}/{season}/{group_id - 1}"
                     )
                     if resp2.status_code == 200:
                         all_matches.extend(resp2.json())
@@ -126,7 +170,14 @@ class OpenLigaDBProvider:
             return cached
 
         try:
-            resp = await self._client.get(f"{BASE_URL}/getmatchdata/{league}")
+            runtime = await self._runtime(sport_key=sport_key)
+            if not bool(runtime.get("enabled", True)):
+                return []
+            base_url = str(runtime.get("base_url") or "")
+            if not base_url:
+                return []
+            await provider_rate_limiter.acquire(PROVIDER_NAME, runtime.get("rate_limit_rpm"))
+            resp = await self._client.get(f"{base_url}/getmatchdata/{league}")
             resp.raise_for_status()
             matches = resp.json()
 
@@ -201,7 +252,14 @@ class OpenLigaDBProvider:
             return cached[0]["matchday_number"] if cached else None
 
         try:
-            resp = await self._client.get(f"{BASE_URL}/getmatchdata/{league}")
+            runtime = await self._runtime(sport_key=sport_key)
+            if not bool(runtime.get("enabled", True)):
+                return None
+            base_url = str(runtime.get("base_url") or "")
+            if not base_url:
+                return None
+            await provider_rate_limiter.acquire(PROVIDER_NAME, runtime.get("rate_limit_rpm"))
+            resp = await self._client.get(f"{base_url}/getmatchdata/{league}")
             resp.raise_for_status()
             matches = resp.json()
             if not matches:
@@ -228,8 +286,15 @@ class OpenLigaDBProvider:
             return cached
 
         try:
+            runtime = await self._runtime(sport_key=sport_key)
+            if not bool(runtime.get("enabled", True)):
+                return []
+            base_url = str(runtime.get("base_url") or "")
+            if not base_url:
+                return []
+            await provider_rate_limiter.acquire(PROVIDER_NAME, runtime.get("rate_limit_rpm"))
             resp = await self._client.get(
-                f"{BASE_URL}/getmatchdata/{league}/{season}/{matchday_number}"
+                f"{base_url}/getmatchdata/{league}/{season}/{matchday_number}"
             )
             resp.raise_for_status()
             raw = resp.json()
@@ -271,6 +336,66 @@ class OpenLigaDBProvider:
             logger.error(
                 "OpenLigaDB matchday error for %s/%d/%d: %s",
                 sport_key, season, matchday_number, e,
+            )
+            stale = self._cache.get(cache_key)
+            return stale["data"] if stale else []
+
+    async def get_season_matches(
+        self,
+        league_shortcut: str,
+        season: int,
+    ) -> list[dict[str, Any]]:
+        """Fetch all matches for a league season and normalize fields for import services."""
+        cache_key = f"season:{league_shortcut}:{season}"
+        cached = self._get_cached(cache_key, ttl=3600)
+        if cached is not None:
+            return cached
+
+        try:
+            runtime = await self._runtime()
+            if not bool(runtime.get("enabled", True)):
+                return []
+            base_url = str(runtime.get("base_url") or "")
+            if not base_url:
+                return []
+            await provider_rate_limiter.acquire(PROVIDER_NAME, runtime.get("rate_limit_rpm"))
+            resp = await self._client.get(f"{base_url}/getmatchdata/{league_shortcut}/{season}")
+            resp.raise_for_status()
+            raw = resp.json()
+            if not isinstance(raw, list):
+                return []
+
+            rows: list[dict[str, Any]] = []
+            for match in raw:
+                results = match.get("matchResults", [])
+                full_time = next((r for r in results if r.get("resultTypeID") == 2), None)
+                half_time = next((r for r in results if r.get("resultTypeID") == 1), None)
+                rows.append(
+                    {
+                        "match_id": str(match.get("matchID", match.get("matchId")) or ""),
+                        "utc_date": str(match.get("matchDateTimeUTC", match.get("matchDateTime", "")) or ""),
+                        "home_team_id": str(match.get("team1", {}).get("teamId") or ""),
+                        "home_team_name": str(match.get("team1", {}).get("teamName") or ""),
+                        "away_team_id": str(match.get("team2", {}).get("teamId") or ""),
+                        "away_team_name": str(match.get("team2", {}).get("teamName") or ""),
+                        "matchday": match.get("group", {}).get("groupOrderID"),
+                        "is_finished": bool(match.get("matchIsFinished", False)),
+                        "home_score": full_time.get("pointsTeam1") if isinstance(full_time, dict) else None,
+                        "away_score": full_time.get("pointsTeam2") if isinstance(full_time, dict) else None,
+                        "half_time_home": half_time.get("pointsTeam1") if isinstance(half_time, dict) else None,
+                        "half_time_away": half_time.get("pointsTeam2") if isinstance(half_time, dict) else None,
+                        "season": int(season),
+                    }
+                )
+
+            self._set_cache(cache_key, rows)
+            return rows
+        except Exception as exc:
+            logger.error(
+                "OpenLigaDB season error league=%s season=%s: %s",
+                league_shortcut,
+                season,
+                exc,
             )
             stale = self._cache.get(cache_key)
             return stale["data"] if stale else []

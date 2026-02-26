@@ -1,22 +1,43 @@
-import asyncio
-import logging
-from datetime import datetime, timedelta, timezone
-from typing import Optional
+"""
+backend/app/routers/ws.py
 
+Purpose:
+    WebSocket router exposing legacy live-score streaming and the new
+    authenticated qbus realtime stream endpoint.
+
+Dependencies:
+    - app.services.auth_service
+    - app.services.websocket_manager
+    - app.services.match_service
+    - app.providers.football_data
+    - app.providers.openligadb
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+from datetime import timedelta
+from typing import Any, Optional
+
+from bson import ObjectId
 from jwt.exceptions import InvalidTokenError
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 import app.database as _db
+from app.config import settings
 from app.utils import parse_utc
 from app.services.auth_service import decode_jwt
 from app.services.match_service import sports_with_live_action, next_kickoff_in
+from app.services.websocket_manager import websocket_manager
 from app.providers.football_data import (
     SPORT_TO_COMPETITION,
     football_data_provider,
-    teams_match,
 )
 from app.providers.openligadb import openligadb_provider, SPORT_TO_LEAGUE
+from app.utils.team_matching import teams_match
 
 logger = logging.getLogger("quotico.ws")
 
@@ -25,10 +46,9 @@ router = APIRouter()
 MAX_WS_CONNECTIONS = 500
 
 # Adaptive polling intervals (seconds)
-_INTERVAL_LIVE = 30         # matches in progress → 30s
-_INTERVAL_PRE_GAME = 120    # kickoff within 30 min → 2 min
-_INTERVAL_DORMANT = 900     # nothing for next 6h → 15 min heartbeat
-_INTERVAL_DEAD_ZONE = None  # nothing today → stop polling (wake on next connect)
+_INTERVAL_LIVE = 30         # matches in progress -> 30s
+_INTERVAL_PRE_GAME = 120    # kickoff within 30 min -> 2 min
+_INTERVAL_DORMANT = 900     # nothing for next 6h -> 15 min heartbeat
 
 
 class LiveScoreManager:
@@ -48,17 +68,17 @@ class LiveScoreManager:
         self.connections.append(ws)
         logger.info("WS client connected (%d total)", len(self.connections))
 
-        # Start polling if first connection
         if len(self.connections) == 1:
             self._start_polling()
 
-        # Send current scores immediately
         if self._last_scores:
             try:
-                await ws.send_json({
-                    "type": "live_scores",
-                    "data": list(self._last_scores.values()),
-                })
+                await ws.send_json(
+                    {
+                        "type": "live_scores",
+                        "data": list(self._last_scores.values()),
+                    }
+                )
             except Exception:
                 pass
 
@@ -66,8 +86,6 @@ class LiveScoreManager:
         if ws in self.connections:
             self.connections.remove(ws)
         logger.info("WS client disconnected (%d remaining)", len(self.connections))
-
-        # Stop polling if no connections
         if not self.connections and self._poll_task:
             self._poll_task.cancel()
             self._poll_task = None
@@ -77,56 +95,35 @@ class LiveScoreManager:
             self._poll_task = asyncio.create_task(self._poll_loop())
 
     async def _poll_loop(self) -> None:
-        """Adaptive poll loop: adjusts interval based on match schedule.
-
-        Intervals:
-        - Active Play (matches live):     30s, poll only active sports
-        - Pre-Game (kickoff within 30m):  2 min, DB check only
-        - Dormant (nothing for 6h):       15 min heartbeat
-        - Dead Zone (nothing today):      stop polling entirely
-        """
         while self.connections:
             try:
                 live_sports = await sports_with_live_action()
-
                 if live_sports:
-                    # Active Play — poll only sports with live matches
                     await self._fetch_and_broadcast(live_sports)
                     interval = _INTERVAL_LIVE
                 else:
-                    # Nothing live — clear stale scores
                     if self._last_scores:
                         self._last_scores = {}
                         await self._broadcast_empty()
-
-                    # Determine wake-up schedule
                     upcoming = await next_kickoff_in()
                     if upcoming and upcoming < timedelta(minutes=30):
                         interval = _INTERVAL_PRE_GAME
-                        logger.debug("WS pre-game: kickoff in %s, checking every %ds", upcoming, interval)
                     elif upcoming and upcoming < timedelta(hours=6):
                         interval = _INTERVAL_DORMANT
-                        logger.debug("WS dormant: next kickoff in %s, heartbeat every %ds", upcoming, interval)
                     else:
-                        # Dead Zone — nothing today, stop polling
-                        logger.info("WS dead zone: no matches upcoming, stopping poll loop")
                         self._poll_task = None
-                        return  # exits the loop; _start_polling re-creates on next connect
-
+                        return
             except asyncio.CancelledError:
                 break
-            except Exception as e:
-                logger.error("WS poll error: %s", e)
-                interval = _INTERVAL_LIVE  # on error, keep trying at normal rate
-
+            except Exception as exc:
+                logger.error("WS poll error: %s", exc)
+                interval = _INTERVAL_LIVE
             await asyncio.sleep(interval)
 
     async def _fetch_and_broadcast(self, live_sports: set[str]) -> None:
         new_scores: dict[str, dict] = {}
-
         for sport_key in live_sports:
             live_data: list[dict] = []
-
             try:
                 if sport_key in SPORT_TO_LEAGUE:
                     live_data = await openligadb_provider.get_live_scores(sport_key)
@@ -143,15 +140,10 @@ class LiveScoreManager:
                 if matched:
                     new_scores[matched["match_id"]] = matched
 
-        # Detect changes
         changed = new_scores != self._last_scores
         self._last_scores = new_scores
-
         if changed and self.connections:
-            message = {
-                "type": "live_scores",
-                "data": list(new_scores.values()),
-            }
+            message = {"type": "live_scores", "data": list(new_scores.values())}
             dead: list[WebSocket] = []
             for ws in self.connections:
                 try:
@@ -162,7 +154,6 @@ class LiveScoreManager:
                 self.disconnect(ws)
 
     async def _broadcast_empty(self) -> None:
-        """Broadcast empty scores when all matches have ended."""
         if not self.connections:
             return
         message = {"type": "live_scores", "data": []}
@@ -176,13 +167,9 @@ class LiveScoreManager:
             self.disconnect(ws)
 
     async def broadcast_match_resolved(self, match_id: str, result: str) -> None:
-        """Notify clients when a match is resolved."""
         if not self.connections:
             return
-        message = {
-            "type": "match_resolved",
-            "data": {"match_id": match_id, "result": result},
-        }
+        message = {"type": "match_resolved", "data": {"match_id": match_id, "result": result}}
         dead: list[WebSocket] = []
         for ws in self.connections:
             try:
@@ -193,13 +180,9 @@ class LiveScoreManager:
             self.disconnect(ws)
 
     async def broadcast_odds_updated(self, sport_key: str, odds_changed: int) -> None:
-        """Notify clients that odds have been refreshed so they can re-fetch."""
         if not self.connections:
             return
-        message = {
-            "type": "odds_updated",
-            "data": {"sport_key": sport_key, "odds_changed": odds_changed},
-        }
+        message = {"type": "odds_updated", "data": {"sport_key": sport_key, "odds_changed": odds_changed}}
         dead: list[WebSocket] = []
         for ws in self.connections:
             try:
@@ -211,24 +194,23 @@ class LiveScoreManager:
 
 
 async def _match_to_db(sport_key: str, score: dict) -> Optional[dict]:
-    """Match a live score to a DB match."""
     utc_date = score.get("utc_date", "")
-    if isinstance(utc_date, str) and utc_date:
-        try:
-            match_time = parse_utc(utc_date)
-        except ValueError:
-            return None
-    else:
+    if not isinstance(utc_date, str) or not utc_date:
+        return None
+    try:
+        match_time = parse_utc(utc_date)
+    except ValueError:
         return None
 
-    candidates = await _db.db.matches.find({
-        "sport_key": sport_key,
-        "match_date": {
-            "$gte": match_time - timedelta(hours=6),
-            "$lte": match_time + timedelta(hours=6),
-        },
-    }).to_list(length=50)
-
+    candidates = await _db.db.matches.find(
+        {
+            "sport_key": sport_key,
+            "match_date": {
+                "$gte": match_time - timedelta(hours=6),
+                "$lte": match_time + timedelta(hours=6),
+            },
+        }
+    ).to_list(length=50)
     for candidate in candidates:
         home = candidate.get("home_team", "")
         if teams_match(home, score.get("home_team", "")):
@@ -239,25 +221,58 @@ async def _match_to_db(sport_key: str, score: dict) -> Optional[dict]:
                 "minute": score.get("minute"),
                 "sport_key": sport_key,
             }
-
     return None
 
 
-# Singleton manager
+def _token_from_ws(websocket: WebSocket) -> str | None:
+    cookie_token = websocket.cookies.get("access_token")
+    if cookie_token:
+        return str(cookie_token)
+    query_token = websocket.query_params.get("token")
+    if query_token:
+        return str(query_token)
+    return None
+
+
+async def _resolve_ws_user(token: str | None) -> dict[str, Any] | None:
+    if not token:
+        return None
+    try:
+        payload = decode_jwt(token)
+    except InvalidTokenError:
+        return None
+    if payload.get("type") != "access":
+        return None
+    user_id = payload.get("sub")
+    if not user_id:
+        return None
+    try:
+        oid = ObjectId(str(user_id))
+    except Exception:
+        return None
+    jti = payload.get("jti")
+    if jti:
+        blocked = await _db.db.access_blocklist.find_one({"jti": jti}, {"_id": 1})
+        if blocked:
+            return None
+    user = await _db.db.users.find_one({"_id": oid, "is_deleted": False}, {"_id": 1, "is_banned": 1})
+    if not user or user.get("is_banned"):
+        return None
+    return user
+
+
 live_manager = LiveScoreManager()
 
 
 @router.websocket("/ws/live-scores")
 async def websocket_live_scores(ws: WebSocket):
-    # Optional auth — live scores are public, but identify user if token present
     token = ws.cookies.get("access_token")
     if token:
         try:
             decode_jwt(token)
         except InvalidTokenError:
-            pass  # proceed as guest
+            pass
 
-    # Connection cap
     if live_manager.is_full:
         await ws.close(code=4002, reason="Too many connections")
         return
@@ -265,12 +280,68 @@ async def websocket_live_scores(ws: WebSocket):
     await live_manager.connect(ws)
     try:
         while True:
-            # Keep connection alive, handle client messages
             data = await ws.receive_text()
-            # Client can send "ping" to keep alive
             if data == "ping":
                 await ws.send_text("pong")
     except WebSocketDisconnect:
         live_manager.disconnect(ws)
     except Exception:
         live_manager.disconnect(ws)
+
+
+@router.websocket("/ws")
+async def websocket_event_stream(ws: WebSocket):
+    """
+    Authenticated realtime event stream for qbus events.
+
+    Auth:
+        - Cookie `access_token` (preferred)
+        - Query parameter `token` (fallback)
+    """
+    if not settings.WS_EVENTS_ENABLED:
+        await ws.close(code=4403, reason="WS events disabled")
+        return
+    token = _token_from_ws(ws)
+    user = await _resolve_ws_user(token)
+    if not user:
+        await ws.close(code=4401, reason="Unauthorized")
+        return
+
+    try:
+        connection_id = await websocket_manager.connect(ws, user_id=str(user["_id"]))
+    except RuntimeError:
+        await ws.close(code=4002, reason="Too many connections")
+        return
+
+    try:
+        await ws.send_json({"type": "connected", "data": {"connection_id": connection_id}})
+        while True:
+            raw = await ws.receive_text()
+            await websocket_manager.touch(connection_id)
+            if raw == "ping":
+                await ws.send_json({"type": "pong"})
+                continue
+
+            try:
+                message = json.loads(raw)
+            except json.JSONDecodeError:
+                await ws.send_json({"type": "error", "error": "invalid_json"})
+                continue
+            command_type = str(message.get("type") or "").strip()
+            if command_type == "ping":
+                await ws.send_json({"type": "pong"})
+                continue
+            if command_type not in {"subscribe", "unsubscribe", "replace_subscriptions"}:
+                await ws.send_json({"type": "error", "error": "unsupported_command"})
+                continue
+
+            try:
+                filters = await websocket_manager.update_filters(connection_id, command_type, message)
+                await ws.send_json({"type": "subscribed", "data": {"filters": filters}})
+            except Exception:
+                await ws.send_json({"type": "error", "error": "invalid_subscription_payload"})
+    except WebSocketDisconnect:
+        await websocket_manager.disconnect(connection_id)
+    except Exception:
+        await websocket_manager.disconnect(connection_id)
+

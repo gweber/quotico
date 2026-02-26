@@ -65,6 +65,8 @@ No test suite exists yet. The frontend uses TypeScript strict mode as its primar
 - **Admin strategy detail route:** `/admin/qbot-lab/:strategyId` provides a dedicated strategy screen with identity switching/activation, full backtest chart, ledger table, and CSV export based on `/api/admin/qbot/strategies/{id}` + `/backtest` + `/backtest/ledger`.
 - **Decision traceability:** QTip enrichment now persists a `decision_trace` object per tip (engine metrics, matched strategy metadata, DNA filter checks, risk-stage calculations, and explicit kill-point), and tip detail UI renders this as a step-by-step decision journey.
 - **Admin trace deep-link:** Dedicated admin route `/admin/qtips/:matchId` renders a linkable QTip Decision Trace detail view (`frontend/src/views/admin/AdminQtipTraceView.vue`) using the shared `DecisionJourney` component.
+- **Season import jobs (football-data/OpenLigaDB):** async admin endpoints `/api/admin/leagues/{league_id}/import-football-data-season/async` and `/api/admin/leagues/{league_id}/import-openligadb-season/async` persist progress/counters in `admin_import_jobs`, expose conflict previews + dry-run alias suggestions, and support alias application via `POST /api/admin/teams/alias-suggestions/apply`.
+- **Event bus V1:** in-process reactive bus (`backend/app/services/event_bus.py`) publishes match/odds domain events from ingest services and dispatches to subscriber handlers under `backend/app/services/event_handlers/`; qbus monitor endpoints are `GET /api/admin/event-bus/status`, `GET /api/admin/event-bus/history`, and `GET /api/admin/event-bus/handlers`, with contract docs in `backend/docs/event_bus_v1.md`.
 
 ### Frontend — Vue 3 + TypeScript
 - **Build:** Vite with `@vitejs/plugin-vue`
@@ -129,13 +131,20 @@ Defined in `.env` at project root (see `.env.example`). Key vars:
 - `MONGO_URI`, `MONGO_DB` — database connection
 - `JWT_SECRET`, `JWT_SECRET_OLD` — token signing (OLD for rotation)
 - `ENCRYPTION_KEY`, `ENCRYPTION_KEY_OLD` — Fernet encryption for 2FA secrets
-- `ODDSAPIKEY`, `FOOTBALL_DATA_API_KEY` — external data providers
+- `ODDSAPIKEY`, `FOOTBALL_DATA__ORG_API_KEY` — external data providers
 - `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` — OAuth
 - `BACKEND_CORS_ORIGINS`, `COOKIE_SECURE` — security settings (dev.sh overrides these locally)
+
+### Provider Quotas (Reference)
+- `api-football.com` — free tier: `100/day`
+- `football-data.org` — free tier: `10/min`
+- `oddsapi` — `20k/month`
 
 ## Production
 
 - Nginx reverse proxy with TLS (Let's Encrypt), rate limiting (5 req/min auth, 30 req/s API)
 - Systemd service (`quotico.service`) runs uvicorn on 127.0.0.1:4201
 - Frontend built to static files served by Nginx with SPA fallback
-- WebSocket endpoint at `/ws` for live scores
+- WebSocket endpoints:
+  - `/ws/live-scores` legacy live score stream
+  - `/ws` authenticated qbus realtime event stream (`odds.ingested`, `match.updated`, `match.finalized`)

@@ -1,4 +1,15 @@
-"""Bankroll mode — place coin bets on match outcomes."""
+"""
+backend/app/services/bankroll_service.py
+
+Purpose:
+    Bankroll betting logic with wallet accounting and odds validation based on
+    aggregated match odds_meta markets.
+
+Dependencies:
+    - app.database
+    - app.services.wallet_service
+    - app.services.odds_meta_service
+"""
 
 import logging
 
@@ -8,6 +19,7 @@ from fastapi import HTTPException, status
 import app.database as _db
 from app.models.game_mode import GAME_MODE_DEFAULTS
 from app.models.wallet import BetStatus
+from app.services.odds_meta_service import build_legacy_like_odds
 from app.services import wallet_service
 from app.utils import utcnow, ensure_utc
 
@@ -52,7 +64,7 @@ async def place_bet(
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Bets only for upcoming matches.")
 
     # Validate prediction
-    current_odds = match.get("odds", {}).get("h2h", {})
+    current_odds = build_legacy_like_odds(match).get("h2h", {})
     if prediction not in current_odds:
         valid = ", ".join(current_odds.keys())
         raise HTTPException(status.HTTP_400_BAD_REQUEST, f"Invalid prediction. Allowed: {valid}")

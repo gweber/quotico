@@ -1,4 +1,14 @@
-"""Backtest simulation utilities for Qbot strategy admin endpoints."""
+"""
+backend/app/services/qbot_backtest_service.py
+
+Purpose:
+    Backtest and simulation utilities for Qbot strategy admin endpoints, arena
+    projections, and historical performance reconstruction.
+
+Dependencies:
+    - app.database
+    - app.utils
+"""
 
 from __future__ import annotations
 
@@ -295,10 +305,10 @@ async def simulate_strategy_backtest(
     if object_ids:
         matches = await _db.db.matches.find(
             {"_id": {"$in": object_ids}},
-            {"_id": 1, "odds.h2h": 1},
+            {"_id": 1, "odds_meta.markets.h2h.current": 1},
         ).to_list(length=len(object_ids))
         for m in matches:
-            h2h = ((m.get("odds") or {}).get("h2h") or {})
+            h2h = (((m.get("odds_meta") or {}).get("markets") or {}).get("h2h") or {}).get("current", {})
             odds_by_match[str(m["_id"])] = {
                 "1": float(h2h.get("1", 0.0)) if h2h.get("1") is not None else 0.0,
                 "X": float(h2h.get("X", 0.0)) if h2h.get("X") is not None else 0.0,

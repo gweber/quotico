@@ -1,8 +1,14 @@
-"""QuoticoTip EV Engine — 3-tier hybrid scoring model.
+"""
+backend/app/services/quotico_tip_service.py
 
-Combines Poisson-based true probabilities, form/momentum scoring,
-sharp line-movement detection, and community consensus ("King's Choice")
-to identify value bets where bookmaker odds are mispriced.
+Purpose:
+    QuoticoTip EV engine with Poisson, momentum, sharp movement, and EVD
+    signals. Computes value-bet recommendations using Team Tower IDs.
+
+Dependencies:
+    - app.database
+    - app.services.historical_service
+    - app.services.team_registry_service
 """
 
 import logging
@@ -20,7 +26,8 @@ from app.services.historical_service import (
     build_match_context,
     sport_keys_for,
 )
-from app.services.team_mapping_service import resolve_team_key
+from app.services.odds_meta_service import get_current_market
+from app.services.team_registry_service import TeamRegistry
 from app.utils import ensure_utc, utcnow
 
 logger = logging.getLogger("quotico.quotico_tip")
@@ -343,11 +350,11 @@ def compute_player_prediction(poisson: dict) -> dict:
     }
 
 
-async def _get_rest_days(team_key: str, match_date: datetime) -> int:
+async def _get_rest_days(team_id: str, match_date: datetime) -> int:
     """Compute days since last competitive match (across ALL competitions)."""
     last_match = await _db.db.matches.find_one(
         {
-            "$or": [{"home_team_key": team_key}, {"away_team_key": team_key}],
+            "$or": [{"home_team_id": team_id}, {"away_team_id": team_id}],
             "status": "final",
             "match_date": {"$lt": ensure_utc(match_date)},
         },
@@ -420,11 +427,11 @@ async def _get_league_averages(
 
 
 async def _get_team_home_matches(
-    team_key: str, related_keys: list[str], limit: int = N_TEAM_MATCHES,
+    team_id: str, related_keys: list[str], limit: int = N_TEAM_MATCHES,
     *, before_date: datetime | None = None,
 ) -> list[dict]:
     """Fetch team's last N home matches (goals scored/conceded)."""
-    query: dict = {"home_team_key": team_key, "sport_key": {"$in": related_keys}, "status": "final"}
+    query: dict = {"home_team_id": team_id, "sport_key": {"$in": related_keys}, "status": "final"}
     if before_date:
         query["match_date"] = {"$lt": before_date}
     return await _db.db.matches.find(
@@ -435,11 +442,11 @@ async def _get_team_home_matches(
 
 
 async def _get_team_away_matches(
-    team_key: str, related_keys: list[str], limit: int = N_TEAM_MATCHES,
+    team_id: str, related_keys: list[str], limit: int = N_TEAM_MATCHES,
     *, before_date: datetime | None = None,
 ) -> list[dict]:
     """Fetch team's last N away matches (goals scored/conceded)."""
-    query: dict = {"away_team_key": team_key, "sport_key": {"$in": related_keys}, "status": "final"}
+    query: dict = {"away_team_id": team_id, "sport_key": {"$in": related_keys}, "status": "final"}
     if before_date:
         query["match_date"] = {"$lt": before_date}
     return await _db.db.matches.find(
@@ -450,8 +457,8 @@ async def _get_team_away_matches(
 
 
 async def compute_poisson_probabilities(
-    home_team_key: str,
-    away_team_key: str,
+    home_team_id: str,
+    away_team_id: str,
     sport_key: str,
     related_keys: list[str],
     *,
@@ -477,8 +484,8 @@ async def compute_poisson_probabilities(
         return None
 
     # Fetch team-specific data
-    home_home_matches = await _get_team_home_matches(home_team_key, related_keys, before_date=before_date)
-    away_away_matches = await _get_team_away_matches(away_team_key, related_keys, before_date=before_date)
+    home_home_matches = await _get_team_home_matches(home_team_id, related_keys, before_date=before_date)
+    away_away_matches = await _get_team_away_matches(away_team_id, related_keys, before_date=before_date)
 
     if len(home_home_matches) < MIN_MATCHES_REQUIRED or len(away_away_matches) < MIN_MATCHES_REQUIRED:
         return None
@@ -525,8 +532,8 @@ async def compute_poisson_probabilities(
         lambda_away = global_weight * lambda_away + h2h_weight_used * h2h_lambdas["lambda_away"]
 
     # Rest advantage: reduce expected goals for fatigued team
-    home_rest = await _get_rest_days(home_team_key, ensure_utc(match_date))
-    away_rest = await _get_rest_days(away_team_key, ensure_utc(match_date))
+    home_rest = await _get_rest_days(home_team_id, ensure_utc(match_date))
+    away_rest = await _get_rest_days(away_team_id, ensure_utc(match_date))
     home_mod, away_mod = _calculate_fatigue_penalty(home_rest, away_rest)
     lambda_home *= home_mod
     lambda_away *= away_mod
@@ -626,7 +633,7 @@ def _compute_h2h_lambdas(
 
         # Adjust perspective: match home_team may be current away_team
         m_result = m.get("result", {})
-        if m.get("home_team_key") == home_key:
+        if m.get("home_team_id") == home_key:
             sum_home_goals += blend_goals(m_result.get("home_score", 0), m_result.get("home_xg")) * weight
             sum_away_goals += blend_goals(m_result.get("away_score", 0), m_result.get("away_xg")) * weight
         else:
@@ -673,7 +680,7 @@ def compute_edge(true_prob: float, implied_prob: float) -> float:
 # ---------------------------------------------------------------------------
 
 async def compute_momentum_score(
-    team_key: str,
+    team_id: str,
     form_matches: list[dict],
     related_keys: list[str],
     *,
@@ -690,8 +697,8 @@ async def compute_momentum_score(
         m_result = m.get("result", {})
         hg = m_result.get("home_score", 0)
         ag = m_result.get("away_score", 0)
-        h_key = m.get("home_team_key", "")
-        is_home = h_key == team_key
+        h_key = m.get("home_team_id", "")
+        is_home = h_key == team_id
 
         # Determine result for this team
         if is_home:
@@ -700,7 +707,7 @@ async def compute_momentum_score(
             points = 3 if ag > hg else (1 if ag == hg else 0)
 
         # Opponent strength weight from historical odds
-        opponent_weight = await _get_opponent_strength_weight(m, team_key, related_keys, before_date=before_date)
+        opponent_weight = await _get_opponent_strength_weight(m, team_id, related_keys, before_date=before_date)
 
         recency_w = MOMENTUM_DECAY ** i
         combined_w = recency_w * opponent_weight
@@ -718,12 +725,12 @@ async def compute_momentum_score(
 
 
 async def _get_opponent_strength_weight(
-    match: dict, team_key: str, related_keys: list[str],
+    match: dict, team_id: str, related_keys: list[str],
     *, before_date: datetime | None = None,
 ) -> float:
     """Estimate opponent strength from their historical odds."""
-    h_key = match.get("home_team_key", "")
-    opponent_key = match.get("away_team_key", "") if h_key == team_key else h_key
+    h_key = match.get("home_team_id", "")
+    opponent_key = match.get("away_team_id", "") if h_key == team_id else h_key
 
     if not opponent_key:
         return 1.0
@@ -732,32 +739,28 @@ async def _get_opponent_strength_weight(
     opp_query: dict = {
         "sport_key": {"$in": related_keys},
         "status": "final",
-        "$or": [{"home_team_key": opponent_key}, {"away_team_key": opponent_key}],
-        "odds.bookmakers": {"$ne": None},
+        "$or": [{"home_team_id": opponent_key}, {"away_team_id": opponent_key}],
+        "odds_meta.markets.h2h.current": {"$exists": True, "$ne": {}},
     }
     if before_date:
         opp_query["match_date"] = {"$lt": before_date}
     recent = await _db.db.matches.find_one(
         opp_query,
-        {"odds.bookmakers": 1},
+        {"odds_meta.markets.h2h.current": 1},
         sort=[("match_date", -1)],
     )
 
-    if not recent or not recent.get("odds", {}).get("bookmakers"):
+    if not recent:
         return 1.0
 
-    # Use first bookmaker's odds to gauge opponent strength
-    for _bk, entry in recent["odds"]["bookmakers"].items():
-        if isinstance(entry, dict):
-            # Strong team → low home odds → higher weight for beating them
-            home_odds = entry.get("home", 2.0)
-            if home_odds < 1.5:
-                return 1.5  # Beat a strong favorite
-            elif home_odds < 2.0:
-                return 1.2
-            elif home_odds > 3.0:
-                return 0.7  # Beat a weak underdog
-            return 1.0
+    h2h = (((recent.get("odds_meta") or {}).get("markets") or {}).get("h2h") or {}).get("current") or {}
+    home_odds = h2h.get("1", 2.0)
+    if home_odds < 1.5:
+        return 1.5
+    elif home_odds < 2.0:
+        return 1.2
+    elif home_odds > 3.0:
+        return 0.7
     return 1.0
 
 
@@ -771,7 +774,7 @@ async def detect_sharp_movement(
     *,
     before_date: datetime | None = None,
 ) -> dict:
-    """Analyze odds snapshots for significant line movement."""
+    """Analyze odds events for significant line movement."""
     default = {
         "has_sharp_movement": False,
         "direction": None,
@@ -787,12 +790,31 @@ async def detect_sharp_movement(
         "snapshot_count": 0,
     }
 
-    snap_query: dict = {"match_id": match_id}
+    from bson import ObjectId
+
+    snap_query: dict = {"match_id": ObjectId(match_id), "market": "h2h"}
     if before_date:
         snap_query["snapshot_at"] = {"$lt": before_date}
-    snapshots = await _db.db.odds_snapshots.find(
+    events = await _db.db.odds_events.find(
         snap_query,
-    ).sort("snapshot_at", 1).to_list(length=200)
+        {"snapshot_at": 1, "provider": 1, "selection_key": 1, "price": 1},
+    ).sort("snapshot_at", 1).to_list(length=5000)
+
+    grouped: dict[datetime, dict[str, list[float]]] = {}
+    for ev in events:
+        ts = ensure_utc(ev["snapshot_at"])
+        grouped.setdefault(ts, {}).setdefault(str(ev.get("selection_key") or ""), []).append(float(ev.get("price") or 0))
+
+    snapshots = []
+    for ts in sorted(grouped.keys()):
+        row = grouped[ts]
+        odds = {}
+        for key in ("1", "X", "2"):
+            vals = [v for v in row.get(key, []) if v > 0]
+            if vals:
+                odds[key] = sum(vals) / len(vals)
+        if odds:
+            snapshots.append({"snapshot_at": ts, "odds": odds})
 
     if len(snapshots) < 3:
         default["snapshot_count"] = len(snapshots)
@@ -991,7 +1013,7 @@ async def compute_kings_choice(match_id: str, *, before_date: datetime | None = 
 # ---------------------------------------------------------------------------
 
 async def compute_team_evd(
-    team_key: str,
+    team_id: str,
     related_keys: list[str],
     n: int = N_TEAM_MATCHES,
     *,
@@ -1009,12 +1031,12 @@ async def compute_team_evd(
     # Fetch last n matches (home + away) that have odds data
     query: dict = {
         "$or": [
-            {"home_team_key": team_key},
-            {"away_team_key": team_key},
+            {"home_team_id": team_id},
+            {"away_team_id": team_id},
         ],
         "sport_key": {"$in": related_keys},
         "status": "final",
-        "odds.bookmakers": {"$exists": True, "$ne": None},
+        "odds_meta.markets.h2h.current": {"$exists": True, "$ne": {}},
     }
     if before_date:
         query["match_date"] = {"$lt": before_date}
@@ -1022,8 +1044,9 @@ async def compute_team_evd(
     matches = await _db.db.matches.find(
         query,
         {
-            "_id": 0, "home_team_key": 1, "away_team_key": 1,
-            "result.home_score": 1, "result.away_score": 1, "result.outcome": 1, "odds.bookmakers": 1,
+            "_id": 0, "home_team_id": 1, "away_team_id": 1,
+            "result.home_score": 1, "result.away_score": 1, "result.outcome": 1,
+            "odds_meta.markets.h2h.current": 1,
         },
     ).sort("match_date", -1).to_list(length=n * 2)  # fetch extra, filter below
 
@@ -1035,21 +1058,11 @@ async def compute_team_evd(
             break
 
         # Determine perspective and extract team odds
-        is_home = m.get("home_team_key") == team_key
-        odds_dict = m.get("odds", {}).get("bookmakers", {})
-
-        # Find the first bookmaker entry with usable odds
-        team_odds: float | None = None
-        for _bk, entry in odds_dict.items():
-            if not isinstance(entry, dict):
-                continue
-            if is_home:
-                team_odds = entry.get("home")
-            else:
-                team_odds = entry.get("away")
-            if team_odds and team_odds > 1.0:
-                break
-            team_odds = None
+        is_home = m.get("home_team_id") == team_id
+        h2h = (((m.get("odds_meta") or {}).get("markets") or {}).get("h2h") or {}).get("current") or {}
+        team_odds: float | None = h2h.get("1") if is_home else h2h.get("2")
+        if team_odds is not None:
+            team_odds = float(team_odds)
 
         if not team_odds:
             continue
@@ -1297,7 +1310,7 @@ def _build_justification(
 async def generate_quotico_tip(match: dict, *, before_date: datetime | None = None) -> dict:
     """Generate a QuoticoTip for a single match."""
     sport_key = match["sport_key"]
-    current_odds = match.get("odds", {}).get("h2h", {})
+    current_odds = get_current_market(match, "h2h")
 
     # Load engine params (includes reliability if analyzed)
     engine_params = await _get_engine_params(sport_key)
@@ -1309,14 +1322,14 @@ async def generate_quotico_tip(match: dict, *, before_date: datetime | None = No
     away_team = match["away_team"]
     match_id = str(match["_id"])
 
-    # Resolve team keys
-    home_key = await resolve_team_key(home_team, related_keys)
-    away_key = await resolve_team_key(away_team, related_keys)
-    if not home_key or not away_key:
+    team_registry = TeamRegistry.get()
+    home_team_id = match.get("home_team_id") or await team_registry.resolve(home_team, sport_key)
+    away_team_id = match.get("away_team_id") or await team_registry.resolve(away_team, sport_key)
+    if not home_team_id or not away_team_id:
         missing = []
-        if not home_key:
+        if not home_team_id:
             missing.append(home_team)
-        if not away_key:
+        if not away_team_id:
             missing.append(away_team)
         return _no_signal_bet(match, f"Team not resolved: {', '.join(missing)}")
 
@@ -1327,11 +1340,11 @@ async def generate_quotico_tip(match: dict, *, before_date: datetime | None = No
     h2h_matches = h2h_data["matches"] if h2h_data else []
 
     # Compute H2H lambdas for Poisson blend
-    h2h_lambdas = _compute_h2h_lambdas(h2h_matches, home_key, away_key) if h2h_matches else None
+    h2h_lambdas = _compute_h2h_lambdas(h2h_matches, home_team_id, away_team_id) if h2h_matches else None
 
     # Tier 1: Dixon-Coles Poisson (with H2H blend + rest advantage)
     poisson = await compute_poisson_probabilities(
-        home_key, away_key, sport_key, related_keys,
+        home_team_id, away_team_id, sport_key, related_keys,
         match_date=match["match_date"], h2h_lambdas=h2h_lambdas, before_date=before_date,
     )
     if not poisson:
@@ -1363,8 +1376,8 @@ async def generate_quotico_tip(match: dict, *, before_date: datetime | None = No
     home_form = context.get("home_form") or []
     away_form = context.get("away_form") or []
 
-    home_momentum = await compute_momentum_score(home_key, home_form, related_keys, before_date=before_date)
-    away_momentum = await compute_momentum_score(away_key, away_form, related_keys, before_date=before_date)
+    home_momentum = await compute_momentum_score(home_team_id, home_form, related_keys, before_date=before_date)
+    away_momentum = await compute_momentum_score(away_team_id, away_form, related_keys, before_date=before_date)
     momentum_gap = abs(home_momentum["momentum_score"] - away_momentum["momentum_score"])
 
     # Tier 3: Sharp Movement
@@ -1375,8 +1388,8 @@ async def generate_quotico_tip(match: dict, *, before_date: datetime | None = No
     kings = await compute_kings_choice(match_id, before_date=before_date)
 
     # EVD: Beat the Books
-    evd_home = await compute_team_evd(home_key, related_keys, before_date=before_date)
-    evd_away = await compute_team_evd(away_key, related_keys, before_date=before_date)
+    evd_home = await compute_team_evd(home_team_id, related_keys, before_date=before_date)
+    evd_away = await compute_team_evd(away_team_id, related_keys, before_date=before_date)
 
     # Rest advantage signal
     rest_diff = poisson["home_rest_days"] - poisson["away_rest_days"]

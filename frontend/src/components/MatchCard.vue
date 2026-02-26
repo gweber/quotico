@@ -171,7 +171,7 @@ const statusClass = computed(() => {
 </script>
 
 <template>
-  <article class="bg-surface-1 rounded-card p-4 border border-surface-3/50 hover:border-surface-3 transition-colors">
+  <article class="relative bg-surface-1 rounded-card p-4 border border-surface-3/50 hover:border-surface-3 transition-colors">
     <!-- Header: date, countdown, status -->
     <div class="flex items-start justify-between mb-3">
       <div class="space-y-1">
@@ -333,5 +333,11 @@ const statusClass = computed(() => {
       :home-team="match.home_team"
       :away-team="match.away_team"
     />
+    <p
+      v-if="auth.isAdmin"
+      class="absolute bottom-2 left-2 rounded border border-surface-3/70 bg-surface-2/80 px-1.5 py-0.5 text-[10px] font-mono text-text-muted"
+    >
+      {{ $t("match.adminMatchId", { id: match.id }) }}
+    </p>
   </article>
 </template>

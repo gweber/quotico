@@ -1,4 +1,15 @@
-"""Resolve parlay bets for completed matches."""
+"""
+backend/app/workers/parlay_resolver.py
+
+Purpose:
+    Resolver worker for parlay bets on finalized matches using aggregated
+    totals/h2h odds context from odds_meta.
+
+Dependencies:
+    - app.database
+    - app.services.wallet_service
+    - app.services.odds_meta_service
+"""
 
 import logging
 
@@ -6,6 +17,7 @@ from bson import ObjectId
 
 import app.database as _db
 from app.models.wallet import BetStatus
+from app.services.odds_meta_service import build_legacy_like_odds
 from app.services import wallet_service
 from app.utils import utcnow
 from app.workers._state import recently_synced, set_synced
@@ -64,7 +76,7 @@ async def resolve_parlays() -> None:
                     continue
 
                 total_goals = match_result["home_score"] + match_result["away_score"]
-                totals = match.get("odds", {}).get("totals", {})
+                totals = build_legacy_like_odds(match).get("totals", {})
                 line = totals.get("line", 2.5)
 
                 if total_goals > line:

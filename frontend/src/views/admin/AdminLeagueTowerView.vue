@@ -9,10 +9,10 @@ Dependencies:
     - app.services.admin_service
 -->
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref } from "vue";
+import { computed, onMounted, onUnmounted, reactive, ref } from "vue";
 import { useI18n } from "vue-i18n";
 import draggable from "vuedraggable";
-import { useApi } from "@/composables/useApi";
+import { HttpError, useApi } from "@/composables/useApi";
 import { useToast } from "@/composables/useToast";
 
 interface LeagueFeatures {
@@ -27,16 +27,79 @@ interface LeagueItem {
   sport_key: string;
   display_name: string;
   structure_type: "league" | "cup" | "tournament";
+  season_start_month: number;
   country_code: string | null;
   current_season: number;
   ui_order: number;
   is_active: boolean;
   features: LeagueFeatures;
   external_ids: Record<string, string>;
+  football_data_last_import_at: string | null;
+  football_data_last_import_season: string | null;
+  football_data_last_import_by: string | null;
 }
 
 interface LeagueListResponse {
   items: LeagueItem[];
+}
+
+type UnifiedIngestSource =
+  | "football_data_uk"
+  | "football_data"
+  | "openligadb"
+  | "theoddsapi"
+  | "matchday_sync"
+  | "xg_enrichment";
+type AdminJobStatus = "queued" | "running" | "succeeded" | "failed" | "canceled";
+
+interface UnifiedIngestState {
+  source: UnifiedIngestSource;
+  seasonInput: string;
+  dryRun: boolean;
+  hasPreview: boolean;
+}
+
+interface UnifiedMatchIngestJobStartResponse {
+  accepted: boolean;
+  job_id: string;
+  league_id: string;
+  source: UnifiedIngestSource;
+  season: string | number | null;
+  dry_run: boolean;
+  status: string;
+}
+
+interface UnifiedMatchIngestResult {
+  processed?: number;
+  created?: number;
+  updated?: number;
+  skipped?: number;
+  conflicts?: number;
+  matched?: number;
+  unmatched?: number;
+  already_enriched?: number;
+  match_ingest?: {
+    matched_by_external_id?: number;
+    matched_by_identity_window?: number;
+    team_name_conflict?: number;
+    other_conflicts?: number;
+  };
+  conflicts_preview?: Array<Record<string, unknown>>;
+  alias_suggestions?: Array<Record<string, unknown>>;
+  unmatched_teams?: string[];
+  raw_rows_preview?: Array<Record<string, unknown>>;
+}
+
+interface UnifiedMatchIngestJobStatusResponse {
+  job_id: string;
+  type: string;
+  source: UnifiedIngestSource | "";
+  status: AdminJobStatus;
+  phase: string;
+  progress: { processed: number; total: number; percent: number };
+  counters: Record<string, number>;
+  results: UnifiedMatchIngestResult | null;
+  error: { message: string; type: string } | null;
 }
 
 const api = useApi();
@@ -46,16 +109,23 @@ const { t } = useI18n();
 const loading = ref(true);
 const leagues = ref<LeagueItem[]>([]);
 const syncBusyById = reactive<Record<string, boolean>>({});
-const importBusyById = reactive<Record<string, boolean>>({});
 const toggleBusyById = reactive<Record<string, boolean>>({});
 const orderSaving = ref(false);
 const editBusy = ref(false);
 const editOpen = ref(false);
 const editingLeagueId = ref<string>("");
+const unifiedIngestStateByLeagueId = reactive<Record<string, UnifiedIngestState>>({});
+const unifiedIngestBusyByLeagueId = reactive<Record<string, boolean>>({});
+const unifiedIngestJobByLeagueId = reactive<Record<string, string>>({});
+const unifiedIngestJobStatusByLeagueId = reactive<Record<string, UnifiedMatchIngestJobStatusResponse | null>>({});
+const unifiedIngestResultsByLeagueId = reactive<Record<string, UnifiedMatchIngestResult | null>>({});
+const unifiedIngestPollTimerByLeagueId = reactive<Record<string, number | null>>({});
+const xgRawFilterByLeagueId = reactive<Record<string, { action: string; query: string }>>({});
 
 const editState = reactive({
   display_name: "",
   structure_type: "league" as "league" | "cup" | "tournament",
+  season_start_month: 7,
   current_season: new Date().getUTCFullYear(),
   is_active: false,
   features: {
@@ -67,6 +137,7 @@ const editState = reactive({
   external_ids: {
     theoddsapi: "",
     openligadb: "",
+    football_data: "",
     football_data_uk: "",
     understat: "",
   },
@@ -98,6 +169,17 @@ async function fetchLeagues(): Promise<void> {
   try {
     const result = await api.get<LeagueListResponse>("/admin/leagues");
     leagues.value = result.items;
+    result.items.forEach((league) => {
+      if (!unifiedIngestStateByLeagueId[league.id]) {
+        unifiedIngestStateByLeagueId[league.id] = {
+          source: defaultUnifiedSource(league),
+          seasonInput: defaultUnifiedSeason(league),
+          dryRun: true,
+          hasPreview: false,
+        };
+      }
+      ensureXgRawFilter(league.id);
+    });
   } catch (error) {
     const message = error instanceof Error ? error.message : t("common.genericError");
     toast.error(message);
@@ -133,30 +215,382 @@ async function triggerSync(league: LeagueItem): Promise<void> {
   }
 }
 
-function seasonCodeFromYear(startYear: number): string {
-  const start = startYear % 100;
-  const end = (startYear + 1) % 100;
-  return `${String(start).padStart(2, "0")}${String(end).padStart(2, "0")}`;
+function importPhaseLabel(phase: string): string {
+  const byPhase: Record<string, string> = {
+    queued: t("admin.leagues.import.phase.queued"),
+    fetching_csv: t("admin.leagues.import.phase.fetching_csv"),
+    matching: t("admin.leagues.import.phase.matching"),
+    ingesting_odds: t("admin.leagues.import.phase.ingesting_odds"),
+    finalizing: t("admin.leagues.import.phase.finalizing"),
+    done: t("admin.leagues.import.phase.done"),
+  };
+  return byPhase[phase] || phase;
 }
 
-function canImportStats(league: LeagueItem): boolean {
-  return Boolean(league.external_ids.football_data_uk);
+function importStatusLabel(status: AdminJobStatus): string {
+  const byStatus: Record<AdminJobStatus, string> = {
+    queued: t("admin.leagues.import.status.queued"),
+    running: t("admin.leagues.import.status.running"),
+    succeeded: t("admin.leagues.import.status.succeeded"),
+    failed: t("admin.leagues.import.status.failed"),
+    canceled: t("admin.leagues.import.status.canceled"),
+  };
+  return byStatus[status];
 }
 
-async function importStats(league: LeagueItem): Promise<void> {
-  if (!canImportStats(league)) return;
-  importBusyById[league.id] = true;
-  try {
-    const result = await api.post<{ message: string }>(
-      `/admin/leagues/${league.id}/import-stats`,
-      { season: seasonCodeFromYear(league.current_season) },
+function unifiedSources(): Array<{ value: UnifiedIngestSource; label: string }> {
+  return [
+    { value: "matchday_sync", label: t("admin.leagues.unified_ingest.sources.matchday_sync") },
+    { value: "xg_enrichment", label: t("admin.leagues.unified_ingest.sources.xg_enrichment") },
+    { value: "football_data", label: t("admin.leagues.unified_ingest.sources.football_data") },
+    { value: "openligadb", label: t("admin.leagues.unified_ingest.sources.openligadb") },
+    { value: "football_data_uk", label: t("admin.leagues.unified_ingest.sources.football_data_uk") },
+    { value: "theoddsapi", label: t("admin.leagues.unified_ingest.sources.theoddsapi") },
+  ];
+}
+
+function defaultUnifiedSeason(league: LeagueItem): string {
+  return String(league.current_season || new Date().getUTCFullYear());
+}
+
+function defaultUnifiedSource(league: LeagueItem): UnifiedIngestSource {
+  if (league.external_ids.football_data) return "football_data";
+  if (league.external_ids.openligadb) return "openligadb";
+  if (league.external_ids.football_data_uk) return "football_data_uk";
+  return "theoddsapi";
+}
+
+function sourceNeedsSeason(source: UnifiedIngestSource): boolean {
+  return source === "football_data" || source === "openligadb" || source === "football_data_uk" || source === "matchday_sync" || source === "xg_enrichment";
+}
+
+function sourceSeasonPlaceholder(source: UnifiedIngestSource): string {
+  if (source === "football_data_uk") return "2025 or 2526";
+  if (source === "xg_enrichment") return "2025 or 2024-2025";
+  return "2025";
+}
+
+function normalizeFootballDataUkSeason(input: string): string | null {
+  const raw = (input || "").trim();
+  if (!/^\d{4}$/.test(raw)) return null;
+  const year = Number(raw);
+  if (year >= 1900 && year <= 2100) {
+    const yy = String(year % 100).padStart(2, "0");
+    const yyNext = String((year + 1) % 100).padStart(2, "0");
+    return `${yy}${yyNext}`;
+  }
+  return raw;
+}
+
+function canUseUnifiedSource(league: LeagueItem, source: UnifiedIngestSource): boolean {
+  if (source === "matchday_sync") return true;
+  if (source === "xg_enrichment") return isXgEligible(league);
+  if (source === "football_data") return Boolean(league.external_ids.football_data);
+  if (source === "openligadb") return Boolean(league.external_ids.openligadb);
+  if (source === "football_data_uk") return Boolean(league.external_ids.football_data_uk);
+  return false;
+}
+
+function isDirectLeagueSyncSource(source: UnifiedIngestSource): boolean {
+  return source === "matchday_sync";
+}
+
+function unifiedSeasonPayload(league: LeagueItem): number | string | null {
+  const state = unifiedIngestStateByLeagueId[league.id];
+  if (!state) return null;
+  const source = state.source;
+  if (!sourceNeedsSeason(source)) return null;
+  const seasonRaw = (state.seasonInput || "").trim();
+  if (!seasonRaw) return null;
+  if (source === "xg_enrichment") return seasonRaw;
+  if (source === "football_data_uk") return normalizeFootballDataUkSeason(seasonRaw);
+  const parsed = Number(seasonRaw);
+  if (!Number.isFinite(parsed)) return null;
+  return Math.trunc(parsed);
+}
+
+function isUnifiedSeasonValid(league: LeagueItem): boolean {
+  const state = unifiedIngestStateByLeagueId[league.id];
+  if (!state) return false;
+  if (!sourceNeedsSeason(state.source)) return true;
+  const seasonRaw = (state.seasonInput || "").trim();
+  if (state.source === "xg_enrichment") return /^\d{4}(-\d{4})?$/.test(seasonRaw);
+  if (state.source === "football_data_uk") return /^\d{4}$/.test(seasonRaw);
+  return /^\d{4}$/.test(seasonRaw);
+}
+
+function clearUnifiedIngestPolling(leagueId: string): void {
+  const timer = unifiedIngestPollTimerByLeagueId[leagueId];
+  if (timer !== null && timer !== undefined) {
+    window.clearInterval(timer);
+  }
+  unifiedIngestPollTimerByLeagueId[leagueId] = null;
+}
+
+function isUnifiedIngestRunning(leagueId: string): boolean {
+  const status = unifiedIngestJobStatusByLeagueId[leagueId]?.status;
+  return status === "queued" || status === "running";
+}
+
+function groupedUnifiedConflicts(leagueId: string): Record<string, Array<Record<string, unknown>>> {
+  const raw = unifiedIngestResultsByLeagueId[leagueId]?.conflicts_preview;
+  const groups: Record<string, Array<Record<string, unknown>>> = {
+    unresolved_league: [],
+    unresolved_team: [],
+    team_name_conflict: [],
+    other_conflicts: [],
+  };
+  for (const item of raw || []) {
+    const code = String(item.code || "");
+    if (code === "unresolved_league") groups.unresolved_league.push(item);
+    else if (code === "unresolved_team") groups.unresolved_team.push(item);
+    else if (code === "team_name_conflict") groups.team_name_conflict.push(item);
+    else groups.other_conflicts.push(item);
+  }
+  return groups;
+}
+
+function unifiedActionHint(code: string): string {
+  const mapping: Record<string, string> = {
+    unresolved_league: t("admin.leagues.unified_ingest.hints.unresolved_league"),
+    unresolved_team: t("admin.leagues.unified_ingest.hints.unresolved_team"),
+    team_name_conflict: t("admin.leagues.unified_ingest.hints.team_name_conflict"),
+    other_conflicts: t("admin.leagues.unified_ingest.hints.other_conflicts"),
+  };
+  return mapping[code] || mapping.other_conflicts;
+}
+
+function isUnifiedXgSource(leagueId: string): boolean {
+  return unifiedIngestJobStatusByLeagueId[leagueId]?.type === "xg_enrichment"
+    || unifiedIngestStateByLeagueId[leagueId]?.source === "xg_enrichment";
+}
+
+function unifiedXgUnmatchedTeams(leagueId: string): string[] {
+  const results = unifiedIngestResultsByLeagueId[leagueId] || (unifiedIngestJobStatusByLeagueId[leagueId]?.results as UnifiedMatchIngestResult | null);
+  return (results?.unmatched_teams || []) as string[];
+}
+
+function unifiedXgRawRows(leagueId: string): Array<Record<string, unknown>> {
+  const results = unifiedIngestResultsByLeagueId[leagueId] || (unifiedIngestJobStatusByLeagueId[leagueId]?.results as UnifiedMatchIngestResult | null);
+  return (results?.raw_rows_preview || []) as Array<Record<string, unknown>>;
+}
+
+function ensureXgRawFilter(leagueId: string): void {
+  if (!xgRawFilterByLeagueId[leagueId]) {
+    xgRawFilterByLeagueId[leagueId] = { action: "all", query: "" };
+  }
+}
+
+function filteredUnifiedXgRawRows(leagueId: string): Array<Record<string, unknown>> {
+  ensureXgRawFilter(leagueId);
+  const rows = unifiedXgRawRows(leagueId);
+  const filter = xgRawFilterByLeagueId[leagueId];
+  const action = (filter.action || "all").trim().toLowerCase();
+  const query = (filter.query || "").trim().toLowerCase();
+  return rows.filter((row) => {
+    const rowAction = String(row.action || "").toLowerCase();
+    if (action !== "all" && rowAction !== action) return false;
+    if (!query) return true;
+    const haystack = [
+      String(row.reason || ""),
+      String(row.home_team || ""),
+      String(row.away_team || ""),
+      String(row.date || ""),
+      String(row.home_xg ?? ""),
+      String(row.away_xg ?? ""),
+    ].join(" ").toLowerCase();
+    return haystack.includes(query);
+  });
+}
+
+function unifiedRunButtonDisabled(league: LeagueItem): boolean {
+  const state = unifiedIngestStateByLeagueId[league.id];
+  if (!state) return true;
+  if (!canUseUnifiedSource(league, state.source)) return true;
+  if (!isUnifiedSeasonValid(league)) return true;
+  return isUnifiedIngestRunning(league.id);
+}
+
+function unifiedRunButtonLabel(league: LeagueItem): string {
+  const source = unifiedIngestStateByLeagueId[league.id]?.source;
+  if (source === "matchday_sync") return t("admin.leagues.trigger_sync");
+  return t("admin.leagues.unified_ingest.run_button");
+}
+
+function isXgEligible(league: LeagueItem): boolean {
+  return Boolean(league.is_active && league.features.xg_sync && league.external_ids.understat);
+}
+
+async function runUnifiedMatchIngest(league: LeagueItem, dryRun: boolean): Promise<void> {
+  const state = unifiedIngestStateByLeagueId[league.id];
+  if (!state) return;
+  if (state.source === "xg_enrichment") {
+    if (!canUseUnifiedSource(league, state.source)) {
+      toast.error(t("admin.leagues.unified_ingest.source_unavailable"));
+      return;
+    }
+    if (!isUnifiedSeasonValid(league)) {
+      toast.error(t("admin.leagues.unified_ingest.invalid_season"));
+      return;
+    }
+    unifiedIngestBusyByLeagueId[league.id] = true;
+    try {
+      const season = String(unifiedSeasonPayload(league) ?? "").trim() || null;
+      const start = await api.post<{ job_id: string }>(
+        "/admin/enrich-xg/async",
+        {
+          sport_key: league.sport_key,
+          season,
+          dry_run: dryRun,
+          force: false,
+        },
+      );
+      unifiedIngestJobByLeagueId[league.id] = start.job_id;
+      unifiedIngestJobStatusByLeagueId[league.id] = {
+        job_id: start.job_id,
+        type: "xg_enrichment",
+        source: state.source,
+        status: "queued",
+        phase: "queued",
+        progress: { processed: 0, total: 0, percent: 0 },
+        counters: {},
+        results: null,
+        error: null,
+      };
+      clearUnifiedIngestPolling(league.id);
+      const poll = async () => {
+        const jobId = unifiedIngestJobByLeagueId[league.id];
+        if (!jobId) return;
+        try {
+          const status = await api.get<UnifiedMatchIngestJobStatusResponse>(`/admin/leagues/import-jobs/${jobId}`);
+          unifiedIngestJobStatusByLeagueId[league.id] = status;
+          if (status.status === "succeeded") {
+            unifiedIngestResultsByLeagueId[league.id] = status.results as UnifiedMatchIngestResult;
+            state.hasPreview = dryRun;
+            clearUnifiedIngestPolling(league.id);
+            unifiedIngestBusyByLeagueId[league.id] = false;
+            toast.success(dryRun ? t("admin.leagues.unified_ingest.preview_ready") : t("admin.leagues.unified_ingest.run_done"));
+          } else if (status.status === "failed" || status.status === "canceled") {
+            clearUnifiedIngestPolling(league.id);
+            unifiedIngestBusyByLeagueId[league.id] = false;
+            toast.error(status.error?.message || t("common.genericError"));
+          }
+        } catch (error) {
+          clearUnifiedIngestPolling(league.id);
+          unifiedIngestBusyByLeagueId[league.id] = false;
+          toast.error(error instanceof Error ? error.message : t("common.genericError"));
+        }
+      };
+      void poll();
+      unifiedIngestPollTimerByLeagueId[league.id] = window.setInterval(() => void poll(), 1500);
+      toast.success(t("admin.leagues.unified_ingest.job_started"));
+    } catch (error) {
+      if (error instanceof HttpError && error.status === 429) {
+        toast.error(t("admin.leagues.unified_ingest.rate_limited"));
+      } else {
+        toast.error(error instanceof Error ? error.message : t("common.genericError"));
+      }
+      unifiedIngestBusyByLeagueId[league.id] = false;
+    }
+    return;
+  }
+  if (isDirectLeagueSyncSource(state.source)) {
+    if (dryRun) return;
+    syncBusyById[league.id] = true;
+    try {
+      const seasonPayload = unifiedSeasonPayload(league);
+      const season = typeof seasonPayload === "number" ? seasonPayload : Number(seasonPayload);
+      const result = await api.post<{ message: string }>(`/admin/leagues/${league.id}/sync`, {
+        season: Number.isFinite(season) ? Math.trunc(season) : null,
+        full_season: true,
+      });
+      toast.success(result.message || t("admin.leagues.sync_triggered"));
+    } catch (error) {
+      const message = error instanceof Error ? error.message : t("common.genericError");
+      toast.error(message);
+    } finally {
+      syncBusyById[league.id] = false;
+    }
+    return;
+  }
+  if (!canUseUnifiedSource(league, state.source)) {
+    toast.error(t("admin.leagues.unified_ingest.source_unavailable"));
+    return;
+  }
+  if (!isUnifiedSeasonValid(league)) {
+    toast.error(t("admin.leagues.unified_ingest.invalid_season"));
+    return;
+  }
+  if (!dryRun && !state.hasPreview) {
+    const confirmed = window.confirm(t("admin.leagues.unified_ingest.confirm_without_preview"));
+    if (!confirmed) return;
+  }
+  if (!dryRun) {
+    const confirmedRun = window.confirm(
+      t("admin.leagues.unified_ingest.confirm_run", {
+        league: league.display_name,
+        source: unifiedSources().find((entry) => entry.value === state.source)?.label || state.source,
+      }),
     );
-    toast.success(result.message || t("admin.leagues.import_stats_triggered"));
+    if (!confirmedRun) return;
+  }
+
+  unifiedIngestBusyByLeagueId[league.id] = true;
+  try {
+    const start = await api.post<UnifiedMatchIngestJobStartResponse>(
+      `/admin/leagues/${league.id}/match-ingest/async`,
+      {
+        source: state.source,
+        season: unifiedSeasonPayload(league),
+        dry_run: dryRun,
+      },
+    );
+    unifiedIngestJobByLeagueId[league.id] = start.job_id;
+    unifiedIngestJobStatusByLeagueId[league.id] = {
+      job_id: start.job_id,
+      type: "match_ingest_unified",
+      source: state.source,
+      status: "queued",
+      phase: "queued",
+      progress: { processed: 0, total: 0, percent: 0 },
+      counters: {},
+      results: null,
+      error: null,
+    };
+    clearUnifiedIngestPolling(league.id);
+    const poll = async () => {
+      const jobId = unifiedIngestJobByLeagueId[league.id];
+      if (!jobId) return;
+      try {
+        const status = await api.get<UnifiedMatchIngestJobStatusResponse>(`/admin/leagues/import-jobs/${jobId}`);
+        unifiedIngestJobStatusByLeagueId[league.id] = status;
+        if (status.status === "succeeded") {
+          unifiedIngestResultsByLeagueId[league.id] = status.results;
+          state.hasPreview = dryRun;
+          clearUnifiedIngestPolling(league.id);
+          unifiedIngestBusyByLeagueId[league.id] = false;
+          toast.success(dryRun ? t("admin.leagues.unified_ingest.preview_ready") : t("admin.leagues.unified_ingest.run_done"));
+        } else if (status.status === "failed" || status.status === "canceled") {
+          clearUnifiedIngestPolling(league.id);
+          unifiedIngestBusyByLeagueId[league.id] = false;
+          toast.error(status.error?.message || t("common.genericError"));
+        }
+      } catch (error) {
+        clearUnifiedIngestPolling(league.id);
+        unifiedIngestBusyByLeagueId[league.id] = false;
+        toast.error(error instanceof Error ? error.message : t("common.genericError"));
+      }
+    };
+    void poll();
+    unifiedIngestPollTimerByLeagueId[league.id] = window.setInterval(() => void poll(), 1500);
+    toast.success(t("admin.leagues.unified_ingest.job_started"));
   } catch (error) {
-    const message = error instanceof Error ? error.message : t("common.genericError");
-    toast.error(message);
-  } finally {
-    importBusyById[league.id] = false;
+    if (error instanceof HttpError && error.status === 429) {
+      toast.error(t("admin.leagues.unified_ingest.rate_limited"));
+    } else {
+      toast.error(error instanceof Error ? error.message : t("common.genericError"));
+    }
+    unifiedIngestBusyByLeagueId[league.id] = false;
   }
 }
 
@@ -180,6 +614,7 @@ function openEditModal(league: LeagueItem): void {
   editingLeagueId.value = league.id;
   editState.display_name = league.display_name;
   editState.structure_type = league.structure_type || "league";
+  editState.season_start_month = league.season_start_month || 7;
   editState.current_season = league.current_season;
   editState.is_active = league.is_active;
   editState.features = {
@@ -191,6 +626,7 @@ function openEditModal(league: LeagueItem): void {
   editState.external_ids = {
     theoddsapi: league.external_ids.theoddsapi || "",
     openligadb: league.external_ids.openligadb || "",
+    football_data: league.external_ids.football_data || "",
     football_data_uk: league.external_ids.football_data_uk || "",
     understat: league.external_ids.understat || "",
   };
@@ -204,6 +640,7 @@ async function saveEdit(): Promise<void> {
     await api.patch(`/admin/leagues/${editingLeagueId.value}`, {
       display_name: editState.display_name,
       structure_type: editState.structure_type,
+      season_start_month: editState.season_start_month,
       current_season: editState.current_season,
       is_active: editState.is_active,
       features: { ...editState.features },
@@ -222,6 +659,10 @@ async function saveEdit(): Promise<void> {
 
 onMounted(() => {
   void fetchLeagues();
+});
+
+onUnmounted(() => {
+  Object.keys(unifiedIngestPollTimerByLeagueId).forEach((leagueId) => clearUnifiedIngestPolling(leagueId));
 });
 </script>
 
@@ -336,24 +777,194 @@ onMounted(() => {
                   </button>
                   <button
                     type="button"
-                    class="rounded-card border border-surface-3 bg-surface-0 px-2.5 py-1 text-xs text-text-secondary hover:border-primary/60 disabled:opacity-50"
-                    :disabled="orderSaving || !canImportStats(league) || Boolean(importBusyById[league.id])"
-                    @click="importStats(league)"
-                  >
-                    {{
-                      importBusyById[league.id]
-                        ? t("admin.leagues.import_stats_loading")
-                        : t("admin.leagues.import_stats")
-                    }}
-                  </button>
-                  <button
-                    type="button"
                     class="rounded-card border border-surface-3 bg-surface-0 px-2.5 py-1 text-xs text-text-secondary hover:border-primary/60"
                     :disabled="orderSaving"
                     @click="openEditModal(league)"
                   >
                     {{ t("admin.leagues.edit") }}
                   </button>
+                </div>
+                <div class="mt-2 rounded-card border border-surface-3/60 bg-surface-0 p-2 space-y-2">
+                  <div class="rounded-card border border-surface-3/60 bg-surface-1 p-2 space-y-2">
+                    <div class="flex items-center justify-between gap-2">
+                      <p class="text-xs font-semibold text-text-primary">{{ t("admin.leagues.unified_ingest.title") }}</p>
+                      <span class="text-[10px] text-text-muted">{{ t("admin.leagues.unified_ingest.dry_run_first") }}</span>
+                    </div>
+                    <div class="grid grid-cols-1 md:grid-cols-4 gap-2">
+                      <label class="text-xs text-text-secondary">
+                        {{ t("admin.leagues.unified_ingest.source") }}
+                        <select
+                          v-model="unifiedIngestStateByLeagueId[league.id].source"
+                          class="mt-1 w-full rounded-card border border-surface-3 bg-surface-1 px-2 py-1 text-xs text-text-primary"
+                        >
+                          <option v-for="entry in unifiedSources()" :key="entry.value" :value="entry.value">
+                            {{ entry.label }}
+                          </option>
+                        </select>
+                      </label>
+                      <label class="text-xs text-text-secondary">
+                        {{ t("admin.leagues.unified_ingest.season") }}
+                        <input
+                          v-model="unifiedIngestStateByLeagueId[league.id].seasonInput"
+                          type="text"
+                          maxlength="9"
+                          class="mt-1 w-full rounded-card border border-surface-3 bg-surface-1 px-2 py-1 text-xs text-text-primary"
+                          :disabled="!sourceNeedsSeason(unifiedIngestStateByLeagueId[league.id].source)"
+                          :placeholder="sourceSeasonPlaceholder(unifiedIngestStateByLeagueId[league.id].source)"
+                        />
+                      </label>
+                      <button
+                        type="button"
+                        class="rounded-card border border-primary/60 bg-primary/10 px-2.5 py-1 text-xs text-text-primary hover:bg-primary/20 disabled:opacity-50 mt-5"
+                        :disabled="unifiedRunButtonDisabled(league) || isDirectLeagueSyncSource(unifiedIngestStateByLeagueId[league.id].source)"
+                        @click="runUnifiedMatchIngest(league, true)"
+                      >
+                        {{ t("admin.leagues.unified_ingest.preview_button") }}
+                      </button>
+                      <button
+                        type="button"
+                        class="rounded-card border border-surface-3 bg-surface-0 px-2.5 py-1 text-xs text-text-secondary hover:border-primary/60 disabled:opacity-50 mt-5"
+                        :disabled="unifiedRunButtonDisabled(league)"
+                        @click="runUnifiedMatchIngest(league, false)"
+                      >
+                        {{ unifiedRunButtonLabel(league) }}
+                      </button>
+                    </div>
+                    <p
+                      v-if="!canUseUnifiedSource(league, unifiedIngestStateByLeagueId[league.id].source)"
+                      class="text-[11px] text-danger"
+                    >
+                      {{ t("admin.leagues.unified_ingest.source_unavailable") }}
+                    </p>
+                    <p
+                      v-else-if="!isUnifiedSeasonValid(league)"
+                      class="text-[11px] text-danger"
+                    >
+                      {{ t("admin.leagues.unified_ingest.invalid_season") }}
+                    </p>
+                    <div
+                      v-if="unifiedIngestJobStatusByLeagueId[league.id]"
+                      class="rounded-card border border-surface-3/60 bg-surface-0 p-2"
+                    >
+                      <p class="text-[11px] text-text-secondary">
+                        {{ t("admin.leagues.unified_ingest.job_status") }}:
+                        {{ importStatusLabel(unifiedIngestJobStatusByLeagueId[league.id]?.status || "queued") }}
+                      </p>
+                      <p class="text-[11px] text-text-muted">
+                        {{ t("admin.leagues.unified_ingest.job_phase") }}:
+                        {{ importPhaseLabel(unifiedIngestJobStatusByLeagueId[league.id]?.phase || "queued") }}
+                      </p>
+                      <div class="mt-1 h-1.5 w-full rounded-full bg-surface-2">
+                        <div
+                          class="h-1.5 rounded-full bg-primary transition-all duration-300"
+                          :style="{ width: `${Math.min(100, Math.max(0, unifiedIngestJobStatusByLeagueId[league.id]?.progress?.percent || 0))}%` }"
+                        />
+                      </div>
+                    </div>
+                    <div
+                      v-if="unifiedIngestResultsByLeagueId[league.id] || unifiedIngestJobStatusByLeagueId[league.id]?.results"
+                      class="rounded-card border border-surface-3/60 bg-surface-0 p-2 space-y-2"
+                    >
+                      <p class="text-xs font-medium text-text-primary">{{ t("admin.leagues.unified_ingest.results_title") }}</p>
+                      <div v-if="!isUnifiedXgSource(league.id)" class="grid grid-cols-2 md:grid-cols-4 gap-2 text-[11px] text-text-secondary">
+                        <span>{{ t("admin.leagues.unified_ingest.metrics.processed") }}: {{ unifiedIngestJobStatusByLeagueId[league.id]?.counters?.processed || 0 }}</span>
+                        <span>{{ t("admin.leagues.unified_ingest.metrics.created") }}: {{ unifiedIngestJobStatusByLeagueId[league.id]?.counters?.created || 0 }}</span>
+                        <span>{{ t("admin.leagues.unified_ingest.metrics.updated") }}: {{ unifiedIngestJobStatusByLeagueId[league.id]?.counters?.updated || 0 }}</span>
+                        <span>{{ t("admin.leagues.unified_ingest.metrics.skipped") }}: {{ unifiedIngestJobStatusByLeagueId[league.id]?.counters?.skipped || 0 }}</span>
+                        <span>{{ t("admin.leagues.unified_ingest.metrics.conflicts") }}: {{ unifiedIngestJobStatusByLeagueId[league.id]?.counters?.conflicts || 0 }}</span>
+                        <span>{{ t("admin.leagues.unified_ingest.metrics.external") }}: {{ unifiedIngestJobStatusByLeagueId[league.id]?.counters?.matched_by_external_id || 0 }}</span>
+                        <span>{{ t("admin.leagues.unified_ingest.metrics.identity") }}: {{ unifiedIngestJobStatusByLeagueId[league.id]?.counters?.matched_by_identity_window || 0 }}</span>
+                      </div>
+                      <div v-else class="grid grid-cols-2 md:grid-cols-4 gap-2 text-[11px] text-text-secondary">
+                        <span>{{ t("admin.leagues.unified_ingest.metrics.processed") }}: {{ unifiedIngestJobStatusByLeagueId[league.id]?.counters?.processed || 0 }}</span>
+                        <span>{{ t("admin.leagues.unified_ingest.metrics.matched") }}: {{ unifiedIngestJobStatusByLeagueId[league.id]?.counters?.matched || 0 }}</span>
+                        <span>{{ t("admin.leagues.unified_ingest.metrics.unmatched") }}: {{ unifiedIngestJobStatusByLeagueId[league.id]?.counters?.unmatched || 0 }}</span>
+                        <span>{{ t("admin.leagues.unified_ingest.metrics.skipped") }}: {{ unifiedIngestJobStatusByLeagueId[league.id]?.counters?.skipped || 0 }}</span>
+                        <span>{{ t("admin.leagues.unified_ingest.metrics.already_enriched") }}: {{ unifiedIngestJobStatusByLeagueId[league.id]?.counters?.already_enriched || 0 }}</span>
+                        <span>{{ t("admin.leagues.unified_ingest.metrics.alias_recorded") }}: {{ unifiedIngestJobStatusByLeagueId[league.id]?.counters?.alias_suggestions_recorded || 0 }}</span>
+                      </div>
+                      <div v-if="!isUnifiedXgSource(league.id)" class="space-y-2">
+                        <p class="text-xs font-medium text-text-primary">{{ t("admin.leagues.unified_ingest.conflicts_title") }}</p>
+                        <div
+                          v-for="group in ['unresolved_league', 'unresolved_team', 'team_name_conflict', 'other_conflicts']"
+                          :key="`${league.id}-${group}`"
+                          class="rounded border border-surface-3/60 bg-surface-1 p-2"
+                        >
+                          <p class="text-[11px] font-medium text-text-primary">
+                            {{ t(`admin.leagues.unified_ingest.conflict_groups.${group}`) }}
+                            ({{ groupedUnifiedConflicts(league.id)[group].length }})
+                          </p>
+                          <p class="text-[10px] text-text-muted mt-0.5">
+                            {{ unifiedActionHint(group) }}
+                          </p>
+                          <p
+                            v-for="(example, idx) in groupedUnifiedConflicts(league.id)[group].slice(0, 3)"
+                            :key="`${league.id}-${group}-${idx}`"
+                            class="text-[10px] text-text-muted"
+                          >
+                            {{ example.external_id || "-" }} | {{ example.message || "-" }}
+                          </p>
+                        </div>
+                      </div>
+                      <div v-else class="space-y-2">
+                        <div class="rounded border border-surface-3/60 bg-surface-1 p-2">
+                          <p class="text-[11px] font-medium text-text-primary">
+                            {{ t("admin.leagues.unified_ingest.xg.alias_suggestions") }} ({{ unifiedIngestJobStatusByLeagueId[league.id]?.counters?.alias_suggestions_recorded || 0 }})
+                          </p>
+                          <p class="text-[10px] text-text-muted">
+                            {{ t("admin.leagues.unified_ingest.xg.alias_hint") }}
+                          </p>
+                        </div>
+                        <div class="rounded border border-surface-3/60 bg-surface-1 p-2">
+                          <p class="text-[11px] font-medium text-text-primary">
+                            {{ t("admin.leagues.unified_ingest.xg.unmatched_teams") }} ({{ unifiedXgUnmatchedTeams(league.id).length }})
+                          </p>
+                          <p
+                            v-for="(name, idx) in unifiedXgUnmatchedTeams(league.id).slice(0, 12)"
+                            :key="`xg-unmatched-${league.id}-${idx}`"
+                            class="text-[10px] text-text-muted"
+                          >
+                            {{ name }}
+                          </p>
+                        </div>
+                        <div class="rounded border border-surface-3/60 bg-surface-1 p-2">
+                          <p class="text-[11px] font-medium text-text-primary">
+                            {{ t("admin.leagues.unified_ingest.xg.raw_rows") }} ({{ filteredUnifiedXgRawRows(league.id).length }})
+                          </p>
+                          <div class="mt-1 grid grid-cols-1 md:grid-cols-3 gap-1">
+                            <select
+                              v-model="xgRawFilterByLeagueId[league.id].action"
+                              class="rounded border border-surface-3 bg-surface-0 px-2 py-1 text-[10px] text-text-primary"
+                              @focus="ensureXgRawFilter(league.id)"
+                            >
+                              <option value="all">{{ t("admin.leagues.unified_ingest.xg.filters.all_actions") }}</option>
+                              <option value="would_update">would_update</option>
+                              <option value="already_enriched">already_enriched</option>
+                              <option value="unmatched">unmatched</option>
+                              <option value="skipped">skipped</option>
+                            </select>
+                            <input
+                              v-model="xgRawFilterByLeagueId[league.id].query"
+                              type="text"
+                              class="md:col-span-2 rounded border border-surface-3 bg-surface-0 px-2 py-1 text-[10px] text-text-primary"
+                              :placeholder="t('admin.leagues.unified_ingest.xg.filters.search_placeholder')"
+                              @focus="ensureXgRawFilter(league.id)"
+                            />
+                          </div>
+                          <p
+                            v-for="(row, idx) in filteredUnifiedXgRawRows(league.id).slice(0, 20)"
+                            :key="`xg-raw-${league.id}-${idx}`"
+                            class="text-[10px] text-text-muted"
+                          >
+                            {{ String(row.action || "-") }} / {{ String(row.reason || "-") }} |
+                            {{ String(row.home_team || "-") }} vs {{ String(row.away_team || "-") }} |
+                            {{ String(row.date || "-") }} |
+                            xG {{ String(row.home_xg ?? "-") }} : {{ String(row.away_xg ?? "-") }}
+                          </p>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
                 </div>
               </td>
               </tr>
@@ -370,7 +981,7 @@ onMounted(() => {
           {{ selectedLeague?.sport_key }}
         </p>
 
-        <div class="grid md:grid-cols-2 gap-3 mt-4">
+        <div class="grid md:grid-cols-3 gap-3 mt-4">
           <label class="text-xs text-text-secondary">
             {{ t("admin.leagues.fields.display_name") }}
             <input
@@ -391,6 +1002,16 @@ onMounted(() => {
             </select>
           </label>
           <label class="text-xs text-text-secondary">
+            {{ t("admin.leagues.fields.season_start_month") }}
+            <input
+              v-model.number="editState.season_start_month"
+              type="number"
+              min="1"
+              max="12"
+              class="mt-1 w-full rounded-card border border-surface-3 bg-surface-1 px-2 py-1 text-xs text-text-primary"
+            />
+          </label>
+          <label class="text-xs text-text-secondary">
             {{ t("admin.leagues.fields.current_season") }}
             <input
               v-model.number="editState.current_season"
@@ -408,36 +1029,32 @@ onMounted(() => {
                 v-model="editState.features.tipping"
                 type="checkbox"
                 class="h-4 w-4 rounded border-surface-3 text-primary"
-                :disabled="!editState.is_active"
               />
-              <span :class="!editState.is_active ? 'opacity-50' : ''">{{ t("admin.leagues.features.tipping") }}</span>
+              <span>{{ t("admin.leagues.features.tipping") }}</span>
             </label>
             <label class="inline-flex items-center gap-2 text-sm text-text-secondary">
               <input
                 v-model="editState.features.match_load"
                 type="checkbox"
                 class="h-4 w-4 rounded border-surface-3 text-primary"
-                :disabled="!editState.is_active"
               />
-              <span :class="!editState.is_active ? 'opacity-50' : ''">{{ t("admin.leagues.features.match_load") }}</span>
+              <span>{{ t("admin.leagues.features.match_load") }}</span>
             </label>
             <label class="inline-flex items-center gap-2 text-sm text-text-secondary">
               <input
                 v-model="editState.features.xg_sync"
                 type="checkbox"
                 class="h-4 w-4 rounded border-surface-3 text-primary"
-                :disabled="!editState.is_active"
               />
-              <span :class="!editState.is_active ? 'opacity-50' : ''">{{ t("admin.leagues.features.xg_sync") }}</span>
+              <span>{{ t("admin.leagues.features.xg_sync") }}</span>
             </label>
             <label class="inline-flex items-center gap-2 text-sm text-text-secondary">
               <input
                 v-model="editState.features.odds_sync"
                 type="checkbox"
                 class="h-4 w-4 rounded border-surface-3 text-primary"
-                :disabled="!editState.is_active"
               />
-              <span :class="!editState.is_active ? 'opacity-50' : ''">{{ t("admin.leagues.features.odds_sync") }}</span>
+              <span>{{ t("admin.leagues.features.odds_sync") }}</span>
             </label>
           </div>
           <label class="inline-flex items-center gap-2 text-sm text-text-secondary mt-3">
@@ -465,6 +1082,14 @@ onMounted(() => {
               {{ t("admin.leagues.providers.openligadb") }}
               <input
                 v-model="editState.external_ids.openligadb"
+                type="text"
+                class="mt-1 w-full rounded-card border border-surface-3 bg-surface-1 px-3 py-2 text-sm text-text-primary"
+              />
+            </label>
+            <label class="text-xs text-text-secondary">
+              {{ t("admin.leagues.providers.football_data") }}
+              <input
+                v-model="editState.external_ids.football_data"
                 type="text"
                 class="mt-1 w-full rounded-card border border-surface-3 bg-surface-1 px-3 py-2 text-sm text-text-primary"
               />

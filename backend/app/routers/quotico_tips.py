@@ -1,4 +1,14 @@
-"""QuoticoTip API — public value-bet recommendations powered by the EV engine."""
+"""
+backend/app/routers/quotico_tips.py
+
+Purpose:
+    HTTP API for QuoticoTip listing, generation, resolution, and diagnostics.
+
+Dependencies:
+    - app.services.quotico_tip_service
+    - app.services.qbot_intelligence_service
+    - app.database
+"""
 
 import asyncio
 import logging
@@ -8,6 +18,7 @@ from bson import ObjectId
 from fastapi import APIRouter, Depends, HTTPException, Query
 
 import app.database as _db
+from app.config import settings
 from app.services.auth_service import get_admin_user
 from app.utils import ensure_utc
 from app.services.qbot_intelligence_service import enrich_tip
@@ -20,7 +31,7 @@ from app.services.quotico_tip_service import (
     EVD_DAMPEN_THRESHOLD,
 )
 from app.services.historical_service import sport_keys_for
-from app.services.team_mapping_service import resolve_team_key
+from app.services.team_registry_service import TeamRegistry
 
 logger = logging.getLogger("quotico.quotico_tips_router")
 router = APIRouter(prefix="/api/quotico-tips", tags=["quotico-tips"])
@@ -294,7 +305,7 @@ async def refresh_single_tip(match_id: str, admin=Depends(get_admin_user)):
 
     # Enrich with Qbot intelligence (graceful — skips if no strategy)
     try:
-        tip = await enrich_tip(tip)
+        tip = await enrich_tip(tip, match=match)
     except Exception:
         logger.warning("Qbot enrichment failed for %s", match_id, exc_info=True)
 
@@ -338,11 +349,28 @@ async def backfill_quotico_tips(
     """
     query: dict = {
         "status": "final",
-        "odds.h2h": {"$exists": True, "$ne": {}},
+        "odds_meta.markets.h2h.current": {"$exists": True, "$ne": {}},
         "result.outcome": {"$ne": None},
     }
     if sport_key:
         query["sport_key"] = sport_key
+
+    max_matches = int(settings.QTIP_BACKFILL_ADMIN_MAX_MATCHES)
+    if batch_size > max_matches:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Requested batch_size={batch_size} exceeds admin limit={max_matches}. Use CLI for mass reruns.",
+        )
+
+    total_scope = await _db.db.matches.count_documents(query)
+    if (total_scope - skip) > max_matches:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Scope too large ({max(total_scope - skip, 0)} matches). "
+                f"Admin backfill limit is {max_matches}; use CLI for mass reruns."
+            ),
+        )
 
     matches = await _db.db.matches.find(query).sort("match_date", 1).skip(skip).to_list(length=batch_size)
 
@@ -358,19 +386,39 @@ async def backfill_quotico_tips(
     generated = 0
     no_signal = 0
     skipped_count = 0
+    skipped_missing_odds_meta = 0
     errors = 0
+    xg_seen = 0
+    xg_total = 0
+    archetype_distribution: dict[str, int] = {}
 
     for match in matches:
         mid = str(match["_id"])
         if mid in existing_ids:
             skipped_count += 1
             continue
+        h2h_current = ((((match.get("odds_meta") or {}).get("markets") or {}).get("h2h") or {}).get("current") or {})
+        if not all(h2h_current.get(k) for k in ("1", "X", "2")):
+            skipped_missing_odds_meta += 1
+            continue
         try:
             tip = await generate_quotico_tip(match, before_date=match["match_date"])
-            tip = await enrich_tip(tip)
+            tip = await enrich_tip(tip, match=match)
             tip = resolve_tip(tip, match)
             if not dry_run:
                 await _db.db.quotico_tips.insert_one(tip)
+
+            qbot_logic = tip.get("qbot_logic") if isinstance(tip.get("qbot_logic"), dict) else {}
+            archetype = str(qbot_logic.get("archetype") or "")
+            if archetype:
+                archetype_distribution[archetype] = int(archetype_distribution.get(archetype, 0)) + 1
+            xg_total += 1
+            post_reasoning = qbot_logic.get("post_match_reasoning")
+            if isinstance(post_reasoning, dict) and (
+                post_reasoning.get("xg_home") is not None or post_reasoning.get("xg_away") is not None
+            ):
+                xg_seen += 1
+
             if tip["status"] == "resolved" and tip.get("was_correct") is not None:
                 generated += 1
             else:
@@ -379,10 +427,18 @@ async def backfill_quotico_tips(
             errors += 1
             logger.error("Backfill error for %s: %s", mid, e)
 
+    no_signal_den = generated + no_signal
+    no_signal_rate_pct = (no_signal / no_signal_den * 100.0) if no_signal_den > 0 else 0.0
+    xg_coverage_pct = (xg_seen / xg_total * 100.0) if xg_total > 0 else 0.0
+
     return {
         "processed": len(matches),
         "generated": generated,
         "no_signal": no_signal,
+        "no_signal_rate_pct": round(no_signal_rate_pct, 2),
+        "xg_coverage_pct": round(xg_coverage_pct, 2),
+        "archetype_distribution": archetype_distribution,
+        "skipped_missing_odds_meta": skipped_missing_odds_meta,
         "skipped": skipped_count,
         "errors": errors,
         "next_skip": skip + batch_size,
@@ -470,19 +526,24 @@ async def backtest_evd(
         if selection == "-" or not match_date:
             continue
 
+        team_registry = TeamRegistry.get()
         related_keys = sport_keys_for(sport_key)
-        home_key = await resolve_team_key(tip.get("home_team", ""), related_keys)
-        away_key = await resolve_team_key(tip.get("away_team", ""), related_keys)
+        home_team_id = tip.get("home_team_id")
+        away_team_id = tip.get("away_team_id")
+        if not home_team_id:
+            home_team_id = await team_registry.resolve(tip.get("home_team", ""), sport_key)
+        if not away_team_id:
+            away_team_id = await team_registry.resolve(tip.get("away_team", ""), sport_key)
 
-        if not home_key or not away_key:
+        if not home_team_id or not away_team_id:
             buckets["no_data"]["total"] += 1
             if was_correct:
                 buckets["no_data"]["correct"] += 1
             continue
 
         # Compute EVD as-of match date (temporal correctness)
-        evd_home = await compute_team_evd(home_key, related_keys, before_date=match_date)
-        evd_away = await compute_team_evd(away_key, related_keys, before_date=match_date)
+        evd_home = await compute_team_evd(home_team_id, related_keys, before_date=match_date)
+        evd_away = await compute_team_evd(away_team_id, related_keys, before_date=match_date)
 
         picked_evd = evd_home if selection == "1" else (evd_away if selection == "2" else None)
 

@@ -3,7 +3,7 @@ backend/app/routers/leagues.py
 
 Purpose:
     Public League Tower endpoints used by the frontend navigation layer.
-    Exposes cached active+tippable leagues ordered for UI rendering.
+    Exposes cached active leagues ordered for UI rendering.
 
 Dependencies:
     - app.services.league_service

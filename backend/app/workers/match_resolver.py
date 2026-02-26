@@ -1,8 +1,14 @@
-"""Match resolution worker.
+"""
+backend/app/workers/match_resolver.py
 
-Fetches final scores from providers, resolves matches → status=final,
-resolves betting slips, and awards points. No separate archive step —
-the unified matches collection IS the archive.
+Purpose:
+    Match resolution worker. Pulls provider scores, finalizes matches, resolves
+    betting slips, and captures odds_meta closing lines once.
+
+Dependencies:
+    - app.database
+    - app.providers.odds_api
+    - app.services.odds_service
 """
 
 import logging
@@ -16,12 +22,14 @@ from app.providers.odds_api import SUPPORTED_SPORTS, odds_provider
 from app.providers.football_data import (
     SPORT_TO_COMPETITION,
     football_data_provider,
-    teams_match,
 )
 from app.providers.openligadb import openligadb_provider, SPORT_TO_LEAGUE
 from app.services.match_service import _MAX_DURATION, _DEFAULT_DURATION
 from app.services.matchday_service import calculate_points, is_match_locked
 from app.services.fantasy_service import calculate_fantasy_points
+from app.services.odds_meta_service import get_current_market
+from app.services.odds_service import odds_service
+from app.utils.team_matching import teams_match
 from app.utils import ensure_utc, parse_utc, utcnow
 from app.workers._state import recently_synced, set_synced
 
@@ -311,12 +319,12 @@ def auto_lock_selections(
             # Freeze odds at lock time for market bets
             market = sel.get("market", "h2h")
             if market == "h2h":
-                odds = match.get("odds", {}).get("h2h", {})
+                odds = get_current_market(match, "h2h")
                 pick = sel.get("pick")
                 if pick and pick in odds:
                     sel["locked_odds"] = odds[pick]
             elif market == "totals":
-                totals = match.get("odds", {}).get("totals", {})
+                totals = get_current_market(match, "totals")
                 pick = sel.get("pick")
                 if pick and pick in totals:
                     sel["locked_odds"] = totals[pick]
@@ -391,19 +399,11 @@ async def _auto_close_stale_matches(now: datetime) -> None:
 
         for match in stale:
             update: dict = {"status": "final", "updated_at": now}
-            # Freeze closing line if transitioning from scheduled (no prior capture)
-            odds = match.get("odds", {})
-            if match.get("status") == "scheduled" and not odds.get("closing_line"):
-                update["odds.closing_line"] = {
-                    "h2h": odds.get("h2h", {}),
-                    "totals": odds.get("totals", {}),
-                    "spreads": odds.get("spreads", {}),
-                    "frozen_at": now,
-                }
             await _db.db.matches.update_one(
                 {"_id": match["_id"]},
                 {"$set": update},
             )
+            await odds_service.set_closing_from_current(match["_id"])
             match_id = str(match["_id"])
             logger.warning(
                 "Auto-closed stale match %s (%s vs %s, %s) — no provider result, needs admin review",
@@ -436,6 +436,7 @@ async def _resolve_match(
             }
         },
     )
+    await odds_service.set_closing_from_current(match["_id"])
 
     # Find all slips with selections on this match (pending, partial, or draft with locked legs)
     affected_slips = await _db.db.betting_slips.find({
@@ -560,6 +561,59 @@ async def _resolve_match(
                 "was_correct": result == bet_doc.get("recommended_selection"),
             }},
         )
+
+
+async def resolve_single_match(match_id: ObjectId | str) -> None:
+    """Resolve one finalized match on demand from event handlers.
+
+    Idempotent behavior:
+    - skips if match does not exist
+    - skips if score/result is incomplete
+    - skips if already resolved and no unresolved dependent slips remain
+    """
+    try:
+        oid = match_id if isinstance(match_id, ObjectId) else ObjectId(str(match_id))
+    except Exception:
+        return
+
+    match = await _db.db.matches.find_one({"_id": oid})
+    if not match:
+        return
+
+    match_id_str = str(oid)
+    unresolved = await _db.db.betting_slips.find_one(
+        {
+            "selections.match_id": match_id_str,
+            "status": {"$in": ["pending", "partial", "draft"]},
+        },
+        {"_id": 1},
+    )
+    if not unresolved and match.get("result", {}).get("outcome"):
+        return
+
+    result_obj = match.get("result") if isinstance(match.get("result"), dict) else {}
+    score_obj = match.get("score") if isinstance(match.get("score"), dict) else {}
+    full_time = score_obj.get("full_time") if isinstance(score_obj.get("full_time"), dict) else {}
+
+    home_score = result_obj.get("home_score")
+    away_score = result_obj.get("away_score")
+    if home_score is None:
+        home_score = full_time.get("home")
+    if away_score is None:
+        away_score = full_time.get("away")
+    if home_score is None or away_score is None:
+        return
+
+    outcome = result_obj.get("outcome")
+    if not outcome:
+        if int(home_score) > int(away_score):
+            outcome = "1"
+        elif int(away_score) > int(home_score):
+            outcome = "2"
+        else:
+            outcome = "X"
+
+    await _resolve_match(match, str(outcome), int(home_score), int(away_score))
 
 
 async def _find_match_by_team(

@@ -1,23 +1,49 @@
-"""Team profile service.
+"""
+backend/app/services/team_service.py
 
-Aggregates team data from the unified ``matches`` collection and
-``team_mappings`` for the team detail page.
+Purpose:
+    Team profile service built on Team Tower identities. Provides search and
+    team detail aggregates from teams + matches using ObjectId references.
+
+Dependencies:
+    - app.database
+    - app.services.team_registry_service
+    - app.services.historical_service
+    - app.utils
 """
 
 import logging
 import re
 
+from bson import ObjectId
+
 import app.database as _db
 from app.services.historical_service import sport_keys_for
-from app.services.team_mapping_service import (
-    team_name_key,
-    derive_season_year,
-    season_code,
-    season_label,
-)
+from app.services.team_registry_service import TeamRegistry
 from app.utils import utcnow
 
 logger = logging.getLogger("quotico.team_service")
+
+
+def _slug(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", (value or "").lower()).strip("-")
+
+
+def _derive_season_year() -> int:
+    now = utcnow()
+    return now.year if now.month >= 7 else now.year - 1
+
+
+def _serialize_team_ids(match_doc: dict) -> dict:
+    """Convert Team Tower ObjectId refs in a match snippet to strings for JSON responses."""
+    out = dict(match_doc)
+    home_id = out.get("home_team_id")
+    away_id = out.get("away_team_id")
+    if isinstance(home_id, ObjectId):
+        out["home_team_id"] = str(home_id)
+    if isinstance(away_id, ObjectId):
+        out["away_team_id"] = str(away_id)
+    return out
 
 
 async def search_teams(
@@ -25,80 +51,74 @@ async def search_teams(
     sport_key: str | None = None,
     limit: int = 20,
 ) -> list[dict]:
-    """Search teams by name across team_mappings."""
-    escaped = re.escape(query)
+    """Search teams by display name or aliases, optionally sport-scoped."""
+    escaped = re.escape((query or "").strip())
     filt: dict = {
         "$or": [
             {"display_name": {"$regex": escaped, "$options": "i"}},
-            {"names": {"$regex": escaped, "$options": "i"}},
+            {"aliases.name": {"$regex": escaped, "$options": "i"}},
         ],
     }
     if sport_key:
-        filt["sport_keys"] = sport_key
+        filt["$or"] = [
+            {"sport_key": sport_key},
+            {"aliases": {"$elemMatch": {"sport_key": sport_key}}},
+            {"aliases": {"$elemMatch": {"sport_key": None}}},
+        ]
 
-    docs = await _db.db.team_mappings.find(filt).sort(
-        "display_name", 1,
-    ).limit(limit).to_list(length=limit)
+    docs = await _db.db.teams.find(
+        filt,
+        {
+            "display_name": 1,
+            "league_ids": 1,
+            "aliases.sport_key": 1,
+            "sport_key": 1,
+        },
+    ).sort("display_name", 1).limit(limit).to_list(length=limit)
 
     return [
         {
-            "team_key": team_name_key(doc["display_name"]),
-            "display_name": doc["display_name"],
-            "slug": team_name_key(doc["display_name"]).replace(" ", "-"),
-            "sport_keys": doc.get("sport_keys", []),
-            "current_league": doc.get("sport_keys", [None])[0],
+            "team_id": str(doc["_id"]),
+            "display_name": doc.get("display_name", ""),
+            "slug": _slug(doc.get("display_name", "")),
+            "sport_keys": sorted({
+                *(a.get("sport_key") for a in doc.get("aliases", []) if a.get("sport_key")),
+                doc.get("sport_key"),
+            } - {None}),
+            "current_league": None,
         }
         for doc in docs
     ]
 
 
 async def get_team_profile(team_slug: str, sport_key: str | None = None) -> dict | None:
-    """Build a full team profile from a URL slug.
+    """Build team profile by normalized display-name slug."""
+    slug = (team_slug or "").strip().lower()
+    docs = await _db.db.teams.find({}, {"display_name": 1}).to_list(length=5000)
+    team = next((d for d in docs if _slug(d.get("display_name", "")) == slug), None)
 
-    Slug format: lowercase, hyphens (e.g. "bayern-munich").
-    Backend converts hyphens to spaces for team_name_key resolution.
-    """
-    search_key = team_slug.replace("-", " ").strip()
+    if not team and sport_key:
+        registry = TeamRegistry.get()
+        team_id = await registry.resolve(slug.replace("-", " "), sport_key)
+        team = await _db.db.teams.find_one({"_id": team_id}) if team_id else None
 
-    if sport_key:
-        related_keys = sport_keys_for(sport_key)
-    else:
-        related_keys = sport_keys_for("soccer_germany_bundesliga")
+    if not team:
+        return None
 
-    # Try to find a mapping whose team_name_key matches
-    team_key = team_name_key(search_key)
-    display_name = await _get_display_name(team_key)
+    team_id = team["_id"]
+    display_name = team.get("display_name", "")
+    related_keys = sport_keys_for(sport_key) if sport_key else None
 
-    if not display_name:
-        # No team mapping found — check if any match uses this key
-        exists = await _db.db.matches.find_one(
-            {
-                "$or": [{"home_team_key": team_key}, {"away_team_key": team_key}],
-            },
-            {"_id": 1},
-        )
-        if not exists:
-            return None
-        display_name = team_key.title()
-
-    # Determine which sport_keys this team appears in
-    team_sport_keys = await _db.db.matches.distinct(
-        "sport_key",
-        {
-            "status": "final",
-            "$or": [{"home_team_key": team_key}, {"away_team_key": team_key}],
-        },
-    )
-
-    season_stats = await get_team_season_stats(team_key, related_keys)
-    recent = await _get_recent_results(team_key, related_keys, limit=15)
-    form = _compute_form(recent, team_key)
-    upcoming = await get_team_upcoming_matches(team_key, related_keys)
+    season_stats = await get_team_season_stats(team_id, related_keys)
+    recent = await _get_recent_results(team_id, related_keys, limit=15)
+    form = _compute_form(recent, team_id)
+    upcoming = await get_team_upcoming_matches(team_id, related_keys)
 
     return {
-        "team_key": team_key,
+        "team_id": str(team_id),
         "display_name": display_name,
-        "sport_keys": team_sport_keys or (related_keys[:1] if related_keys else []),
+        "needs_review": bool(team.get("needs_review", False)),
+        "aliases": team.get("aliases", []),
         "form": form[:5],
         "recent_results": recent,
         "season_stats": season_stats,
@@ -106,52 +126,50 @@ async def get_team_profile(team_slug: str, sport_key: str | None = None) -> dict
     }
 
 
-async def _get_display_name(team_key: str) -> str | None:
-    """Find the best display name for a team_key from team_mappings."""
-    # Fetch all mappings and find the one whose display_name normalizes to team_key
-    docs = await _db.db.team_mappings.find(
-        {}, {"display_name": 1},
-    ).to_list(length=5000)
-
-    for doc in docs:
-        if team_name_key(doc["display_name"]) == team_key:
-            return doc["display_name"]
-
-    return None
-
-
 async def _get_recent_results(
-    team_key: str, related_keys: list[str], limit: int = 15,
+    team_id,
+    related_keys: list[str] | None,
+    limit: int = 15,
 ) -> list[dict]:
-    """Fetch recent finalized matches for a team."""
-    proj = {
-        "_id": 0,
-        "match_date": 1, "home_team": 1, "away_team": 1,
-        "home_team_key": 1, "away_team_key": 1,
-        "result.home_score": 1, "result.away_score": 1, "result.outcome": 1,
-        "season_label": 1, "sport_key": 1,
+    """Fetch recent finalized matches for a team by ObjectId."""
+    query: dict = {
+        "status": "final",
+        "$or": [
+            {"home_team_id": team_id},
+            {"away_team_id": team_id},
+        ],
     }
-    return await _db.db.matches.find(
+    if related_keys:
+        query["sport_key"] = {"$in": related_keys}
+
+    matches = await _db.db.matches.find(
+        query,
         {
-            "sport_key": {"$in": related_keys},
-            "status": "final",
-            "$or": [
-                {"home_team_key": team_key},
-                {"away_team_key": team_key},
-            ],
+            "_id": 0,
+            "match_date": 1,
+            "home_team": 1,
+            "away_team": 1,
+            "home_team_id": 1,
+            "away_team_id": 1,
+            "result.home_score": 1,
+            "result.away_score": 1,
+            "result.outcome": 1,
+            "sport_key": 1,
+            "season": 1,
         },
-        proj,
     ).sort("match_date", -1).to_list(length=limit)
 
+    return [_serialize_team_ids(m) for m in matches]
 
-def _compute_form(matches: list[dict], team_key: str) -> list[str]:
-    """Derive W/D/L form string from recent results."""
+
+def _compute_form(matches: list[dict], team_id) -> list[str]:
+    """Derive W/D/L form string from recent results using team IDs."""
     form: list[str] = []
     for m in matches:
         r = m.get("result", {})
         hg = r.get("home_score", 0) or 0
         ag = r.get("away_score", 0) or 0
-        is_home = m.get("home_team_key") == team_key
+        is_home = m.get("home_team_id") == team_id
 
         if hg == ag:
             form.append("D")
@@ -163,26 +181,29 @@ def _compute_form(matches: list[dict], team_key: str) -> list[str]:
 
 
 async def get_team_season_stats(
-    team_key: str, related_keys: list[str],
+    team_id,
+    related_keys: list[str] | None,
 ) -> dict | None:
-    """Aggregate season stats from finalized matches for the current season."""
-    now = utcnow()
-    sy = derive_season_year(now)
-    sc = season_code(sy)
+    """Aggregate current-season stats for a team by ObjectId."""
+    season_year = _derive_season_year()
+    query: dict = {
+        "status": "final",
+        "season": season_year,
+        "$or": [
+            {"home_team_id": team_id},
+            {"away_team_id": team_id},
+        ],
+    }
+    if related_keys:
+        query["sport_key"] = {"$in": related_keys}
 
     matches = await _db.db.matches.find(
+        query,
         {
-            "sport_key": {"$in": related_keys},
-            "status": "final",
-            "season": sc,
-            "$or": [
-                {"home_team_key": team_key},
-                {"away_team_key": team_key},
-            ],
-        },
-        {
-            "_id": 0, "home_team_key": 1,
-            "result.home_score": 1, "result.away_score": 1,
+            "_id": 0,
+            "home_team_id": 1,
+            "result.home_score": 1,
+            "result.away_score": 1,
             "sport_key": 1,
         },
     ).to_list(length=500)
@@ -198,29 +219,35 @@ async def get_team_season_stats(
         r = m.get("result", {})
         hg = r.get("home_score", 0) or 0
         ag = r.get("away_score", 0) or 0
-        is_home = m["home_team_key"] == team_key
+        is_home = m.get("home_team_id") == team_id
 
         if is_home:
             gf += hg
             ga += ag
             if hg > ag:
-                wins += 1; home_w += 1
+                wins += 1
+                home_w += 1
             elif hg == ag:
-                draws += 1; home_d += 1
+                draws += 1
+                home_d += 1
             else:
-                losses += 1; home_l += 1
+                losses += 1
+                home_l += 1
         else:
             gf += ag
             ga += hg
             if ag > hg:
-                wins += 1; away_w += 1
+                wins += 1
+                away_w += 1
             elif ag == hg:
-                draws += 1; away_d += 1
+                draws += 1
+                away_d += 1
             else:
-                losses += 1; away_l += 1
+                losses += 1
+                away_l += 1
 
     return {
-        "season_label": season_label(sy),
+        "season": season_year,
         "matches_played": len(matches),
         "wins": wins,
         "draws": draws,
@@ -235,35 +262,43 @@ async def get_team_season_stats(
 
 
 async def get_team_upcoming_matches(
-    team_key: str, related_keys: list[str], limit: int = 10,
+    team_id,
+    related_keys: list[str] | None,
+    limit: int = 10,
 ) -> list[dict]:
-    """Find upcoming matches where this team is playing.
+    """Find upcoming matches where this team is playing."""
+    query: dict = {
+        "status": {"$in": ["scheduled", "live"]},
+        "$or": [
+            {"home_team_id": team_id},
+            {"away_team_id": team_id},
+        ],
+    }
+    if related_keys:
+        query["sport_key"] = {"$in": related_keys}
 
-    Uses home_team_key/away_team_key directly — no alias lookup needed.
-    """
     matches = await _db.db.matches.find(
+        query,
         {
-            "status": "scheduled",
-            "$or": [
-                {"home_team_key": team_key},
-                {"away_team_key": team_key},
-            ],
-        },
-        {
-            "_id": 1, "sport_key": 1, "home_team": 1, "away_team": 1,
-            "match_date": 1, "odds": 1, "status": 1,
+            "_id": 1,
+            "sport_key": 1,
+            "home_team": 1,
+            "away_team": 1,
+            "match_date": 1,
+            "odds": 1,
+            "status": 1,
         },
     ).sort("match_date", 1).to_list(length=limit)
 
     return [
         {
             "id": str(m["_id"]),
-            "sport_key": m["sport_key"],
-            "home_team": m["home_team"],
-            "away_team": m["away_team"],
-            "match_date": m["match_date"],
+            "sport_key": m.get("sport_key"),
+            "home_team": m.get("home_team"),
+            "away_team": m.get("away_team"),
+            "match_date": m.get("match_date"),
             "odds": m.get("odds", {}),
-            "status": m["status"],
+            "status": m.get("status"),
         }
         for m in matches
     ]

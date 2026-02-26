@@ -9,6 +9,8 @@ Purpose:
 Dependencies:
     - pydantic
     - bson.ObjectId
+    - app.models.common.PyObjectId
+    - app.services.odds_meta_service
     - app.utils.ensure_utc
 """
 
@@ -19,8 +21,10 @@ from enum import Enum
 from typing import Any
 
 from bson import ObjectId
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
+from app.models.common import PyObjectId
+from app.services.odds_meta_service import build_legacy_like_odds
 from app.utils import ensure_utc
 
 
@@ -45,10 +49,11 @@ class MatchScore(BaseModel):
 
 
 class MatchInDB(BaseModel):
-    league_id: ObjectId
+    id: PyObjectId | None = Field(alias="_id", default=None)
+    league_id: PyObjectId
     sport_key: str
-    home_team_id: ObjectId
-    away_team_id: ObjectId
+    home_team_id: PyObjectId
+    away_team_id: PyObjectId
     match_date: datetime
     last_updated: datetime
     matchday: int | None = None
@@ -60,6 +65,16 @@ class MatchInDB(BaseModel):
     score_extra_time: ScoreDetail | None = None
     score_penalties: ScoreDetail | None = None
     external_ids: dict[str, str] = Field(default_factory=dict)
+
+    model_config = ConfigDict(
+        populate_by_name=True,
+        arbitrary_types_allowed=True,
+        json_encoders={ObjectId: str},
+    )
+
+
+class Match(MatchInDB):
+    pass
 
 
 class OddsResponse(BaseModel):
@@ -82,6 +97,7 @@ class MatchResponse(BaseModel):
     away_team: str
     match_date: datetime
     status: str
+    odds_meta: dict[str, Any] = Field(default_factory=dict)
     odds: OddsResponse
     result: ResultResponse
 
@@ -116,7 +132,7 @@ def db_to_response(doc: dict) -> MatchResponse:
     full_time = score.get("full_time", {}) if isinstance(score, dict) else {}
     home_score, away_score = _coerce_score(full_time)
 
-    odds = doc.get("odds", {})
+    odds = build_legacy_like_odds(doc)
     return MatchResponse(
         id=str(doc["_id"]),
         sport_key=str(doc.get("sport_key") or ""),
@@ -124,6 +140,7 @@ def db_to_response(doc: dict) -> MatchResponse:
         away_team=str(doc.get("away_team") or ""),
         match_date=ensure_utc(doc.get("match_date")),
         status=str(doc.get("status") or MatchStatus.SCHEDULED.value),
+        odds_meta=doc.get("odds_meta", {}) if isinstance(doc.get("odds_meta"), dict) else {},
         odds=OddsResponse(
             h2h=odds.get("h2h", {}) if isinstance(odds, dict) else {},
             totals=odds.get("totals", {}) if isinstance(odds, dict) else {},

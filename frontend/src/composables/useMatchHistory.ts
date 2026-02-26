@@ -1,3 +1,11 @@
+/**
+ * frontend/src/composables/useMatchHistory.ts
+ *
+ * Purpose:
+ * Loads and caches historical match context (H2H + form) for fixture cards.
+ * Uses Team Tower identifiers (`home_team_id` / `away_team_id`) exclusively.
+ */
+
 import { ref, type Ref } from "vue";
 import { useApi } from "./useApi";
 
@@ -11,14 +19,16 @@ export interface H2HSummary {
   btts_pct: number;
   avg_home_xg?: number;
   avg_away_xg?: number;
+  xg_samples_used?: number;
+  xg_samples_total?: number;
 }
 
 export interface HistoricalMatch {
   match_date: string;
   home_team: string;
   away_team: string;
-  home_team_key: string;
-  away_team_key: string;
+  home_team_id: string;
+  away_team_id: string;
   result: {
     home_score: number;
     away_score: number;
@@ -36,8 +46,8 @@ export interface MatchContext {
   } | null;
   home_form: HistoricalMatch[];
   away_form: HistoricalMatch[];
-  home_team_key: string;
-  away_team_key: string;
+  home_team_id: string;
+  away_team_id: string;
 }
 
 interface BulkFixture {
@@ -85,8 +95,8 @@ export async function prefetchMatchHistory(
         h2h: r.h2h,
         home_form: r.home_form,
         away_form: r.away_form,
-        home_team_key: r.home_team_key,
-        away_team_key: r.away_team_key,
+        home_team_id: r.home_team_id,
+        away_team_id: r.away_team_id,
       });
     }
   } catch {

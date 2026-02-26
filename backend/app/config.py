@@ -1,9 +1,21 @@
+"""
+backend/app/config.py
+
+Purpose:
+    Central settings loading for backend services.
+
+Dependencies:
+    - pydantic-settings
+    - pathlib
+"""
+
 from pathlib import Path
 
 from pydantic_settings import BaseSettings
 
-# .env is at project root (one level up from backend/)
-_ENV_FILE = Path(__file__).resolve().parent.parent.parent / ".env"
+# Prefer backend/.env, fallback to project-root .env.
+_BACKEND_ENV_FILE = Path(__file__).resolve().parent.parent / ".env"
+_ROOT_ENV_FILE = Path(__file__).resolve().parent.parent.parent / ".env"
 
 
 class Settings(BaseSettings):
@@ -34,15 +46,67 @@ class Settings(BaseSettings):
     SEED_ADMIN_PASSWORD: str = ""
 
     # football-data.org (free scores + live data)
-    FOOTBALL_DATA_API_KEY: str = ""
+    FOOTBALL_DATA_ORG_API_KEY: str = ""
+    FOOTBALL_DATA_ORG_BASE_URL: str = "https://api.football-data.org/v4"
 
     # API key for local tools (scraper import etc.)
     IMPORT_API_KEY: str = ""
 
+    # Provider runtime settings fallback (DB-first: DB > ENV > defaults)
+    THEODDSAPI_BASE_URL: str = "https://api.the-odds-api.com/v4"
+    OPENLIGADB_BASE_URL: str = "https://api.openligadb.de"
+    FOOTBALL_DATA_UK_BASE_URL: str = "https://www.football-data.co.uk/mmz4281"
+    UNDERSTAT_BASE_URL: str = "https://understat.com"
+    PROVIDER_SETTINGS_CACHE_TTL: int = 15
+    THEODDSAPI_RATE_LIMIT_RPM: int = 30
+    FOOTBALL_DATA_RATE_LIMIT_RPM: int = 10
+    OPENLIGADB_RATE_LIMIT_RPM: int = 120
+    FOOTBALL_DATA_UK_RATE_LIMIT_RPM: int = 30
+    UNDERSTAT_RATE_LIMIT_RPM: int = 30
+
     # Q-Bot: minimum QuoticoTip confidence to auto-bet
     QBOT_MIN_CONFIDENCE: float = 0.55
 
-    model_config = {"env_file": str(_ENV_FILE), "extra": "ignore"}
+    # Event bus (in-process, V1)
+    EVENT_BUS_ENABLED: bool = True
+    EVENT_BUS_INGRESS_QUEUE_MAXSIZE: int = 10000
+    EVENT_BUS_HANDLER_QUEUE_MAXSIZE: int = 2000
+    EVENT_BUS_HANDLER_DEFAULT_CONCURRENCY: int = 1
+    EVENT_BUS_ERROR_BUFFER_SIZE: int = 200
+    EVENT_PUBLISH_FOOTBALL_DATA: bool = True
+    EVENT_PUBLISH_OPENLIGADB: bool = True
+    EVENT_PUBLISH_FOOTBALL_DATA_UK: bool = True
+    EVENT_PUBLISH_THEODDSAPI: bool = True
+    EVENT_PUBLISH_ODDS_INGESTED: bool = True
+    EVENT_HANDLER_MATCH_FINALIZED_ENABLED: bool = True
+    EVENT_HANDLER_MATCH_UPDATED_ENABLED: bool = True
+    EVENT_HANDLER_ODDS_INGESTED_ENABLED: bool = True
+    EVENT_HANDLER_WS_BROADCAST_ENABLED: bool = True
+
+    # WebSocket realtime stream
+    WS_EVENTS_ENABLED: bool = True
+    WS_HEARTBEAT_SECONDS: int = 30
+    WS_MAX_CONNECTIONS: int = 500
+
+    # QBus monitor
+    QBUS_MONITOR_ENABLED: bool = True
+    QBUS_MONITOR_SAMPLING_SECONDS: int = 10
+    QBUS_MONITOR_TTL_DAYS: int = 7
+    QBUS_ALERT_QUEUE_WARN_PCT: float = 80.0
+    QBUS_ALERT_QUEUE_CRIT_PCT: float = 95.0
+    QBUS_ALERT_FAILED_RATE_WARN: float = 0.05
+    QBUS_ALERT_FAILED_RATE_CRIT: float = 0.10
+    QBUS_ALERT_DROPPED_WARN_PER_MIN: int = 1
+    QBUS_ALERT_DROPPED_CRIT_PER_MIN: int = 5
+    QBUS_ALERT_LATENCY_P95_WARN_MS: int = 500
+    QBUS_ALERT_LATENCY_P95_CRIT_MS: int = 1500
+    QTIP_BACKFILL_NO_SIGNAL_WARN_PCT: float = 30.0
+    QTIP_BACKFILL_ADMIN_MAX_MATCHES: int = 2000
+
+    model_config = {
+        "env_file": (str(_BACKEND_ENV_FILE), str(_ROOT_ENV_FILE)),
+        "extra": "ignore",
+    }
 
 
 settings = Settings()

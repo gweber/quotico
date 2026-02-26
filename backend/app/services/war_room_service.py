@@ -1,10 +1,22 @@
-"""Squad War Room service — per-match squad bet visibility with Shadow Logic."""
+"""
+backend/app/services/war_room_service.py
+
+Purpose:
+    Build squad war room payloads for a specific match with shadow logic and
+    reveal rules around kickoff.
+
+Dependencies:
+    - app.database
+    - app.utils
+    - app.services.odds_meta_service
+"""
 
 from bson import ObjectId
 from fastapi import HTTPException, status
 
 import app.database as _db
 from app.utils import utcnow, ensure_utc
+from app.services.odds_meta_service import build_legacy_like_odds
 
 
 async def get_war_room(
@@ -76,7 +88,7 @@ async def get_war_room(
         "away_team": match["away_team"],
         "match_date": match["match_date"],
         "status": match["status"],
-        "odds": match.get("odds", {}),
+        "odds": build_legacy_like_odds(match),
         "result": match.get("result", {}),
     }
 

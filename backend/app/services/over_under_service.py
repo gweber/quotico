@@ -1,4 +1,15 @@
-"""Over/Under mode — bet on total goals above or below a line."""
+"""
+backend/app/services/over_under_service.py
+
+Purpose:
+    Over/Under betting service using aggregated totals odds from match
+    odds_meta and wallet-safe stake handling.
+
+Dependencies:
+    - app.database
+    - app.services.wallet_service
+    - app.services.odds_meta_service
+"""
 
 import logging
 
@@ -7,6 +18,7 @@ from fastapi import HTTPException, status
 
 import app.database as _db
 from app.models.wallet import BetStatus
+from app.services.odds_meta_service import build_legacy_like_odds
 from app.services import wallet_service
 from app.utils import utcnow, ensure_utc
 
@@ -45,7 +57,7 @@ async def place_bet(
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Bets only for upcoming matches.")
 
     # Get totals odds
-    totals = match.get("odds", {}).get("totals", {})
+    totals = build_legacy_like_odds(match).get("totals", {})
     if not totals or "line" not in totals:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "No over/under odds available for this match.")
 

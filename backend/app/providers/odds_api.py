@@ -20,10 +20,12 @@ from typing import Any, Optional
 from app.config import settings
 from app.providers.base import BaseProvider
 from app.providers.http_client import ResilientClient
+from app.services.provider_rate_limiter import provider_rate_limiter
+from app.services.provider_settings_service import provider_settings_service
 
 logger = logging.getLogger("quotico.odds_api")
 
-BASE_URL = "https://api.the-odds-api.com/v4"
+PROVIDER_NAME = "theoddsapi"
 
 # Sport key mapping: TheOddsAPI sport keys we support
 SUPPORTED_SPORTS = [
@@ -90,6 +92,28 @@ class TheOddsAPIProvider(BaseProvider):
         self._cache = OddsCache(ttl=settings.ODDS_CACHE_TTL_SECONDS)
         self._api_usage = {"requests_used": 0, "requests_remaining": None}
         self._usage_loaded = False
+        self._runtime_fingerprint: tuple[float, int, float] | None = None
+
+    async def _runtime(self, sport_key: str | None = None) -> dict[str, Any]:
+        payload = await provider_settings_service.get_effective(
+            PROVIDER_NAME,
+            sport_key=sport_key,
+            include_secret=True,
+        )
+        effective = dict(payload.get("effective_config") or {})
+        timeout = float(effective.get("timeout_seconds") or 15.0)
+        retries = int(effective.get("max_retries") or 3)
+        base_delay = float(effective.get("base_delay_seconds") or 10.0)
+        fp = (timeout, retries, base_delay)
+        if fp != self._runtime_fingerprint:
+            if hasattr(self._client, "_max_retries"):
+                self._client._max_retries = retries
+            if hasattr(self._client, "_base_delay"):
+                self._client._base_delay = base_delay
+            if hasattr(self._client, "_client"):
+                self._client._client.timeout = timeout
+            self._runtime_fingerprint = fp
+        return effective
 
     async def _load_persisted_usage(self) -> None:
         """Load API usage from DB on first access."""
@@ -154,15 +178,25 @@ class TheOddsAPIProvider(BaseProvider):
                 return stale if stale is not None else []
 
             try:
+                runtime = await self._runtime(sport_key=sport_key)
+                if not bool(runtime.get("enabled", True)):
+                    return []
+                api_key = str(runtime.get("api_key") or "")
+                if not api_key:
+                    return []
+                base_url = str(runtime.get("base_url") or "")
+                if not base_url:
+                    return []
+                await provider_rate_limiter.acquire(PROVIDER_NAME, runtime.get("rate_limit_rpm"))
                 is_three_way = sport_key in THREE_WAY_SPORTS
 
                 # All sports use h2h market only
                 markets = "h2h"
 
                 resp = await self._client.get(
-                    f"{BASE_URL}/sports/{sport_key}/odds",
+                    f"{base_url}/sports/{sport_key}/odds",
                     params={
-                        "apiKey": settings.ODDSAPIKEY,
+                        "apiKey": api_key,
                         "regions": "eu",
                         "markets": markets,
                         "oddsFormat": "decimal",
@@ -197,10 +231,20 @@ class TheOddsAPIProvider(BaseProvider):
             return stale if stale is not None else []
 
         try:
+            runtime = await self._runtime(sport_key=sport_key)
+            if not bool(runtime.get("enabled", True)):
+                return []
+            api_key = str(runtime.get("api_key") or "")
+            if not api_key:
+                return []
+            base_url = str(runtime.get("base_url") or "")
+            if not base_url:
+                return []
+            await provider_rate_limiter.acquire(PROVIDER_NAME, runtime.get("rate_limit_rpm"))
             resp = await self._client.get(
-                f"{BASE_URL}/sports/{sport_key}/scores",
+                f"{base_url}/sports/{sport_key}/scores",
                 params={
-                    "apiKey": settings.ODDSAPIKEY,
+                    "apiKey": api_key,
                     "daysFrom": 3,
                 },
             )

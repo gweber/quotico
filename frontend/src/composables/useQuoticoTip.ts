@@ -1,3 +1,9 @@
+/**
+ * frontend/src/composables/useQuoticoTip.ts
+ *
+ * Purpose:
+ *     Typed API/composable layer for QuoticoTip fetch, cache, and refresh flows.
+ */
 import { ref, reactive, type Ref } from "vue";
 import { useApi } from "./useApi";
 
@@ -65,8 +71,30 @@ export interface QbotLogic {
   stake_units?: number;
   kelly_raw?: number;
   bayesian_confidence?: number;
+  market_synergy_factor?: number;
+  market_trust_factor?: number;
+  market_context?: {
+    volatility_dim?: string;
+  };
   cluster_key?: string;
   cluster_sample_size?: number;
+  is_midweek?: boolean;
+  is_weekend?: boolean;
+  post_match_reasoning?: {
+    type?: string;
+    red_cards?: number;
+    xg_home?: number;
+    xg_away?: number;
+    efficiency_home?: number;
+    efficiency_away?: number;
+    efficient_team?: "home" | "away";
+    goals_home?: number;
+    goals_away?: number;
+    xg_delta?: number;
+    expected_winner?: "home" | "away" | "draw";
+    actual_outcome?: "home" | "away" | "draw";
+    [key: string]: unknown;
+  };
   // Player mode (always present when Poisson data available)
   player?: PlayerPrediction;
   applied_at: string;

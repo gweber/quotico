@@ -53,9 +53,9 @@ function formatDateTime(dateStr: string): string {
 }
 
 // Result indicator for a match relative to this team
-function matchResult(m: { home_team_key?: string; result: { home_score: number; away_score: number } }): string {
+function matchResult(m: { home_team_id?: string; result: { home_score: number; away_score: number } }): string {
   if (!team.value) return "";
-  const isHome = m.home_team_key === team.value.team_key;
+  const isHome = m.home_team_id === team.value.team_key;
   const hg = m.result.home_score;
   const ag = m.result.away_score;
   if (hg === ag) return "D";
@@ -63,16 +63,16 @@ function matchResult(m: { home_team_key?: string; result: { home_score: number; 
   return "L";
 }
 
-function opponent(m: { home_team?: string; away_team?: string; home_team_key?: string }): string {
+function opponent(m: { home_team?: string; away_team?: string; home_team_id?: string }): string {
   if (!team.value) return "";
-  return m.home_team_key === team.value.team_key ? (m.away_team || "") : (m.home_team || "");
+  return m.home_team_id === team.value.team_key ? (m.away_team || "") : (m.home_team || "");
 }
 
-function isHome(m: { home_team_key?: string }): boolean {
-  return m.home_team_key === team.value?.team_key;
+function isHome(m: { home_team_id?: string }): boolean {
+  return m.home_team_id === team.value?.team_key;
 }
 
-function opponentSlug(m: { home_team?: string; away_team?: string; home_team_key?: string }): string {
+function opponentSlug(m: { home_team?: string; away_team?: string; home_team_id?: string }): string {
   return teamSlug(opponent(m));
 }
 

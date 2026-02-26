@@ -9,11 +9,15 @@ Dependencies:
     - enum.Enum
     - pydantic.BaseModel
     - pydantic.Field
+    - app.models.common.PyObjectId
 """
 
 from enum import Enum
 
-from pydantic import BaseModel, Field
+from bson import ObjectId
+from pydantic import BaseModel, ConfigDict, Field
+
+from app.models.common import PyObjectId
 
 
 class LeagueType(str, Enum):
@@ -30,6 +34,7 @@ class LeagueFeatures(BaseModel):
 
 
 class League(BaseModel):
+    id: PyObjectId | None = Field(alias="_id", default=None)
     sport_key: str
     display_name: str
     structure_type: LeagueType = LeagueType.LEAGUE
@@ -41,3 +46,9 @@ class League(BaseModel):
     needs_review: bool = False
     features: LeagueFeatures = Field(default_factory=LeagueFeatures)
     external_ids: dict[str, str] = Field(default_factory=dict)
+
+    model_config = ConfigDict(
+        populate_by_name=True,
+        arbitrary_types_allowed=True,
+        json_encoders={ObjectId: str},
+    )

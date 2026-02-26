@@ -24,105 +24,8 @@ logger = logging.getLogger("quotico.league_registry")
 _NAV_CACHE_TTL = timedelta(hours=1)
 _nav_cache_data: list[dict] | None = None
 _nav_cache_expires_at: datetime | None = None
-
-CORE_LEAGUES = [
-    {
-        "sport_key": "soccer_germany_bundesliga",
-        "name": "Bundesliga",
-        "structure_type": "league",
-        "country": "Germany",
-        "level": 1,
-        "external_ids": {
-            "theoddsapi": "soccer_germany_bundesliga",
-            "openligadb": "bl1",
-            "football_data_uk": "D1",
-            "football_data": "BL1",
-            "understat": "GER-Bundesliga",
-        },
-    },
-    {
-        "sport_key": "soccer_germany_bundesliga2",
-        "name": "2. Bundesliga",
-        "structure_type": "league",
-        "country": "Germany",
-        "level": 2,
-        "external_ids": {
-            "theoddsapi": "soccer_germany_bundesliga2",
-            "openligadb": "bl2",
-        },
-    },
-    {
-        "sport_key": "soccer_epl",
-        "name": "Premier League",
-        "structure_type": "league",
-        "country": "England",
-        "level": 1,
-        "external_ids": {
-            "theoddsapi": "soccer_epl",
-            "football_data_uk": "E0",
-            "football_data": "PL",
-            "understat": "ENG-Premier League",
-        },
-    },
-    {
-        "sport_key": "soccer_spain_la_liga",
-        "name": "La Liga",
-        "structure_type": "league",
-        "country": "Spain",
-        "level": 1,
-        "external_ids": {
-            "theoddsapi": "soccer_spain_la_liga",
-            "football_data": "PD",
-            "understat": "ESP-La Liga",
-        },
-    },
-    {
-        "sport_key": "soccer_italy_serie_a",
-        "name": "Serie A",
-        "structure_type": "league",
-        "country": "Italy",
-        "level": 1,
-        "external_ids": {
-            "theoddsapi": "soccer_italy_serie_a",
-            "football_data": "SA",
-            "understat": "ITA-Serie A",
-        },
-    },
-    {
-        "sport_key": "soccer_france_ligue_one",
-        "name": "Ligue 1",
-        "structure_type": "league",
-        "country": "France",
-        "level": 1,
-        "external_ids": {
-            "theoddsapi": "soccer_france_ligue_one",
-            "football_data": "FL1",
-            "understat": "FRA-Ligue 1",
-        },
-    },
-    {
-        "sport_key": "soccer_uefa_champs_league",
-        "name": "Champions League",
-        "structure_type": "tournament",
-        "country": "Europe",
-        "level": 1,
-        "external_ids": {
-            "theoddsapi": "soccer_uefa_champs_league",
-            "football_data": "CL",
-        },
-    },
-    {
-        "sport_key": "soccer_germany_dfb_pokal",
-        "name": "DFB-Pokal",
-        "structure_type": "cup",
-        "country": "Germany",
-        "level": 1,
-        "external_ids": {
-            "theoddsapi": "soccer_germany_dfb_pokal",
-        },
-    },
-]
-
+_DEFAULT_SOCCER_SEASON_START_MONTH = 7
+_SEASON_START_MONTH_OVERRIDES: dict[str, int] = {}
 
 def _tier_from_level(level: int | None) -> str:
     if level is None:
@@ -152,8 +55,28 @@ def _provider_key(provider_name: str, provider_id: str) -> tuple[str, str]:
     return ((provider_name or "").strip().lower(), str(provider_id).strip())
 
 
-def _default_current_season() -> int:
-    return utcnow().year
+def default_season_start_month_for_sport(sport_key: str | None) -> int:
+    """Return the default season start month for a league key."""
+    normalized = (sport_key or "").strip().lower()
+    start_month = _SEASON_START_MONTH_OVERRIDES.get(normalized)
+    if start_month is not None:
+        return start_month
+    return _DEFAULT_SOCCER_SEASON_START_MONTH if normalized.startswith("soccer_") else 1
+
+
+def default_current_season_for_sport(
+    sport_key: str | None,
+    *,
+    season_start_month: int | None = None,
+) -> int:
+    """Return season start-year for a league key.
+
+    Soccer leagues default to a July->June season; unknown/non-soccer domains
+    default to calendar year.
+    """
+    now = utcnow()
+    start_month = int(season_start_month or default_season_start_month_for_sport(sport_key))
+    return now.year if now.month >= start_month else now.year - 1
 
 
 def _default_features() -> dict:
@@ -200,61 +123,18 @@ def _league_external_ids(league: dict) -> dict[str, str]:
 
 
 async def seed_core_leagues() -> dict[str, int]:
-    """Upsert the core league starter pack without resetting admin-controlled flags."""
-    created = 0
-    updated = 0
-    now = utcnow()
+    """Facade to dedicated league seed service."""
+    from app.services.league_seed_service import seed_core_leagues as _seed_core_leagues
 
-    for league in CORE_LEAGUES:
-        sport_key = str(league["sport_key"]).strip()
-        name = str(league["name"]).strip()
-        country = str(league["country"]).strip()
-        level = int(league.get("level") or 1)
-        structure_type = str(league.get("structure_type") or _default_structure_type()).strip().lower()
-        if structure_type not in {"league", "cup", "tournament"}:
-            structure_type = _default_structure_type()
-        external_ids = {
-            str(provider).strip().lower(): str(external_id).strip()
-            for provider, external_id in (league.get("external_ids") or {}).items()
-            if str(provider).strip() and str(external_id).strip()
-        }
+    return await _seed_core_leagues()
 
-        update_doc = {
-            "name": name,
-            "country": country,
-            "level": level,
-            "display_name": name,
-            "country_code": _country_code_from_name(country),
-            "tier": _tier_from_level(level),
-            "structure_type": structure_type,
-            "external_ids": external_ids,
-            "updated_at": now,
-        }
-        insert_defaults = {
-            "sport_key": sport_key,
-            "current_season": _default_current_season(),
-            "is_active": True,
-            "needs_review": False,
-            "ui_order": 999,
-            "features": _default_features(),
-            "structure_type": _default_structure_type(),
-            "created_at": now,
-        }
 
-        existing = await _db.db.leagues.find_one({"sport_key": sport_key}, {"_id": 1})
-        result = await _db.db.leagues.update_one(
-            {"sport_key": sport_key},
-            {"$set": update_doc, "$setOnInsert": insert_defaults},
-            upsert=True,
-        )
-        if result.upserted_id is not None:
-            created += 1
-        elif existing:
-            updated += 1
+class LeagueService:
+    """Service facade for league maintenance operations."""
 
-    await invalidate_navigation_cache()
-    await LeagueRegistry.get().initialize()
-    return {"created": created, "updated": updated, "total": len(CORE_LEAGUES)}
+    @staticmethod
+    async def seed_core_leagues() -> dict[str, int]:
+        return await seed_core_leagues()
 
 
 async def invalidate_navigation_cache() -> None:
@@ -264,7 +144,7 @@ async def invalidate_navigation_cache() -> None:
 
 
 async def get_active_navigation() -> list[dict]:
-    """Return cached active+tippable leagues for public sidebar navigation."""
+    """Return cached active leagues for public sidebar navigation."""
     global _nav_cache_data, _nav_cache_expires_at
 
     now = utcnow()
@@ -272,7 +152,7 @@ async def get_active_navigation() -> list[dict]:
         return _nav_cache_data
 
     docs = await _db.db.leagues.find(
-        {"is_active": True, "features.tipping": True},
+        {"is_active": True},
         {
             "_id": 1,
             "sport_key": 1,
@@ -351,7 +231,14 @@ class LeagueRegistry:
             if not sport_key:
                 continue
             doc.setdefault("ui_order", 999)
-            doc.setdefault("current_season", _default_current_season())
+            doc.setdefault("season_start_month", default_season_start_month_for_sport(sport_key))
+            doc.setdefault(
+                "current_season",
+                default_current_season_for_sport(
+                    sport_key,
+                    season_start_month=int(doc.get("season_start_month", default_season_start_month_for_sport(sport_key))),
+                ),
+            )
             doc.setdefault("structure_type", _default_structure_type())
             doc.setdefault("features", _league_features(doc))
             doc.setdefault("external_ids", _league_external_ids(doc))
@@ -409,7 +296,11 @@ class LeagueRegistry:
             "country_code": None,
             "tier": "unknown",
             "ui_order": 999,
-            "current_season": _default_current_season(),
+            "season_start_month": default_season_start_month_for_sport(sport_key),
+            "current_season": default_current_season_for_sport(
+                sport_key,
+                season_start_month=default_season_start_month_for_sport(sport_key),
+            ),
             "structure_type": _default_structure_type(),
             "is_active": False,
             "needs_review": True,
@@ -438,7 +329,14 @@ class LeagueRegistry:
         if not league:
             raise RuntimeError(f"Failed to ensure league for sport_key={sport_key}")
         league.setdefault("ui_order", 999)
-        league.setdefault("current_season", _default_current_season())
+        league.setdefault("season_start_month", default_season_start_month_for_sport(sport_key))
+        league.setdefault(
+            "current_season",
+            default_current_season_for_sport(
+                sport_key,
+                season_start_month=int(league.get("season_start_month", default_season_start_month_for_sport(sport_key))),
+            ),
+        )
         league.setdefault("features", _league_features(league))
         league.setdefault("external_ids", _league_external_ids(league))
         self._by_sport_key[sport_key] = league

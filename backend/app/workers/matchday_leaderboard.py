@@ -10,7 +10,7 @@ logger = logging.getLogger("quotico.matchday_leaderboard")
 _STATE_KEY = "matchday_leaderboard"
 
 
-async def materialize_matchday_leaderboard() -> None:
+async def materialize_matchday_leaderboard(*, sport_key: str | None = None, season: int | None = None) -> None:
     """Aggregate resolved matchday_round slips into per-sport/season leaderboard.
 
     Smart sleep: skips if no slips were resolved since last materialization.
@@ -24,8 +24,14 @@ async def materialize_matchday_leaderboard() -> None:
             logger.debug("Smart sleep: no new matchday resolutions since last run, skipping")
             return
 
+    match_filter = {"type": "matchday_round", "status": "resolved", "total_points": {"$ne": None}}
+    if sport_key:
+        match_filter["sport_key"] = str(sport_key)
+    if season is not None:
+        match_filter["season"] = int(season)
+
     pipeline = [
-        {"$match": {"type": "matchday_round", "status": "resolved", "total_points": {"$ne": None}}},
+        {"$match": match_filter},
         {
             "$group": {
                 "_id": {

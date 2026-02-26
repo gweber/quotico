@@ -2,8 +2,8 @@
 backend/app/workers/odds_poller.py
 
 Purpose:
-    Poll odds providers for active leagues and refresh match odds snapshots plus
-    downstream candidate generation, respecting league feature flags.
+    Poll odds providers for active leagues, ingest append-only odds events, and
+    materialize match odds_meta for downstream services and candidate generation.
 """
 
 import logging
@@ -16,6 +16,8 @@ from app.config import settings
 from app.providers.odds_api import SUPPORTED_SPORTS, odds_provider
 from app.services.league_service import LeagueRegistry, league_feature_enabled
 from app.services.match_service import sync_matches_for_sport
+from app.services.odds_meta_service import get_current_market, get_market_updated_at
+from app.services.odds_service import odds_service
 from app.utils import ensure_utc, utcnow
 from app.workers._state import recently_synced, set_synced
 
@@ -81,7 +83,8 @@ async def poll_odds() -> None:
             total_odds_changed += odds_changed
             if matches_count > 0:
                 logger.info("Polled %s: %d matches, %d odds changed", sport_key, matches_count, odds_changed)
-                await _snapshot_odds(sport_key)
+                payload = result.get("provider_payload") or []
+                await odds_service.ingest_snapshot_batch("theoddsapi", payload)
             if odds_changed > 0:
                 try:
                     from app.routers.ws import live_manager
@@ -104,34 +107,6 @@ async def poll_odds() -> None:
             usage.get("requests_used", "?"),
             usage.get("requests_remaining", "?"),
         )
-
-
-async def _snapshot_odds(sport_key: str) -> None:
-    """Record current odds as a point-in-time snapshot for line movement tracking."""
-    now = utcnow()
-    matches = await _db.db.matches.find(
-        {"sport_key": sport_key, "status": "scheduled"},
-        {"_id": 1, "metadata.theoddsapi_id": 1, "sport_key": 1, "odds": 1},
-    ).to_list(length=200)
-
-    if not matches:
-        return
-
-    docs = [
-        {
-            "match_id": str(m["_id"]),
-            "external_id": m.get("metadata", {}).get("theoddsapi_id"),
-            "sport_key": m["sport_key"],
-            "odds": m.get("odds", {}).get("h2h", {}),
-            "totals": m.get("odds", {}).get("totals", {}),
-            "spreads": m.get("odds", {}).get("spreads", {}),
-            "snapshot_at": now,
-        }
-        for m in matches
-    ]
-    await _db.db.odds_snapshots.insert_many(docs, ordered=False)
-    logger.debug("Snapshotted odds for %d %s matches", len(docs), sport_key)
-
 
 async def _is_initial_load(sport_key: str) -> bool:
     """Check if we have any matches at all for this sport (first run)."""
@@ -167,7 +142,7 @@ async def _generate_candidates(sport_key: str) -> None:
             {"match_id": match_id}, {"generated_at": 1},
         )
         if existing:
-            odds_updated = match.get("odds", {}).get("updated_at")
+            odds_updated = get_market_updated_at(match, "h2h")
             if odds_updated:
                 bet_generated = ensure_utc(existing["generated_at"])
                 if bet_generated >= ensure_utc(odds_updated):
@@ -236,7 +211,7 @@ def _resolve_auto_pick(
 
 def _favorite_pick(match: dict) -> str | None:
     """Pick the moneyline favorite based on odds."""
-    odds = match.get("odds", {}).get("h2h", {})
+    odds = get_current_market(match, "h2h")
     home_odds = odds.get("1", 0)
     away_odds = odds.get("2", 0)
     if not home_odds or not away_odds:
@@ -431,7 +406,7 @@ async def run_qbot_bets() -> None:
                 continue
 
             # Validate pick exists in odds
-            h2h = match.get("odds", {}).get("h2h", {})
+            h2h = get_current_market(match, "h2h")
             if pick not in h2h:
                 continue
 

@@ -1,14 +1,19 @@
-"""Self-calibration worker — evaluates + optimizes Dixon-Coles parameters.
+"""
+backend/app/workers/calibration_worker.py
 
-Daily (3 AM):   evaluate Brier scores, recalibrate degraded leagues.
-Weekly (Mon 4 AM): refinement grid search around current params.
-Monthly (1st 5 AM): full exploration grid search.
-Sunday (23:00): reliability analysis — meta-learning confidence calibration.
+Purpose:
+    Periodic calibration worker for evaluation/refinement/exploration cycles
+    and reliability updates.
+
+Dependencies:
+    - app.services.optimizer_service
+    - app.services.qbot_intelligence_service
+    - app.services.reliability_service
+    - app.workers._state
 """
 
 import logging
 
-from app.services.odds_normalization_service import normalize_match_odds
 from app.services.optimizer_service import run_calibration
 from app.services.qbot_intelligence_service import update_cluster_stats
 from app.services.reliability_service import run_reliability_analysis
@@ -21,16 +26,8 @@ _RELIABILITY_STATE_KEY = "reliability"
 _QBOT_STATE_KEY = "qbot_clusters"
 
 
-async def _prepare_odds_for_calibration() -> None:
-    """Ensure legacy final matches expose canonical odds.h2h before calibration."""
-    updated = await normalize_match_odds()
-    if updated:
-        logger.info("Calibration prep normalized %d legacy odds documents", updated)
-
-
 async def run_daily_evaluation() -> None:
     """Evaluate performance, recalibrate flagged leagues, update Qbot clusters."""
-    await _prepare_odds_for_calibration()
     result = await run_calibration(force_mode=None)
     await set_synced(_STATE_KEY, metrics=result)
     logger.info("Daily calibration eval: %s", result)
@@ -46,7 +43,6 @@ async def run_daily_evaluation() -> None:
 
 async def run_weekly_refinement() -> None:
     """Narrow grid search around current params."""
-    await _prepare_odds_for_calibration()
     result = await run_calibration(force_mode="refinement")
     await set_synced(_STATE_KEY, metrics=result)
     logger.info("Weekly refinement: %s", result)
@@ -54,7 +50,6 @@ async def run_weekly_refinement() -> None:
 
 async def run_monthly_exploration() -> None:
     """Full grid search across entire parameter space."""
-    await _prepare_odds_for_calibration()
     result = await run_calibration(force_mode="exploration")
     await set_synced(_STATE_KEY, metrics=result)
     logger.info("Monthly exploration: %s", result)

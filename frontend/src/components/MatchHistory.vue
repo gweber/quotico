@@ -1,7 +1,21 @@
+<!--
+  frontend/src/components/MatchHistory.vue
+
+  Purpose:
+  Renders H2H and form insights for match cards and loads additional H2H pages.
+  All team comparisons and API parameters use Team Tower IDs.
+-->
+
 <script setup lang="ts">
 import { ref, onMounted } from "vue";
+import { useI18n } from "vue-i18n";
 import { useApi } from "@/composables/useApi";
-import { useMatchHistory, type HistoricalMatch, type MatchContext } from "@/composables/useMatchHistory";
+import {
+  useMatchHistory,
+  type HistoricalMatch,
+  type H2HSummary,
+  type MatchContext,
+} from "@/composables/useMatchHistory";
 
 const props = defineProps<{
   homeTeam: string;
@@ -11,6 +25,7 @@ const props = defineProps<{
 }>();
 
 const api = useApi();
+const { t } = useI18n();
 const expanded = ref(false);
 const h2hScrollRef = ref<HTMLElement | null>(null);
 const h2hScrolledToEnd = ref(false);
@@ -29,15 +44,15 @@ async function onH2HScroll() {
 }
 
 async function loadMoreH2H() {
-  if (!data.value?.h2h?.matches.length || !data.value.home_team_key) return;
+  if (!data.value?.h2h?.matches.length || !data.value.home_team_id) return;
   h2hLoadingMore.value = true;
   try {
     const resp = await api.get<{ matches: HistoricalMatch[]; count: number }>(
       "/historical/h2h",
       {
         sport_key: props.sportKey,
-        home_team_key: data.value.home_team_key,
-        away_team_key: data.value.away_team_key,
+        home_team_id: data.value.home_team_id,
+        away_team_id: data.value.away_team_id,
         skip: String(data.value.h2h.matches.length),
         limit: "10",
       },
@@ -64,9 +79,9 @@ onMounted(() => {
   }
 });
 
-function formResult(match: HistoricalMatch, teamKey: string): "W" | "D" | "L" {
+function formResult(match: HistoricalMatch, teamId: string): "W" | "D" | "L" {
   if (match.result.outcome === "X") return "D";
-  const isHome = match.home_team_key === teamKey;
+  const isHome = match.home_team_id === teamId;
   if (match.result.outcome === "1") return isHome ? "W" : "L";
   return isHome ? "L" : "W";
 }
@@ -85,9 +100,9 @@ function h2hWinnerClass(match: HistoricalMatch, side: "home" | "away"): string {
   return "text-text-secondary";
 }
 
-function formScore(matches: HistoricalMatch[], teamKey: string): number {
+function formScore(matches: HistoricalMatch[], teamId: string): number {
   return matches.reduce((sum, m) => {
-    const r = formResult(m, teamKey);
+    const r = formResult(m, teamId);
     return sum + (r === "W" ? 3 : r === "D" ? 1 : 0);
   }, 0);
 }
@@ -111,6 +126,22 @@ function yearGap(olderDate: string, newerDate: string): number {
   const diff = new Date(newerDate).getTime() - new Date(olderDate).getTime();
   const years = diff / (365.25 * 24 * 60 * 60 * 1000);
   return years >= 1 ? Math.floor(years) : 0;
+}
+
+function hasXgAverages(summary: H2HSummary): boolean {
+  return summary.avg_home_xg != null && summary.avg_away_xg != null;
+}
+
+function xgUsed(summary: H2HSummary): number {
+  return summary.xg_samples_used ?? 0;
+}
+
+function xgTotal(summary: H2HSummary): number {
+  return summary.xg_samples_total ?? summary.total ?? 0;
+}
+
+function showHistoricalXg(summary: H2HSummary): boolean {
+  return hasXgAverages(summary) && xgUsed(summary) >= 3;
 }
 </script>
 
@@ -200,10 +231,15 @@ function yearGap(olderDate: string, newerDate: string): number {
               <span>Über 2.5: {{ Math.round(data.h2h.summary.over_2_5_pct * 100) }}%</span>
               <span>Beide treffen: {{ Math.round(data.h2h.summary.btts_pct * 100) }}%</span>
               <span
-                v-if="data.h2h.summary.avg_home_xg != null"
+                v-if="showHistoricalXg(data.h2h.summary)"
                 class="tabular-nums"
-                title="Durchschnittliche Expected Goals pro Spiel"
-              >⌀ xG {{ data.h2h.summary.avg_home_xg }} – {{ data.h2h.summary.avg_away_xg }}</span>
+                :title="t('matchHistory.historicalXgTooltip')"
+              >
+                {{ t("matchHistory.historicalXgLabel") }} {{ data.h2h.summary.avg_home_xg }} – {{ data.h2h.summary.avg_away_xg }}
+                <span class="text-[10px] text-text-muted/70 ml-1">
+                  {{ t("matchHistory.historicalXgSamples", { used: xgUsed(data.h2h.summary), total: xgTotal(data.h2h.summary) }) }}
+                </span>
+              </span>
             </div>
 
             <!-- Recent meetings -->
@@ -286,18 +322,18 @@ function yearGap(olderDate: string, newerDate: string): number {
                   v-for="(m, i) in data.home_form"
                   :key="i"
                   class="w-5 h-5 rounded-full text-[10px] font-bold text-white flex items-center justify-center"
-                  :class="resultColor(formResult(m, data.home_team_key))"
+                  :class="resultColor(formResult(m, data.home_team_id))"
                   :title="`${m.home_team} ${m.result.home_score}:${m.result.away_score} ${m.away_team}`"
                 >
-                  {{ formResult(m, data.home_team_key) }}
+                  {{ formResult(m, data.home_team_id) }}
                 </span>
               </div>
               <span
                 class="text-[10px] font-bold ml-auto tabular-nums"
-                :class="formScoreColor(formScore(data.home_form, data.home_team_key))"
-                :title="`Letzte ${data.home_form.length} Spiele: ${formScore(data.home_form, data.home_team_key)} von ${data.home_form.length * 3} Punkten (S=3, U=1, N=0)`"
+                :class="formScoreColor(formScore(data.home_form, data.home_team_id))"
+                :title="`Letzte ${data.home_form.length} Spiele: ${formScore(data.home_form, data.home_team_id)} von ${data.home_form.length * 3} Punkten (S=3, U=1, N=0)`"
               >
-                {{ formScore(data.home_form, data.home_team_key) }}<span class="text-text-muted">/{{ data.home_form.length * 3 }}</span>
+                {{ formScore(data.home_form, data.home_team_id) }}<span class="text-text-muted">/{{ data.home_form.length * 3 }}</span>
               </span>
             </div>
 
@@ -311,18 +347,18 @@ function yearGap(olderDate: string, newerDate: string): number {
                   v-for="(m, i) in data.away_form"
                   :key="i"
                   class="w-5 h-5 rounded-full text-[10px] font-bold text-white flex items-center justify-center"
-                  :class="resultColor(formResult(m, data.away_team_key))"
+                  :class="resultColor(formResult(m, data.away_team_id))"
                   :title="`${m.home_team} ${m.result.home_score}:${m.result.away_score} ${m.away_team}`"
                 >
-                  {{ formResult(m, data.away_team_key) }}
+                  {{ formResult(m, data.away_team_id) }}
                 </span>
               </div>
               <span
                 class="text-[10px] font-bold ml-auto tabular-nums"
-                :class="formScoreColor(formScore(data.away_form, data.away_team_key))"
-                :title="`Letzte ${data.away_form.length} Spiele: ${formScore(data.away_form, data.away_team_key)} von ${data.away_form.length * 3} Punkten (S=3, U=1, N=0)`"
+                :class="formScoreColor(formScore(data.away_form, data.away_team_id))"
+                :title="`Letzte ${data.away_form.length} Spiele: ${formScore(data.away_form, data.away_team_id)} von ${data.away_form.length * 3} Punkten (S=3, U=1, N=0)`"
               >
-                {{ formScore(data.away_form, data.away_team_key) }}<span class="text-text-muted">/{{ data.away_form.length * 3 }}</span>
+                {{ formScore(data.away_form, data.away_team_id) }}<span class="text-text-muted">/{{ data.away_form.length * 3 }}</span>
               </span>
             </div>
           </div>

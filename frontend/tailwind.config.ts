@@ -38,7 +38,7 @@ export default {
         text: {
           primary: "#f8fafc",   // slate-50 — main text
           secondary: "#94a3b8", // slate-400 — secondary info
-          muted: "#64748b",     // slate-500 — disabled, hints
+          muted: "#96aed0",     // +~50% brightness vs prior muted for better readability
         },
       },
       fontFamily: {

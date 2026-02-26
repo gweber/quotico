@@ -1,27 +1,27 @@
-"""Historical match context service.
+"""
+backend/app/services/historical_service.py
 
-Provides H2H and form context by querying the unified ``matches`` collection
-for matches with ``status: "final"``.  Team name resolution is delegated to
-``team_mapping_service``.
+Purpose:
+    Historical context service (H2H + form) using Team Tower IDs only.
 
-The old ``historical_matches`` collection and ``archive_resolved_match()``
-function are no longer needed — resolved matches stay in the same collection.
+Dependencies:
+    - app.database
+    - app.services.team_registry_service
 """
 
 import logging
 import time
 from datetime import datetime
 
+from bson import ObjectId
+
 import app.database as _db
-from app.services.team_mapping_service import resolve_team, team_name_key
+from app.services.team_registry_service import TeamRegistry
 
 logger = logging.getLogger("quotico.historical_service")
 
-# ---------------------------------------------------------------------------
-# In-memory cache for match-context responses (historical data rarely changes)
-# ---------------------------------------------------------------------------
 _context_cache: dict[str, tuple[float, dict]] = {}
-_CACHE_TTL = 3600  # 1 hour
+_CACHE_TTL = 3600
 
 
 def cache_get(key: str) -> dict | None:
@@ -42,9 +42,6 @@ def clear_context_cache() -> None:
     logger.info("Match-context cache cleared")
 
 
-# ---------------------------------------------------------------------------
-# Related sport keys: H2H spans across divisions (e.g. BL1 + BL2)
-# ---------------------------------------------------------------------------
 _ALL_SOCCER_KEYS = [
     "soccer_germany_bundesliga",
     "soccer_germany_bundesliga2",
@@ -55,18 +52,24 @@ _ALL_SOCCER_KEYS = [
     "soccer_netherlands_eredivisie",
     "soccer_portugal_primeira_liga",
 ]
-
 RELATED_SPORT_KEYS: dict[str, list[str]] = {k: _ALL_SOCCER_KEYS for k in _ALL_SOCCER_KEYS}
 
 
 def sport_keys_for(sport_key: str) -> list[str]:
-    """Return the sport_key(s) to query for H2H/form (spans related leagues)."""
     return RELATED_SPORT_KEYS.get(sport_key, [sport_key])
 
 
-# ---------------------------------------------------------------------------
-# Match context builder (H2H + form) — queries unified matches collection
-# ---------------------------------------------------------------------------
+def _serialize_match_team_ids(match_doc: dict) -> dict:
+    """Return a shallow match copy with team ids converted to strings for API safety."""
+    out = dict(match_doc)
+    home_id = out.get("home_team_id")
+    away_id = out.get("away_team_id")
+    if isinstance(home_id, ObjectId):
+        out["home_team_id"] = str(home_id)
+    if isinstance(away_id, ObjectId):
+        out["away_team_id"] = str(away_id)
+    return out
+
 
 async def build_match_context(
     home_team: str,
@@ -77,8 +80,6 @@ async def build_match_context(
     *,
     before_date: datetime | None = None,
 ) -> dict:
-    """Core logic: resolve team names, fetch H2H + form from unified collection."""
-    # Skip cache when backfilling (queries are unique per date)
     if not before_date:
         cache_key = f"{home_team}|{away_team}|{sport_key}|{h2h_limit}|{form_limit}"
         cached = cache_get(cache_key)
@@ -86,54 +87,52 @@ async def build_match_context(
             return cached
 
     related_keys = sport_keys_for(sport_key)
-
-    # Resolve via team_mapping_service
-    home_result = await resolve_team(home_team, sport_key)
-    away_result = await resolve_team(away_team, sport_key)
-
-    home_key = home_result[2] if home_result else team_name_key(home_team)
-    away_key = away_result[2] if away_result else team_name_key(away_team)
-
-    if not home_key or not away_key:
-        result: dict = {"h2h": None, "home_form": None, "away_form": None}
-        if not before_date:
-            cache_set(cache_key, result)
-        return result
+    team_registry = TeamRegistry.get()
+    home_team_id = await team_registry.resolve(home_team, sport_key)
+    away_team_id = await team_registry.resolve(away_team, sport_key)
 
     proj = {
         "_id": 0,
-        "match_date": 1, "home_team": 1, "away_team": 1,
-        "home_team_key": 1, "away_team_key": 1,
-        "result.home_score": 1, "result.away_score": 1, "result.outcome": 1,
-        "result.home_xg": 1, "result.away_xg": 1,
-        "season_label": 1, "sport_key": 1,
+        "match_date": 1,
+        "home_team": 1,
+        "away_team": 1,
+        "home_team_id": 1,
+        "away_team_id": 1,
+        "result.home_score": 1,
+        "result.away_score": 1,
+        "result.outcome": 1,
+        "result.home_xg": 1,
+        "result.away_xg": 1,
+        "sport_key": 1,
     }
 
-    # H2H query: finalized matches between these two teams across related leagues
     h2h_query: dict = {
         "sport_key": {"$in": related_keys},
         "status": "final",
         "result.outcome": {"$ne": None},
         "$or": [
-            {"home_team_key": home_key, "away_team_key": away_key},
-            {"home_team_key": away_key, "away_team_key": home_key},
+            {"home_team_id": home_team_id, "away_team_id": away_team_id},
+            {"home_team_id": away_team_id, "away_team_id": home_team_id},
         ],
     }
     if before_date:
         h2h_query["match_date"] = {"$lt": before_date}
 
-    h2h_matches = await _db.db.matches.find(
-        h2h_query, proj,
-    ).sort("match_date", -1).to_list(length=h2h_limit)
-
-    # Compute H2H summary from ALL matches
-    h2h_summary = None
+    h2h_matches = await _db.db.matches.find(h2h_query, proj).sort("match_date", -1).to_list(length=h2h_limit)
     h2h_all = await _db.db.matches.find(
         h2h_query,
-        {"_id": 0, "home_team_key": 1, "result.home_score": 1, "result.away_score": 1,
-         "result.home_xg": 1, "result.away_xg": 1},
+        {
+            "_id": 0,
+            "home_team_id": 1,
+            "away_team_id": 1,
+            "result.home_score": 1,
+            "result.away_score": 1,
+            "result.home_xg": 1,
+            "result.away_xg": 1,
+        },
     ).to_list(length=500)
 
+    h2h_summary = None
     if h2h_all:
         total = len(h2h_all)
         home_wins = 0
@@ -156,11 +155,10 @@ async def build_match_context(
             if hg > 0 and ag > 0:
                 btts += 1
 
-            # Accumulate xG (perspective-corrected to current home/away)
             h_xg = r.get("home_xg")
             a_xg = r.get("away_xg")
             if h_xg is not None and a_xg is not None:
-                if m["home_team_key"] == home_key:
+                if m.get("home_team_id") == home_team_id:
                     sum_home_xg += h_xg
                     sum_away_xg += a_xg
                 else:
@@ -168,7 +166,7 @@ async def build_match_context(
                     sum_away_xg += h_xg
                 xg_count += 1
 
-            if m["home_team_key"] == home_key:
+            if m.get("home_team_id") == home_team_id:
                 if hg > ag:
                     home_wins += 1
                 elif hg < ag:
@@ -183,7 +181,7 @@ async def build_match_context(
                 else:
                     draws += 1
 
-        h2h_summary: dict = {
+        h2h_summary = {
             "total": total,
             "home_wins": home_wins,
             "away_wins": away_wins,
@@ -191,41 +189,36 @@ async def build_match_context(
             "avg_goals": round(total_goals / total, 1),
             "over_2_5_pct": round(over_2_5 / total, 2),
             "btts_pct": round(btts / total, 2),
+            "xg_samples_used": xg_count,
+            "xg_samples_total": total,
         }
         if xg_count > 0:
             h2h_summary["avg_home_xg"] = round(sum_home_xg / xg_count, 2)
             h2h_summary["avg_away_xg"] = round(sum_away_xg / xg_count, 2)
 
-    # Form: last N finalized matches for each team
-    async def get_form(t_key: str) -> list[dict]:
-        form_query: dict = {
+    async def get_form(team_id) -> list[dict]:
+        query: dict = {
             "sport_key": {"$in": related_keys},
             "status": "final",
             "result.outcome": {"$ne": None},
-            "$or": [
-                {"home_team_key": t_key},
-                {"away_team_key": t_key},
-            ],
+            "$or": [{"home_team_id": team_id}, {"away_team_id": team_id}],
         }
         if before_date:
-            form_query["match_date"] = {"$lt": before_date}
-        return await _db.db.matches.find(
-            form_query,
-            proj,
-        ).sort("match_date", -1).to_list(length=form_limit)
+            query["match_date"] = {"$lt": before_date}
+        return await _db.db.matches.find(query, proj).sort("match_date", -1).to_list(length=form_limit)
 
-    home_form = await get_form(home_key)
-    away_form = await get_form(away_key)
+    home_form = await get_form(home_team_id)
+    away_form = await get_form(away_team_id)
 
     response = {
         "h2h": {
             "summary": h2h_summary,
-            "matches": h2h_matches,
+            "matches": [_serialize_match_team_ids(m) for m in h2h_matches],
         } if h2h_summary else None,
-        "home_form": home_form,
-        "away_form": away_form,
-        "home_team_key": home_key,
-        "away_team_key": away_key,
+        "home_form": [_serialize_match_team_ids(m) for m in home_form],
+        "away_form": [_serialize_match_team_ids(m) for m in away_form],
+        "home_team_id": str(home_team_id) if isinstance(home_team_id, ObjectId) else home_team_id,
+        "away_team_id": str(away_team_id) if isinstance(away_team_id, ObjectId) else away_team_id,
     }
     if not before_date:
         cache_set(cache_key, response)

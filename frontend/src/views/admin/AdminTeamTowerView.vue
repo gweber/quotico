@@ -26,7 +26,6 @@ interface TeamAlias {
 interface TeamItem {
   id: string;
   display_name: string;
-  canonical_id: string | null;
   needs_review: boolean;
   sport_key: string | null;
   aliases: TeamAlias[];
@@ -44,31 +43,72 @@ interface MergeResponse {
   stats: Record<string, number>;
 }
 
+interface AliasSuggestion {
+  id: string;
+  status: string;
+  source: string;
+  sport_key: string | null;
+  league_id: string | null;
+  league_name: string;
+  league_external_id: string | null;
+  raw_team_name: string;
+  normalized_name: string;
+  reason: string;
+  confidence: number | null;
+  seen_count: number;
+  first_seen_at: string | null;
+  last_seen_at: string | null;
+  suggested_team_id: string | null;
+  suggested_team_name: string;
+  applied_to_team_id: string | null;
+  applied_to_team_name: string;
+  sample_refs: Array<Record<string, unknown>>;
+}
+
+interface AliasSuggestionListResponse {
+  total: number;
+  items: AliasSuggestion[];
+}
+
 const api = useApi();
 const toast = useToast();
 const { t } = useI18n();
 
 const loading = ref(true);
+const teamsError = ref("");
 const mergeSearchLoading = ref(false);
 const teams = ref<TeamItem[]>([]);
 const mergeSearchResults = ref<TeamItem[]>([]);
 const search = ref("");
-const showNeedsReviewOnly = ref(true);
+const showNeedsReviewOnly = ref(false);
 const mergeSearch = ref("");
 const sourceTeamId = ref<string>("");
 const targetTeamId = ref<string>("");
 const draggingSourceId = ref<string>("");
+const dragOverTargetId = ref<string>("");
+const sourceZoneDragDepth = ref(0);
+const targetZoneDragDepth = ref(0);
 const aliasDrafts = reactive<Record<string, { name: string; sport_key: string }>>({});
 const aliasSavingByTeam = reactive<Record<string, boolean>>({});
 const mergeBusy = ref(false);
 const confirmMergeOpen = ref(false);
+const aliasSuggestionsLoading = ref(false);
+const aliasSuggestionsApplying = ref(false);
+const aliasSuggestions = ref<AliasSuggestion[]>([]);
+const draggingSuggestionId = ref<string>("");
 
-const sourceTeam = computed(() => teams.value.find((team) => team.id === sourceTeamId.value) ?? null);
+const sourceTeam = computed(() => {
+  const fromList = teams.value.find((team) => team.id === sourceTeamId.value);
+  if (fromList) return fromList;
+  return mergeSearchResults.value.find((team) => team.id === sourceTeamId.value) ?? null;
+});
 const targetTeam = computed(() => {
   const fromList = teams.value.find((team) => team.id === targetTeamId.value);
   if (fromList) return fromList;
   return mergeSearchResults.value.find((team) => team.id === targetTeamId.value) ?? null;
 });
+const sourceZoneActive = computed(() => sourceZoneDragDepth.value > 0);
+const targetZoneActive = computed(() => targetZoneDragDepth.value > 0);
 
 function hasAliasDraft(teamId: string): boolean {
   return Boolean(aliasDrafts[teamId]);
@@ -90,6 +130,7 @@ function sportBadgeClass(sportKey: string | null): string {
 
 async function fetchTeams(): Promise<void> {
   loading.value = true;
+  teamsError.value = "";
   try {
     const params: Record<string, string> = { limit: "200", offset: "0" };
     if (search.value.trim()) params.search = search.value.trim();
@@ -98,9 +139,23 @@ async function fetchTeams(): Promise<void> {
     teams.value = result.items;
   } catch (error) {
     const message = error instanceof Error ? error.message : t("common.genericError");
+    teamsError.value = message;
     toast.error(message);
   } finally {
     loading.value = false;
+  }
+}
+
+async function fetchAliasSuggestions(): Promise<void> {
+  aliasSuggestionsLoading.value = true;
+  try {
+    const result = await api.get<AliasSuggestionListResponse>("/admin/teams/alias-suggestions", { limit: "200" });
+    aliasSuggestions.value = result.items;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : t("common.genericError");
+    toast.error(message);
+  } finally {
+    aliasSuggestionsLoading.value = false;
   }
 }
 
@@ -125,25 +180,136 @@ async function fetchMergeTargets(): Promise<void> {
   }
 }
 
-function setSourceTeam(teamId: string): void {
-  sourceTeamId.value = teamId;
-  if (teamId === targetTeamId.value) targetTeamId.value = "";
-}
-
-function setTargetTeam(teamId: string): void {
-  targetTeamId.value = teamId;
-  if (teamId === sourceTeamId.value) sourceTeamId.value = "";
-}
-
-function onSourceDragStart(teamId: string): void {
+function onSourceDragStart(event: DragEvent, teamId: string): void {
   draggingSourceId.value = teamId;
+  if (event.dataTransfer) {
+    event.dataTransfer.effectAllowed = "move";
+    event.dataTransfer.setData("application/x-quotico-team-id", teamId);
+    event.dataTransfer.setData("text/plain", teamId);
+  }
 }
 
-function onTargetDrop(teamId: string): void {
-  if (!draggingSourceId.value || draggingSourceId.value === teamId) return;
-  sourceTeamId.value = draggingSourceId.value;
-  targetTeamId.value = teamId;
+function onSourceDragEnd(): void {
   draggingSourceId.value = "";
+  dragOverTargetId.value = "";
+  sourceZoneDragDepth.value = 0;
+  targetZoneDragDepth.value = 0;
+}
+
+function readDraggedTeamId(event: DragEvent): string {
+  const customTeamId = (event.dataTransfer?.getData("application/x-quotico-team-id") || "").trim();
+  if (customTeamId) return customTeamId;
+  const textPayload = (event.dataTransfer?.getData("text/plain") || "").trim();
+  if (!textPayload || textPayload.startsWith("alias:")) return "";
+  return textPayload;
+}
+
+function readDraggedSuggestionId(event: DragEvent): string {
+  const customId = (event.dataTransfer?.getData("application/x-quotico-alias-suggestion") || "").trim();
+  if (customId) return customId;
+  const textPayload = (event.dataTransfer?.getData("text/plain") || "").trim();
+  if (textPayload.startsWith("alias:")) {
+    return textPayload.slice("alias:".length).trim();
+  }
+  return draggingSuggestionId.value.trim();
+}
+
+function teamIdFromSuggestion(suggestionId: string): string {
+  const suggestion = aliasSuggestions.value.find((item) => item.id === suggestionId);
+  if (!suggestion) return "";
+  return (suggestion.suggested_team_id || suggestion.applied_to_team_id || "").trim();
+}
+
+function onTargetDrop(event: DragEvent, teamId: string): void {
+  const draggedId = readDraggedTeamId(event) || draggingSourceId.value;
+  if (!draggedId || draggedId === teamId) return;
+  sourceTeamId.value = draggedId;
+  targetTeamId.value = teamId;
+  if (sourceTeamId.value === targetTeamId.value) {
+    targetTeamId.value = "";
+  }
+  draggingSourceId.value = "";
+  dragOverTargetId.value = "";
+  sourceZoneDragDepth.value = 0;
+  targetZoneDragDepth.value = 0;
+}
+
+async function onSourceDropZoneDrop(event: DragEvent): Promise<void> {
+  const suggestionId = readDraggedSuggestionId(event);
+  if (suggestionId) {
+    const mappedTeamId = teamIdFromSuggestion(suggestionId);
+    if (!mappedTeamId) {
+      toast.error(t("admin.teamTower.aliasSuggestions.noSuggestedTeam"));
+      draggingSuggestionId.value = "";
+      sourceZoneDragDepth.value = 0;
+      targetZoneDragDepth.value = 0;
+      return;
+    }
+    sourceTeamId.value = mappedTeamId;
+    if (targetTeamId.value === mappedTeamId) {
+      targetTeamId.value = "";
+    }
+    draggingSuggestionId.value = "";
+    sourceZoneDragDepth.value = 0;
+    targetZoneDragDepth.value = 0;
+    return;
+  }
+
+  const draggedId = readDraggedTeamId(event) || draggingSourceId.value;
+  if (!draggedId) return;
+  sourceTeamId.value = draggedId;
+  if (targetTeamId.value === draggedId) {
+    targetTeamId.value = "";
+  }
+  draggingSourceId.value = "";
+  sourceZoneDragDepth.value = 0;
+  targetZoneDragDepth.value = 0;
+}
+
+function onTargetDropZoneDrop(event: DragEvent): void {
+  const suggestionId = readDraggedSuggestionId(event);
+  if (suggestionId) {
+    const mappedTeamId = teamIdFromSuggestion(suggestionId);
+    if (!mappedTeamId) {
+      toast.error(t("admin.teamTower.aliasSuggestions.noSuggestedTeam"));
+      draggingSuggestionId.value = "";
+      sourceZoneDragDepth.value = 0;
+      targetZoneDragDepth.value = 0;
+      return;
+    }
+    if (sourceTeamId.value === mappedTeamId) {
+      targetTeamId.value = "";
+    } else {
+      targetTeamId.value = mappedTeamId;
+    }
+    draggingSuggestionId.value = "";
+    sourceZoneDragDepth.value = 0;
+    targetZoneDragDepth.value = 0;
+    return;
+  }
+
+  const draggedId = readDraggedTeamId(event) || draggingSourceId.value;
+  if (!draggedId) return;
+  if (sourceTeamId.value === draggedId) {
+    // Same team cannot be source and target.
+    targetTeamId.value = "";
+  } else {
+    targetTeamId.value = draggedId;
+  }
+  draggingSourceId.value = "";
+  sourceZoneDragDepth.value = 0;
+  targetZoneDragDepth.value = 0;
+}
+
+function onTargetDragEnter(teamId: string): void {
+  if (!draggingSourceId.value || draggingSourceId.value === teamId) return;
+  dragOverTargetId.value = teamId;
+}
+
+function onTargetDragLeave(teamId: string): void {
+  if (dragOverTargetId.value === teamId) {
+    dragOverTargetId.value = "";
+  }
 }
 
 async function markReviewState(team: TeamItem, nextState: boolean): Promise<void> {
@@ -173,7 +339,7 @@ async function addAlias(team: TeamItem): Promise<void> {
     });
     draft.name = "";
     draft.sport_key = "";
-    await fetchTeams();
+    await Promise.all([fetchTeams(), fetchAliasSuggestions()]);
     toast.success(t("admin.teamTower.aliasAdded"));
     toast.success(t("admin.teamTower.registryReinitialized"));
   } catch (error) {
@@ -215,25 +381,179 @@ async function executeMerge(): Promise<void> {
   if (!sourceTeam.value || !targetTeam.value) return;
   mergeBusy.value = true;
   try {
-    const result = await api.post<MergeResponse>(`/admin/teams/${sourceTeam.value.id}/merge`, {
+    const mergedSourceId = sourceTeam.value.id;
+    const result = await api.post<MergeResponse>(`/admin/teams/${mergedSourceId}/merge`, {
       target_id: targetTeam.value.id,
     });
+    confirmMergeOpen.value = false;
     toast.success(t("admin.teamTower.mergeSuccess"));
-    if (result.message) {
+    if (result?.message) {
       toast.success(result.message);
     }
-    confirmMergeOpen.value = false;
+    // Immediate UI cleanup before server roundtrip refresh.
+    mergeSearchResults.value = mergeSearchResults.value.filter((team) => team.id !== mergedSourceId);
     sourceTeamId.value = "";
     targetTeamId.value = "";
-    mergeSearch.value = "";
-    mergeSearchResults.value = [];
-    await fetchTeams();
+    await Promise.all([
+      fetchTeams(),
+      fetchMergeTargets(),
+    ]);
   } catch (error) {
     const message = error instanceof Error ? error.message : t("common.genericError");
     toast.error(message);
   } finally {
     mergeBusy.value = false;
   }
+}
+
+async function applyAliasSuggestion(suggestion: AliasSuggestion): Promise<void> {
+  aliasSuggestionsApplying.value = true;
+  try {
+    const result = await api.post<{ applied: number; failed: Array<{ message: string }> }>(
+      "/admin/teams/alias-suggestions/apply",
+      {
+        items: [
+          {
+            id: suggestion.id,
+            team_id: suggestion.suggested_team_id,
+          },
+        ],
+      },
+    );
+    if ((result.failed || []).length > 0) {
+      toast.error(result.failed[0]?.message || t("common.genericError"));
+      return;
+    }
+    toast.success(t("admin.teamTower.aliasSuggestions.appliedSingle"));
+    await Promise.all([fetchTeams(), fetchAliasSuggestions()]);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : t("common.genericError");
+    toast.error(message);
+  } finally {
+    aliasSuggestionsApplying.value = false;
+  }
+}
+
+async function applyAliasSuggestionToTeamId(suggestionId: string, teamId: string): Promise<void> {
+  const suggestion = aliasSuggestions.value.find((item) => item.id === suggestionId);
+  if (!suggestion) return;
+  aliasSuggestionsApplying.value = true;
+  try {
+    const result = await api.post<{ applied: number; failed: Array<{ message: string }> }>(
+      "/admin/teams/alias-suggestions/apply",
+      {
+        items: [
+          {
+            id: suggestion.id,
+            team_id: teamId,
+          },
+        ],
+      },
+    );
+    if ((result.failed || []).length > 0) {
+      toast.error(result.failed[0]?.message || t("common.genericError"));
+      return;
+    }
+    toast.success(t("admin.teamTower.aliasSuggestions.appliedSingle"));
+    await Promise.all([fetchTeams(), fetchAliasSuggestions()]);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : t("common.genericError");
+    toast.error(message);
+  } finally {
+    aliasSuggestionsApplying.value = false;
+  }
+}
+
+async function applyAllAliasSuggestions(): Promise<void> {
+  if (aliasSuggestions.value.length === 0) return;
+  aliasSuggestionsApplying.value = true;
+  try {
+    const result = await api.post<{ applied: number; failed: Array<{ message: string }> }>(
+      "/admin/teams/alias-suggestions/apply",
+      {
+        items: aliasSuggestions.value.map((item) => ({
+          id: item.id,
+          team_id: item.suggested_team_id,
+        })),
+      },
+    );
+    if ((result.failed || []).length > 0) {
+      toast.error(
+        t("admin.teamTower.aliasSuggestions.bulkPartial", {
+          applied: result.applied,
+          failed: result.failed.length,
+        }),
+      );
+    } else {
+      toast.success(
+        t("admin.teamTower.aliasSuggestions.bulkApplied", { count: result.applied }),
+      );
+    }
+    await Promise.all([fetchAliasSuggestions(), fetchTeams()]);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : t("common.genericError");
+    toast.error(message);
+  } finally {
+    aliasSuggestionsApplying.value = false;
+  }
+}
+
+async function rejectAliasSuggestion(suggestion: AliasSuggestion): Promise<void> {
+  aliasSuggestionsApplying.value = true;
+  try {
+    await api.post(`/admin/teams/alias-suggestions/${suggestion.id}/reject`, {});
+    toast.success(t("admin.teamTower.aliasSuggestions.rejectedSingle"));
+    await fetchAliasSuggestions();
+  } catch (error) {
+    const message = error instanceof Error ? error.message : t("common.genericError");
+    toast.error(message);
+  } finally {
+    aliasSuggestionsApplying.value = false;
+  }
+}
+
+function onAliasSuggestionDragStart(event: DragEvent, suggestionId: string): void {
+  draggingSuggestionId.value = suggestionId;
+  if (event.dataTransfer) {
+    event.dataTransfer.effectAllowed = "move";
+    event.dataTransfer.setData("application/x-quotico-alias-suggestion", suggestionId);
+    // Fallback channel for browsers that drop custom MIME types.
+    event.dataTransfer.setData("text/plain", `alias:${suggestionId}`);
+  }
+}
+
+function onAliasSuggestionDragEnd(): void {
+  draggingSuggestionId.value = "";
+  sourceZoneDragDepth.value = 0;
+  targetZoneDragDepth.value = 0;
+}
+
+async function onTeamCardDrop(event: DragEvent, teamId: string): Promise<void> {
+  const suggestionId = readDraggedSuggestionId(event);
+  if (suggestionId) {
+    draggingSuggestionId.value = "";
+    await applyAliasSuggestionToTeamId(suggestionId, teamId);
+    sourceZoneDragDepth.value = 0;
+    targetZoneDragDepth.value = 0;
+    return;
+  }
+  onTargetDrop(event, teamId);
+}
+
+function onSourceZoneDragEnter(): void {
+  sourceZoneDragDepth.value += 1;
+}
+
+function onSourceZoneDragLeave(): void {
+  sourceZoneDragDepth.value = Math.max(0, sourceZoneDragDepth.value - 1);
+}
+
+function onTargetZoneDragEnter(): void {
+  targetZoneDragDepth.value += 1;
+}
+
+function onTargetZoneDragLeave(): void {
+  targetZoneDragDepth.value = Math.max(0, targetZoneDragDepth.value - 1);
 }
 
 let listSearchTimer: ReturnType<typeof setTimeout> | null = null;
@@ -254,6 +574,7 @@ watch(mergeSearch, () => {
 
 onMounted(() => {
   void fetchTeams();
+  void fetchAliasSuggestions();
 });
 </script>
 
@@ -283,18 +604,91 @@ onMounted(() => {
       </div>
     </section>
 
+    <section class="rounded-card border border-primary/30 bg-primary/5 p-4 md:p-5">
+      <div class="flex items-center justify-between gap-3">
+        <div>
+          <h2 class="text-sm font-semibold text-text-primary">{{ t("admin.teamTower.aliasSuggestions.title") }}</h2>
+          <p class="text-xs text-text-muted mt-1">{{ t("admin.teamTower.aliasSuggestions.subtitle") }}</p>
+        </div>
+        <button
+          type="button"
+          class="rounded-card border border-surface-3 bg-surface-0 px-3 py-1 text-xs text-text-secondary hover:border-primary/60 disabled:opacity-50"
+          :disabled="aliasSuggestionsApplying || aliasSuggestions.length === 0"
+          @click="applyAllAliasSuggestions"
+        >
+          {{ t("admin.teamTower.aliasSuggestions.applyAll") }}
+        </button>
+      </div>
+      <div v-if="aliasSuggestionsLoading" class="mt-3 text-sm text-text-muted">
+        {{ t("admin.teamTower.loading") }}
+      </div>
+      <div v-else-if="aliasSuggestions.length === 0" class="mt-3 text-sm text-text-muted">
+        {{ t("admin.teamTower.aliasSuggestions.empty") }}
+      </div>
+      <div v-else class="mt-3 space-y-2">
+        <div
+          v-for="suggestion in aliasSuggestions"
+          :key="suggestion.id"
+          class="rounded-card border border-surface-3/60 bg-surface-0 px-3 py-2 flex flex-col md:flex-row md:items-center md:justify-between gap-2"
+          draggable="true"
+          @dragstart="onAliasSuggestionDragStart($event, suggestion.id)"
+          @dragend="onAliasSuggestionDragEnd"
+        >
+          <div class="text-xs text-text-secondary flex flex-wrap items-center gap-x-2 gap-y-1">
+            <span class="font-medium text-text-primary">{{ suggestion.raw_team_name }}</span>
+            <span>-> {{ suggestion.suggested_team_name || t("admin.teamTower.aliasSuggestions.noSuggestedTeam") }}</span>
+            <span class="ml-1">({{ suggestion.source }})</span>
+            <span v-if="suggestion.league_name" class="ml-1">{{ suggestion.league_name }}</span>
+            <span class="ml-1">{{ t("admin.teamTower.aliasSuggestions.seenCount", { count: suggestion.seen_count }) }}</span>
+          </div>
+          <div class="flex items-center gap-2">
+            <button
+              type="button"
+              class="rounded-card border border-surface-3 bg-surface-1 px-3 py-1 text-xs text-text-secondary hover:border-primary/60 disabled:opacity-50"
+              :disabled="aliasSuggestionsApplying || !suggestion.suggested_team_id"
+              @click="applyAliasSuggestion(suggestion)"
+            >
+              {{ t("admin.teamTower.aliasSuggestions.applyOne") }}
+            </button>
+            <button
+              type="button"
+              class="rounded-card border border-danger/40 bg-danger/10 px-3 py-1 text-xs text-danger hover:border-danger disabled:opacity-50"
+              :disabled="aliasSuggestionsApplying"
+              @click="rejectAliasSuggestion(suggestion)"
+            >
+              {{ t("admin.teamTower.aliasSuggestions.rejectOne") }}
+            </button>
+          </div>
+        </div>
+      </div>
+    </section>
+
     <section class="rounded-card border border-warning/40 bg-warning/5 p-4 md:p-5">
       <h2 class="text-sm font-semibold text-text-primary">{{ t("admin.teamTower.merge.title") }}</h2>
       <p class="text-sm text-text-secondary mt-1">{{ t("admin.teamTower.merge.description") }}</p>
 
       <div class="grid md:grid-cols-3 gap-3 mt-3">
-        <div class="rounded-card border border-surface-3 bg-surface-0 p-3">
+        <div
+          class="rounded-card border bg-surface-0 p-3 transition-colors"
+          :class="sourceZoneActive ? 'border-primary/70 bg-primary/10' : 'border-surface-3'"
+          @dragenter.prevent="onSourceZoneDragEnter"
+          @dragleave.prevent="onSourceZoneDragLeave"
+          @dragover.prevent
+          @drop.prevent="onSourceDropZoneDrop"
+        >
           <p class="text-xs text-text-muted">{{ t("admin.teamTower.merge.source") }}</p>
           <p class="text-sm font-medium text-text-primary mt-1 truncate">
             {{ sourceTeam?.display_name || t("admin.teamTower.merge.unselected") }}
           </p>
         </div>
-        <div class="rounded-card border border-surface-3 bg-surface-0 p-3">
+        <div
+          class="rounded-card border bg-surface-0 p-3 transition-colors"
+          :class="targetZoneActive ? 'border-danger/70 bg-danger/10' : 'border-surface-3'"
+          @dragenter.prevent="onTargetZoneDragEnter"
+          @dragleave.prevent="onTargetZoneDragLeave"
+          @dragover.prevent
+          @drop.prevent="onTargetDropZoneDrop"
+        >
           <p class="text-xs text-text-muted">{{ t("admin.teamTower.merge.target") }}</p>
           <p class="text-sm font-medium text-text-primary mt-1 truncate">
             {{ targetTeam?.display_name || t("admin.teamTower.merge.unselected") }}
@@ -329,21 +723,28 @@ onMounted(() => {
           {{ t("admin.teamTower.noResults") }}
         </div>
         <div v-else-if="mergeSearchResults.length" class="mt-2 space-y-2">
-          <button
+          <div
             v-for="team in mergeSearchResults"
             :key="team.id"
-            type="button"
-            class="w-full rounded-card border border-surface-3 bg-surface-0 px-3 py-2 text-left hover:border-primary/60"
-            @click="setTargetTeam(team.id)"
+            class="w-full rounded-card border border-surface-3 bg-surface-0 px-3 py-2 text-left hover:border-primary/60 cursor-grab active:cursor-grabbing"
+            draggable="true"
+            @dragstart="onSourceDragStart($event, team.id)"
+            @dragend="onSourceDragEnd"
           >
             <span class="text-sm font-medium text-text-primary">{{ team.display_name }}</span>
             <span class="ml-2 text-xs text-text-muted">{{ t("admin.teamTower.labels.teamId") }}: {{ team.id }}</span>
-          </button>
+          </div>
         </div>
       </div>
     </section>
 
     <section class="space-y-3">
+      <div
+        v-if="teamsError"
+        class="rounded-card border border-danger/40 bg-danger/10 p-3 text-sm text-danger"
+      >
+        {{ teamsError }}
+      </div>
       <div v-if="loading" class="grid md:grid-cols-2 gap-3">
         <div
           v-for="index in 6"
@@ -369,21 +770,33 @@ onMounted(() => {
           :key="team.id"
           class="rounded-card border border-surface-3/60 bg-surface-1 p-4"
           draggable="true"
-          @dragstart="onSourceDragStart(team.id)"
+          :class="{
+            'ring-2 ring-primary/50 border-primary/50': dragOverTargetId === team.id,
+          }"
+          @dragstart="onSourceDragStart($event, team.id)"
+          @dragend="onSourceDragEnd"
+          @dragenter.prevent="onTargetDragEnter(team.id)"
+          @dragleave.prevent="onTargetDragLeave(team.id)"
           @dragover.prevent
-          @drop.prevent="onTargetDrop(team.id)"
+          @drop.prevent="onTeamCardDrop($event, team.id)"
         >
         <div class="flex flex-col md:flex-row md:items-start md:justify-between gap-3">
           <div>
             <h3 class="text-base font-semibold text-text-primary">{{ team.display_name }}</h3>
             <p class="text-xs text-text-muted mt-1">
-              {{ t("admin.teamTower.labels.canonicalId") }}: {{ team.canonical_id || t("admin.teamTower.labels.notAvailable") }}
-            </p>
-            <p class="text-xs text-text-muted">
               {{ t("admin.teamTower.labels.teamId") }}: {{ team.id }}
             </p>
           </div>
           <div class="flex flex-wrap items-center gap-2">
+            <button
+              type="button"
+              draggable="true"
+              class="rounded-card border border-surface-3 bg-surface-0 px-3 py-1 text-xs font-medium text-text-secondary hover:border-primary/50 cursor-grab active:cursor-grabbing"
+              @dragstart="onSourceDragStart($event, team.id)"
+              @dragend="onSourceDragEnd"
+            >
+              {{ t("admin.teamTower.actions.dragAsSource") }}
+            </button>
             <span
               class="rounded-full px-2.5 py-1 text-xs font-medium"
               :class="team.needs_review ? 'bg-warning/20 text-warning' : 'bg-primary-muted/20 text-primary'"
@@ -457,22 +870,6 @@ onMounted(() => {
           >
             {{ aliasSavingByTeam[team.id] ? t("admin.teamTower.actions.saving") : t("admin.teamTower.actions.addAlias") }}
           </button>
-          <div class="flex gap-2">
-            <button
-              type="button"
-              class="flex-1 rounded-card border border-surface-3 bg-surface-0 px-3 py-2 text-xs font-medium text-text-secondary hover:border-primary/50"
-              @click="setSourceTeam(team.id)"
-            >
-              {{ t("admin.teamTower.actions.setSource") }}
-            </button>
-            <button
-              type="button"
-              class="flex-1 rounded-card border border-surface-3 bg-surface-0 px-3 py-2 text-xs font-medium text-text-secondary hover:border-primary/50"
-              @click="setTargetTeam(team.id)"
-            >
-              {{ t("admin.teamTower.actions.setTarget") }}
-            </button>
-          </div>
         </div>
         </article>
       </template>

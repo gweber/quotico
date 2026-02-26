@@ -7,25 +7,25 @@ Purpose:
 
 Dependencies:
     - app.providers.http_client
-    - app.config
+    - app.services.provider_settings_service
+    - app.services.provider_rate_limiter
     - app.utils.utcnow
 """
 
-import asyncio
 import logging
 import time
-import unicodedata
-from datetime import datetime, timedelta
-
-from app.utils import utcnow
+from datetime import timedelta
 from typing import Any, Optional
 
-from app.config import settings
+from app.config import settings  # kept for test monkeypatch compatibility
 from app.providers.http_client import ResilientClient
+from app.services.provider_rate_limiter import provider_rate_limiter
+from app.services.provider_settings_service import provider_settings_service
+from app.utils import utcnow
 
 logger = logging.getLogger("quotico.football_data")
 
-BASE_URL = "https://api.football-data.org/v4"
+PROVIDER_NAME = "football_data"
 
 # Map our sport keys to football-data.org competition codes
 # Free tier only — BL2 (2. Bundesliga) requires paid plan, use OpenLigaDB instead
@@ -40,57 +40,40 @@ SPORT_TO_COMPETITION = {
 }
 
 
-def _normalize_tokens(name: str) -> set[str]:
-    """Normalize a team name into lowercase tokens for fuzzy matching."""
-    # Remove accents (ü→u, é→e, etc.)
-    name = unicodedata.normalize("NFKD", name)
-    name = "".join(c for c in name if not unicodedata.combining(c))
-    name = name.lower()
-    noise = {"fc", "cf", "sc", "ac", "as", "ss", "us", "afc", "rcd", "1.", "club", "de"}
-    return {t for t in name.split() if t not in noise and len(t) >= 3}
-
-
-def teams_match(name_a: str, name_b: str) -> bool:
-    """Check if two team names likely refer to the same team."""
-    tokens_a = _normalize_tokens(name_a)
-    tokens_b = _normalize_tokens(name_b)
-
-    # Direct token overlap ("bayern" in both)
-    if tokens_a & tokens_b:
-        return True
-
-    # Prefix matching ("inter" ~ "internazionale", "milan" ~ "milano")
-    for ta in tokens_a:
-        for tb in tokens_b:
-            if len(ta) >= 4 and len(tb) >= 4:
-                if ta.startswith(tb[:4]) or tb.startswith(ta[:4]):
-                    return True
-
-    return False
-
-
 class FootballDataProvider:
     """football-data.org provider for free match scores and live data."""
-
-    # Free tier: 10 requests/minute → 1 request per 7 seconds (with margin)
-    _MIN_INTERVAL = 7.0
 
     def __init__(self):
         self._client = ResilientClient("football_data")
         self._cache: dict[str, dict[str, Any]] = {}
         self._cache_ttl = 300  # 5 minutes
-        self._last_request_at: float = 0.0
+        self._runtime_fingerprint: tuple[float, int, float] | None = None
 
-    async def _throttle(self) -> None:
-        """Enforce minimum interval between API calls (free tier rate limit)."""
-        elapsed = time.time() - self._last_request_at
-        if elapsed < self._MIN_INTERVAL:
-            await asyncio.sleep(self._MIN_INTERVAL - elapsed)
-        self._last_request_at = time.time()
+    async def _runtime(self, sport_key: str | None = None) -> dict[str, Any]:
+        payload = await provider_settings_service.get_effective(
+            PROVIDER_NAME,
+            sport_key=sport_key,
+            include_secret=True,
+        )
+        effective = dict(payload.get("effective_config") or {})
+        timeout = float(effective.get("timeout_seconds") or 15.0)
+        retries = int(effective.get("max_retries") or 3)
+        base_delay = float(effective.get("base_delay_seconds") or 10.0)
+        fp = (timeout, retries, base_delay)
+        if fp != self._runtime_fingerprint:
+            if hasattr(self._client, "_max_retries"):
+                self._client._max_retries = retries
+            if hasattr(self._client, "_base_delay"):
+                self._client._base_delay = base_delay
+            if hasattr(self._client, "_client"):
+                self._client._client.timeout = timeout
+            self._runtime_fingerprint = fp
+        return effective
 
-    def _get_cached(self, key: str) -> Optional[list[dict]]:
+    def _get_cached(self, key: str, ttl_seconds: int | None = None) -> Optional[list[dict]]:
         entry = self._cache.get(key)
-        if entry and (time.time() - entry["ts"]) < self._cache_ttl:
+        ttl = ttl_seconds if ttl_seconds is not None else self._cache_ttl
+        if entry and (time.time() - entry["ts"]) < ttl:
             return entry["data"]
         return None
 
@@ -98,20 +81,30 @@ class FootballDataProvider:
         self._cache[key] = {"data": data, "ts": time.time()}
 
     async def _fetch_matches(
-        self, competition: str, status: str, days_back: int = 3
+        self,
+        competition: str,
+        status: str,
+        days_back: int = 3,
+        sport_key: str | None = None,
     ) -> list[dict]:
         """Fetch matches from football-data.org for a competition."""
-        api_key = getattr(settings, "FOOTBALL_DATA_API_KEY", "")
+        runtime = await self._runtime(sport_key=sport_key)
+        if not bool(runtime.get("enabled", True)):
+            return []
+        api_key = str(runtime.get("api_key") or "")
         if not api_key:
+            return []
+        base_url = str(runtime.get("base_url") or "")
+        if not base_url:
             return []
 
         now = utcnow()
         date_from = (now - timedelta(days=days_back)).strftime("%Y-%m-%d")
         date_to = now.strftime("%Y-%m-%d")
 
-        await self._throttle()
+        await provider_rate_limiter.acquire(PROVIDER_NAME, runtime.get("rate_limit_rpm"))
         resp = await self._client.get(
-            f"{BASE_URL}/competitions/{competition}/matches",
+            f"{base_url}/competitions/{competition}/matches",
             params={
                 "status": status,
                 "dateFrom": date_from,
@@ -134,7 +127,7 @@ class FootballDataProvider:
             return cached
 
         try:
-            raw = await self._fetch_matches(competition, "FINISHED", days_back=3)
+            raw = await self._fetch_matches(competition, "FINISHED", days_back=3, sport_key=sport_key)
             results = []
 
             for match in raw:
@@ -202,13 +195,19 @@ class FootballDataProvider:
             return entry["data"]
 
         try:
-            api_key = getattr(settings, "FOOTBALL_DATA_API_KEY", "")
+            runtime = await self._runtime(sport_key=sport_key)
+            if not bool(runtime.get("enabled", True)):
+                return []
+            api_key = str(runtime.get("api_key") or "")
             if not api_key:
                 return []
+            base_url = str(runtime.get("base_url") or "")
+            if not base_url:
+                return []
 
-            await self._throttle()
+            await provider_rate_limiter.acquire(PROVIDER_NAME, runtime.get("rate_limit_rpm"))
             resp = await self._client.get(
-                f"{BASE_URL}/competitions/{competition}/matches",
+                f"{base_url}/competitions/{competition}/matches",
                 params={"status": "IN_PLAY"},
                 headers={"X-Auth-Token": api_key},
             )
@@ -245,7 +244,6 @@ class FootballDataProvider:
             stale = self._cache.get(cache_key)
             return stale["data"] if stale else []
 
-
     async def get_current_matchday_number(self, sport_key: str) -> int | None:
         """Get the current matchday number for a competition."""
         competition = SPORT_TO_COMPETITION.get(sport_key)
@@ -258,13 +256,19 @@ class FootballDataProvider:
             return cached[0]["matchday_number"] if cached else None
 
         try:
-            api_key = getattr(settings, "FOOTBALL_DATA_API_KEY", "")
+            runtime = await self._runtime(sport_key=sport_key)
+            if not bool(runtime.get("enabled", True)):
+                return None
+            api_key = str(runtime.get("api_key") or "")
             if not api_key:
                 return None
+            base_url = str(runtime.get("base_url") or "")
+            if not base_url:
+                return None
 
-            await self._throttle()
+            await provider_rate_limiter.acquire(PROVIDER_NAME, runtime.get("rate_limit_rpm"))
             resp = await self._client.get(
-                f"{BASE_URL}/competitions/{competition}",
+                f"{base_url}/competitions/{competition}",
                 headers={"X-Auth-Token": api_key},
             )
             resp.raise_for_status()
@@ -291,13 +295,19 @@ class FootballDataProvider:
             return cached
 
         try:
-            api_key = getattr(settings, "FOOTBALL_DATA_API_KEY", "")
+            runtime = await self._runtime(sport_key=sport_key)
+            if not bool(runtime.get("enabled", True)):
+                return []
+            api_key = str(runtime.get("api_key") or "")
             if not api_key:
                 return []
+            base_url = str(runtime.get("base_url") or "")
+            if not base_url:
+                return []
 
-            await self._throttle()
+            await provider_rate_limiter.acquire(PROVIDER_NAME, runtime.get("rate_limit_rpm"))
             resp = await self._client.get(
-                f"{BASE_URL}/competitions/{competition}/matches",
+                f"{base_url}/competitions/{competition}/matches",
                 params={"matchday": str(matchday_number)},
                 headers={"X-Auth-Token": api_key},
             )
@@ -349,6 +359,76 @@ class FootballDataProvider:
             logger.error(
                 "football-data.org matchday error for %s/%d/%d: %s",
                 sport_key, season, matchday_number, e,
+            )
+            stale = self._cache.get(cache_key)
+            return stale["data"] if stale else []
+
+    async def get_season_matches(self, competition: str, season_year: int) -> list[dict[str, Any]]:
+        """Fetch all matches for one competition season and return normalized rows."""
+        cache_key = f"season:{competition}:{season_year}"
+        cached = self._get_cached(cache_key, ttl_seconds=3600)
+        if cached is not None:
+            return cached
+
+        runtime = await self._runtime()
+        if not bool(runtime.get("enabled", True)):
+            return []
+        api_key = str(runtime.get("api_key") or "")
+        if not api_key:
+            return []
+        base_url = str(runtime.get("base_url") or "")
+        if not base_url:
+            return []
+
+        try:
+            await provider_rate_limiter.acquire(PROVIDER_NAME, runtime.get("rate_limit_rpm"))
+            resp = await self._client.get(
+                f"{base_url}/competitions/{competition}/matches",
+                params={"season": int(season_year)},
+                headers={"X-Auth-Token": api_key},
+            )
+            resp.raise_for_status()
+            raw = resp.json().get("matches", [])
+
+            normalized: list[dict[str, Any]] = []
+            for match in raw:
+                score_data = match.get("score", {}) if isinstance(match.get("score"), dict) else {}
+                ft = score_data.get("fullTime", {}) if isinstance(score_data.get("fullTime"), dict) else {}
+                ht = score_data.get("halfTime", {}) if isinstance(score_data.get("halfTime"), dict) else {}
+                et = score_data.get("extraTime", {}) if isinstance(score_data.get("extraTime"), dict) else {}
+                pens = score_data.get("penalties", {}) if isinstance(score_data.get("penalties"), dict) else {}
+                group = match.get("group")
+                group_name = group.get("name") if isinstance(group, dict) else group
+                normalized.append(
+                    {
+                        "match_id": str(match.get("id")) if match.get("id") is not None else "",
+                        "utc_date": str(match.get("utcDate") or ""),
+                        "status_raw": str(match.get("status") or ""),
+                        "matchday": match.get("matchday"),
+                        "season": int(season_year),
+                        "stage": match.get("stage"),
+                        "group": group_name,
+                        "home_team_id": str(match.get("homeTeam", {}).get("id") or ""),
+                        "home_team_name": str(match.get("homeTeam", {}).get("name") or ""),
+                        "away_team_id": str(match.get("awayTeam", {}).get("id") or ""),
+                        "away_team_name": str(match.get("awayTeam", {}).get("name") or ""),
+                        "score": {
+                            "full_time": {"home": ft.get("home"), "away": ft.get("away")},
+                            "half_time": {"home": ht.get("home"), "away": ht.get("away")},
+                            "extra_time": {"home": et.get("home"), "away": et.get("away")},
+                            "penalties": {"home": pens.get("home"), "away": pens.get("away")},
+                        },
+                    }
+                )
+
+            self._set_cache(cache_key, normalized)
+            return normalized
+        except Exception as exc:
+            logger.error(
+                "football-data.org season error competition=%s season=%s: %s",
+                competition,
+                season_year,
+                exc,
             )
             stale = self._cache.get(cache_key)
             return stale["data"] if stale else []
