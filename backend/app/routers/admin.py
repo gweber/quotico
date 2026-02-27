@@ -29,6 +29,7 @@ from pymongo.errors import DuplicateKeyError
 
 import app.database as _db
 from app.services.alias_service import generate_default_alias
+from app.services.admin_view_catalog_service import list_view_catalog
 from app.services.admin_service import (
     cleanup_same_day_duplicate_matches,
     list_same_day_duplicate_matches,
@@ -164,7 +165,6 @@ async def admin_stats(admin=Depends(get_admin_user)):
 
 # Worker definitions: id -> (label, provider, import path)
 _WORKER_REGISTRY: dict[str, dict] = {
-    "odds_poller": {"label": "Odds Poller", "provider": "odds_api"},
     "calibration_eval": {"label": "Calibration: Daily Eval", "provider": None},
     "calibration_refine": {"label": "Calibration: Weekly Refine", "provider": None},
     "calibration_explore": {"label": "Calibration: Monthly Explore", "provider": None},
@@ -186,7 +186,7 @@ _WORKER_REGISTRY: dict[str, dict] = {
 
 # Workers that can be triggered manually
 _TRIGGERABLE_WORKERS = {
-    "odds_poller", "match_resolver", "matchday_sync",
+    "match_resolver", "matchday_sync",
     "leaderboard", "matchday_resolver", "matchday_leaderboard",
     "quotico_tip_worker",
     "calibration_eval", "calibration_refine", "calibration_explore", "reliability_check"
@@ -220,6 +220,7 @@ async def provider_status(admin=Depends(get_admin_user)):
         "espn": {"label": "ESPN", "status": "ok"},
     }
 
+
     # Worker state from DB + scheduler
     jobs_by_id = {job.id: job for job in scheduler.get_jobs()}
     workers = []
@@ -237,13 +238,35 @@ async def provider_status(admin=Depends(get_admin_user)):
             "next_run": job.next_run_time.isoformat() if job and job.next_run_time else None,
         })
 
+    odds_status = await _db.db.meta.find_one(
+        {"_id": "odds_scheduler_status"},
+        {"_id": 0, "last_tick_at": 1, "rounds_synced": 1, "fixtures_synced": 1, "matches_in_window": 1, "tier_breakdown": 1},
+    ) or {}
     return {
         "providers": providers,
         "workers": workers,
+        "heartbeat": {
+            "enabled": bool(settings.METRICS_HEARTBEAT_ENABLED),
+            "last_tick_at": (
+                ensure_utc(odds_status.get("last_tick_at")).isoformat()
+                if odds_status.get("last_tick_at")
+                else None
+            ),
+            "rounds_synced": int(odds_status.get("rounds_synced") or 0),
+            "fixtures_synced": int(odds_status.get("fixtures_synced") or 0),
+            "matches_in_window": int(odds_status.get("matches_in_window") or 0),
+            "tier_breakdown": odds_status.get("tier_breakdown") if isinstance(odds_status.get("tier_breakdown"), dict) else {},
+        },
         "automated_workers_enabled": automation_enabled(),
         "automated_workers_scheduled_jobs": automated_job_count(),
         "scheduler_running": bool(scheduler.running),
     }
+
+
+@router.get("/views/catalog")
+async def admin_views_catalog(admin=Depends(get_admin_user)):
+    _ = admin
+    return list_view_catalog()
 
 
 class ProviderSettingsPatchBody(BaseModel):
@@ -659,21 +682,9 @@ async def list_time_machine_justice(
     }
 
 
-class TriggerSyncRequest(BaseModel):
-    worker_id: str
-
-
 class AutomationToggleRequest(BaseModel):
     enabled: bool
     run_initial_sync: bool = False
-
-
-@router.post("/trigger-sync")
-async def trigger_sync(
-    body: TriggerSyncRequest, request: Request, admin=Depends(get_admin_user),
-):
-    _ = body, request, admin
-    raise HTTPException(status_code=410, detail="Legacy endpoint disabled in v3.1")
 
 
 @router.get("/workers/automation")
@@ -709,6 +720,10 @@ _HEARTBEAT_FIELD_LIMITS = {
 
 class HeartbeatConfigPatch(BaseModel):
     xg_crawler_tick_seconds: int | None = None
+
+
+class HeartbeatOddsTickRequest(BaseModel):
+    reason: str | None = "manual_provider_overview"
 
 
 @router.get("/heartbeat/config")
@@ -761,42 +776,37 @@ async def patch_heartbeat_config(
     return {"ok": True, "applied": updates}
 
 
-def _get_worker_fn(worker_id: str):
-    """Lazy-import worker functions to avoid circular imports."""
-    if worker_id == "odds_poller":
-        from app.workers.odds_poller import poll_odds
-        return poll_odds
-    if worker_id == "match_resolver":
-        from app.workers.match_resolver import resolve_matches
-        return resolve_matches
-    if worker_id == "matchday_sync":
-        from app.workers.matchday_sync import sync_matchdays
-        return sync_matchdays
-    if worker_id == "leaderboard":
-        from app.workers.leaderboard import materialize_leaderboard
-        return materialize_leaderboard
-    if worker_id == "matchday_resolver":
-        from app.workers.matchday_resolver import resolve_matchday_predictions
-        return resolve_matchday_predictions
-    if worker_id == "matchday_leaderboard":
-        from app.workers.matchday_leaderboard import materialize_matchday_leaderboard
-        return materialize_matchday_leaderboard
-    if worker_id == "quotico_tip_worker":
-        from app.workers.quotico_tip_worker import generate_quotico_tips
-        return generate_quotico_tips
-    if worker_id == "calibration_eval":
-        from app.workers.calibration_worker import run_daily_evaluation
-        return run_daily_evaluation
-    if worker_id == "calibration_refine":
-        from app.workers.calibration_worker import run_weekly_refinement
-        return run_weekly_refinement
-    if worker_id == "calibration_explore":
-        from app.workers.calibration_worker import run_monthly_exploration
-        return run_monthly_exploration
-    if worker_id == "reliability_check":
-        from app.workers.calibration_worker import run_reliability_check
-        return run_reliability_check
-    return None
+@router.post("/heartbeat/odds/tick")
+async def trigger_heartbeat_odds_tick(
+    body: HeartbeatOddsTickRequest,
+    request: Request,
+    admin=Depends(get_admin_user),
+):
+    from app.services.metrics_heartbeat import (
+        OddsTickAlreadyRunningError,
+        metrics_heartbeat,
+    )
+
+    reason = str(body.reason or "manual_provider_overview").strip() or "manual_provider_overview"
+    try:
+        result = await metrics_heartbeat.run_odds_tick_now(triggered_by=reason)
+    except OddsTickAlreadyRunningError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    await log_audit(
+        actor_id=str(admin["_id"]),
+        action="heartbeat.odds_tick.manual",
+        target_id="heartbeat:odds",
+        details={"reason": reason, "result": result.get("tick")},
+        request=request,
+    )
+    return {
+        "ok": True,
+        "message": "Heartbeat odds tick completed.",
+        "duration_ms": int(result.get("duration_ms") or 0),
+        "result": result.get("tick") or {},
+        "generated_at_utc": ensure_utc(result.get("finished_at")).isoformat(),
+    }
 
 
 # --- User Management ---
@@ -1587,7 +1597,6 @@ def _league_to_dict(doc: dict) -> dict:
     features = doc.get("features", {})
     if not isinstance(features, dict):
         features = {}
-    tipping_default = bool(doc.get("is_active", False))
     sport_key = str(doc.get("sport_key", ""))
     season_start_month = int(
         doc.get("season_start_month")
@@ -1597,7 +1606,7 @@ def _league_to_dict(doc: dict) -> dict:
     return {
         "id": str(doc["_id"]),
         "sport_key": sport_key,
-        "display_name": doc.get("display_name", ""),
+        "display_name": doc.get("display_name") or doc.get("name") or "",
         "structure_type": str(doc.get("structure_type") or "league"),
         "country_code": doc.get("country_code"),
         "tier": doc.get("tier"),
@@ -1613,10 +1622,10 @@ def _league_to_dict(doc: dict) -> dict:
         "is_active": bool(doc.get("is_active", False)),
         "needs_review": bool(doc.get("needs_review", False)),
         "features": {
-            "tipping": bool(features.get("tipping", tipping_default)),
-            "match_load": bool(features.get("match_load", True)),
-            "xg_sync": bool(features.get("xg_sync", False)),
-            "odds_sync": bool(features.get("odds_sync", False)),
+            "tipping": bool(features.get("tipping")),
+            "match_load": bool(features.get("match_load")),
+            "xg_sync": bool(features.get("xg_sync")),
+            "odds_sync": bool(features.get("odds_sync")),
         },
         "external_ids": {
             str(provider).strip().lower(): str(external_id).strip()
@@ -1637,7 +1646,6 @@ def _league_to_dict(doc: dict) -> dict:
 
 async def _refresh_league_registry() -> None:
     await invalidate_navigation_cache()
-    await LeagueRegistry.get().initialize()
 
 
 class LeagueFeaturesUpdateBody(BaseModel):
@@ -1770,7 +1778,7 @@ async def _run_football_data_import_job(
             },
         )
         if not dry_run:
-            await _db.db.leagues.update_one(
+            await _db.db.league_registry_v3.update_one(
                 {"_id": league_id},
                 {
                     "$set": {
@@ -1919,7 +1927,7 @@ async def _run_unified_match_ingest_job(
             },
         )
         if not dry_run:
-            await _db.db.leagues.update_one(
+            await _db.db.league_registry_v3.update_one(
                 {"_id": league_id},
                 {
                     "$set": {
@@ -2134,7 +2142,7 @@ async def _run_xg_enrichment_job(
 
 @router.get("/leagues")
 async def list_leagues_admin(admin=Depends(get_admin_user)):
-    docs = await _db.db.leagues.find({}).sort([("ui_order", 1), ("display_name", 1)]).to_list(length=10_000)
+    docs = await _db.db.league_registry_v3.find({}).sort([("ui_order", 1), ("name", 1)]).to_list(length=10_000)
     return {"items": [_league_to_dict(doc) for doc in docs]}
 
 
@@ -2153,13 +2161,16 @@ async def update_leagues_order_admin(
     if not body.league_ids:
         raise HTTPException(status_code=400, detail="league_ids must not be empty.")
 
-    ordered_ids: list[ObjectId] = []
+    ordered_ids: list[int] = []
     seen: set[str] = set()
     for league_id in body.league_ids:
         if league_id in seen:
             continue
         seen.add(league_id)
-        ordered_ids.append(_parse_object_id(league_id, "league_id"))
+        try:
+            ordered_ids.append(int(league_id))
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="league_id must be an integer.") from None
 
     result = await update_league_order(ordered_ids)
     await log_audit(
@@ -2191,14 +2202,21 @@ async def update_league_admin(
     ):
         raise HTTPException(status_code=400, detail="Nothing to update.")
 
-    league_oid = _parse_object_id(league_id, "league_id")
-    league = await _db.db.leagues.find_one({"_id": league_oid})
+    try:
+        league_id_int = int(league_id)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="league_id must be an integer.") from None
+
+    league = await _db.db.league_registry_v3.find_one({"_id": league_id_int})
     if not league:
         raise HTTPException(status_code=404, detail="League not found.")
 
     updates: dict = {"updated_at": utcnow()}
     if body.display_name is not None:
-        updates["display_name"] = body.display_name.strip()
+        cleaned_name = body.display_name.strip()
+        if not cleaned_name:
+            raise HTTPException(status_code=400, detail="display_name must not be empty.")
+        updates["name"] = cleaned_name
     if body.structure_type is not None:
         structure_type = str(body.structure_type).strip().lower()
         if structure_type not in {"league", "cup", "tournament"}:
@@ -2224,12 +2242,15 @@ async def update_league_admin(
     if body.features is not None:
         existing_features = league.get("features")
         if not isinstance(existing_features, dict):
-            existing_features = {}
+            raise HTTPException(
+                status_code=409,
+                detail="League missing required features object. Fix source data first.",
+            )
         next_features = {
-            "tipping": bool(existing_features.get("tipping", bool(league.get("is_active", False)))),
-            "match_load": bool(existing_features.get("match_load", True)),
-            "xg_sync": bool(existing_features.get("xg_sync", False)),
-            "odds_sync": bool(existing_features.get("odds_sync", False)),
+            "tipping": bool(existing_features.get("tipping")),
+            "match_load": bool(existing_features.get("match_load")),
+            "xg_sync": bool(existing_features.get("xg_sync")),
+            "odds_sync": bool(existing_features.get("odds_sync")),
         }
         if body.features.tipping is not None:
             next_features["tipping"] = bool(body.features.tipping)
@@ -2241,7 +2262,7 @@ async def update_league_admin(
             next_features["odds_sync"] = bool(body.features.odds_sync)
         updates["features"] = next_features
 
-    await _db.db.leagues.update_one({"_id": league_oid}, {"$set": updates})
+    await _db.db.league_registry_v3.update_one({"_id": league_id_int}, {"$set": updates})
     await _refresh_league_registry()
 
     await log_audit(
@@ -2251,7 +2272,7 @@ async def update_league_admin(
         metadata={"updates": updates},
         request=request,
     )
-    updated = await _db.db.leagues.find_one({"_id": league_oid})
+    updated = await _db.db.league_registry_v3.find_one({"_id": league_id_int})
     return {"message": "League updated.", "item": _league_to_dict(updated or league)}
 
 

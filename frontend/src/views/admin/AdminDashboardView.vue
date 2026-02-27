@@ -162,6 +162,15 @@ const cards = ref<ModuleCard[]>([
     health: "ok",
   },
   {
+    key: "viewsCatalog",
+    to: "/admin/views",
+    labelKey: "admin.dashboard.modules.viewsCatalog",
+    icon: "VC",
+    status: "active",
+    healthEndpoint: "/admin/views/catalog",
+    health: "ok",
+  },
+  {
     key: "providerStatus",
     to: "/admin/provider-status",
     labelKey: "admin.dashboard.modules.providerStatus",

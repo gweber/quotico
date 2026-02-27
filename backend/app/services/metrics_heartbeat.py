@@ -41,10 +41,15 @@ _POST_MATCH_LOOKBACK_DAYS = 7
 _TIER_PRIORITY = {"CLOSING": 0, "IMMINENT": 1, "APPROACHING": 2}
 
 
+class OddsTickAlreadyRunningError(RuntimeError):
+    """Raised when a manual odds tick is requested while another tick is active."""
+
+
 class MetricsHeartbeat:
     def __init__(self) -> None:
         self._tasks: list[asyncio.Task] = []
         self._stopping = False
+        self._odds_tick_lock = asyncio.Lock()
 
     async def start(self) -> None:
         self._stopping = False
@@ -77,14 +82,49 @@ class MetricsHeartbeat:
         await asyncio.sleep(10)  # let the app boot
         while not self._stopping:
             try:
-                await self._odds_scheduler_tick()
+                await self._run_odds_scheduler_tick(triggered_by="scheduler_loop")
             except asyncio.CancelledError:
                 return
             except Exception:
                 logger.exception("Odds scheduler tick failed")
             await asyncio.sleep(interval)
 
-    async def _odds_scheduler_tick(self) -> None:
+    async def run_odds_tick_now(self, *, triggered_by: str) -> dict[str, Any]:
+        """Run one odds scheduler tick immediately for admin-triggered sync."""
+        started_at = utcnow()
+        if self._odds_tick_lock.locked():
+            raise OddsTickAlreadyRunningError("Odds scheduler tick already running")
+        acquired = False
+        try:
+            await asyncio.wait_for(self._odds_tick_lock.acquire(), timeout=0.01)
+            acquired = True
+        except TimeoutError as exc:
+            raise OddsTickAlreadyRunningError("Odds scheduler tick already running") from exc
+
+        try:
+            tick_result = await self._odds_scheduler_tick(triggered_by=triggered_by)
+        finally:
+            if acquired:
+                self._odds_tick_lock.release()
+
+        finished_at = utcnow()
+        duration_ms = max(
+            0,
+            int((finished_at - started_at).total_seconds() * 1000),
+        )
+        return {
+            "started_at": started_at,
+            "finished_at": finished_at,
+            "duration_ms": duration_ms,
+            "triggered_by": triggered_by,
+            "tick": tick_result,
+        }
+
+    async def _run_odds_scheduler_tick(self, *, triggered_by: str) -> dict[str, Any]:
+        async with self._odds_tick_lock:
+            return await self._odds_scheduler_tick(triggered_by=triggered_by)
+
+    async def _odds_scheduler_tick(self, *, triggered_by: str) -> dict[str, Any]:
         from app.services.sportmonks_connector import sportmonks_connector
         from app.workers._state import set_synced
 
@@ -103,7 +143,16 @@ class MetricsHeartbeat:
 
         if not upcoming:
             logger.debug("Odds scheduler: no upcoming matches in next %dd", settings.ODDS_SCHEDULER_LOOKAHEAD_DAYS)
-            return
+            return {
+                "status": "ok",
+                "triggered_by": triggered_by,
+                "matches_in_window": 0,
+                "rounds_synced": 0,
+                "fixtures_synced": 0,
+                "repairs": 0,
+                "tier_breakdown": {},
+                "deferred_rounds": 0,
+            }
 
         # 2. Classify and collect stale rounds by tier
         # Key: (tier, season_id, round_id) → list of fixture IDs
@@ -121,10 +170,22 @@ class MetricsHeartbeat:
 
         if not stale_rounds:
             logger.debug("Odds scheduler: %d matches all fresh", len(upcoming))
-            return
+            return {
+                "status": "ok",
+                "triggered_by": triggered_by,
+                "matches_in_window": len(upcoming),
+                "rounds_synced": 0,
+                "fixtures_synced": 0,
+                "repairs": 0,
+                "tier_breakdown": {},
+                "deferred_rounds": 0,
+            }
 
         # 3. Sort by tier priority (CLOSING first)
         work_plan = sorted(stale_rounds.keys(), key=lambda k: _TIER_PRIORITY.get(k[0], 99))
+        tier_counts = defaultdict(int)
+        for tier, _, _ in work_plan:
+            tier_counts[tier] += 1
 
         # 4. Execute
         synced_rounds = 0
@@ -134,11 +195,12 @@ class MetricsHeartbeat:
         errors = 0
 
         job_id = await self._create_job("heartbeat_odds_sync")
+        deferred_rounds = 0
 
         for tier, season_id, round_id in work_plan:
             if utcnow() > tick_deadline:
-                logger.info("Odds scheduler: tick deadline reached, deferring %d rounds",
-                            len(work_plan) - synced_rounds)
+                deferred_rounds = len(work_plan) - synced_rounds
+                logger.info("Odds scheduler: tick deadline reached, deferring %d rounds", deferred_rounds)
                 break
             if self._stopping:
                 break
@@ -170,14 +232,21 @@ class MetricsHeartbeat:
                 logger.warning("Odds scheduler: round %d failed: %s (backoff %ds)",
                                round_id, exc, backoff)
                 if errors >= _MAX_CONSECUTIVE_ERRORS:
-                    await self._fail_job(job_id, f"Max errors after {errors} consecutive failures")
-                    return
+                    error_msg = f"Max errors after {errors} consecutive failures"
+                    await self._fail_job(job_id, error_msg)
+                    return {
+                        "status": "failed",
+                        "triggered_by": triggered_by,
+                        "error": error_msg,
+                        "matches_in_window": len(upcoming),
+                        "rounds_synced": synced_rounds,
+                        "fixtures_synced": synced_fixtures,
+                        "repairs": repair_count,
+                        "tier_breakdown": dict(tier_counts),
+                        "deferred_rounds": deferred_rounds,
+                    }
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, _BACKOFF_MAX_S)
-
-        tier_counts = defaultdict(int)
-        for tier, _, _ in work_plan:
-            tier_counts[tier] += 1
 
         await self._succeed_job(job_id, {
             "rounds_synced": synced_rounds,
@@ -197,6 +266,7 @@ class MetricsHeartbeat:
                 "repairs": repair_count,
                 "matches_in_window": len(upcoming),
                 "tier_breakdown": dict(tier_counts),
+                "triggered_by": triggered_by,
             }},
             upsert=True,
         )
@@ -210,6 +280,16 @@ class MetricsHeartbeat:
                      synced_rounds, synced_fixtures, repair_count, dict(tier_counts))
 
         await self._publish_metrics_event("odds_scheduler", synced_fixtures)
+        return {
+            "status": "ok",
+            "triggered_by": triggered_by,
+            "matches_in_window": len(upcoming),
+            "rounds_synced": synced_rounds,
+            "fixtures_synced": synced_fixtures,
+            "repairs": repair_count,
+            "tier_breakdown": dict(tier_counts),
+            "deferred_rounds": deferred_rounds,
+        }
 
     @staticmethod
     def _classify_match(doc: dict[str, Any], now) -> tuple[str, bool]:

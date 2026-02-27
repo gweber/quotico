@@ -326,19 +326,19 @@ async def create_or_get_draft(
 
     # Add matchday-specific fields
     if slip_type == "matchday_round" and matchday_id:
-        matchday = await _db.db.matchdays.find_one({"_id": ObjectId(matchday_id)})
-        if not matchday:
-            raise HTTPException(status.HTTP_404_NOT_FOUND, "Matchday not found.")
+        # v3 matchday IDs are strings like "v3:sport:season:round" — resolve context
+        from app.services.matchday_service import _resolve_v3_matchday_context
+        context, _ = await _resolve_v3_matchday_context(matchday_id)
         slip_doc["matchday_id"] = matchday_id
-        slip_doc["matchday_number"] = matchday.get("matchday_number")
-        slip_doc["sport_key"] = matchday.get("sport_key")
-        slip_doc["season"] = matchday.get("season")
+        slip_doc["matchday_number"] = context.get("matchday_number")
+        slip_doc["sport_key"] = context.get("sport_key")
+        slip_doc["season"] = context.get("season")
         # Freeze point_weights from squad config at creation
         if squad_id:
             squad = await _db.db.squads.find_one({"_id": ObjectId(squad_id)})
             if squad:
                 from app.services.squad_league_service import get_active_league_config
-                lc = get_active_league_config(squad, matchday.get("sport_key", ""))
+                lc = get_active_league_config(squad, context.get("sport_key", ""))
                 if lc:
                     slip_doc["point_weights"] = lc.get("config", {}).get("point_weights")
 
@@ -424,9 +424,21 @@ async def patch_selection(
 
     now = utcnow()
     lock_mins = await _get_squad_lock_minutes(slip.get("squad_id"))
+    is_matchday = slip.get("type") == "matchday_round"
 
-    # Validate match exists and is open
-    match = await _db.db.matches.find_one({"_id": ObjectId(match_id)})
+    # exact_score validation: both home and away scores required
+    if market == "exact_score" and action in ("add", "update"):
+        if not isinstance(pick, dict) or pick.get("home") is None or pick.get("away") is None:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                "exact_score pick requires both home and away scores.",
+            )
+
+    # Validate match exists — matchday_round uses matches_v3 (integer IDs)
+    if is_matchday:
+        match = await _db.db.matches_v3.find_one({"_id": int(match_id)})
+    else:
+        match = await _db.db.matches.find_one({"_id": ObjectId(match_id)})
     if not match:
         raise HTTPException(status.HTTP_404_NOT_FOUND, f"Match {match_id} not found.")
 
@@ -448,12 +460,14 @@ async def patch_selection(
             "match_id": match_id,
             "market": market,
             "pick": pick,
-            "displayed_odds": displayed_odds,
-            "locked_odds": None,
             "points_earned": None,
             "is_auto": False,
             "status": "draft",
         }
+        # Only set odds fields for market bets (not exact_score)
+        if market != "exact_score":
+            sel["displayed_odds"] = displayed_odds
+            sel["locked_odds"] = None
         if market == "totals":
             totals = build_legacy_like_odds(match).get("totals", {})
             sel["line"] = totals.get("line", 2.5)
@@ -492,7 +506,8 @@ async def patch_selection(
             f"selections.{sel_idx}.pick": pick,
             "updated_at": now,
         }
-        if displayed_odds is not None:
+        # Only update odds for market bets (not exact_score)
+        if displayed_odds is not None and market != "exact_score":
             update_fields[f"selections.{sel_idx}.displayed_odds"] = displayed_odds
 
         await _db.db.betting_slips.update_one(

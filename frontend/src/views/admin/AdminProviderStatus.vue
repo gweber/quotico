@@ -1,10 +1,12 @@
 <script setup lang="ts">
 import { ref, onMounted } from "vue";
+import { useI18n } from "vue-i18n";
 import { useApi } from "@/composables/useApi";
 import { useToast } from "@/composables/useToast";
 
 const api = useApi();
 const toast = useToast();
+const { t } = useI18n();
 
 interface Provider {
   label: string;
@@ -17,15 +19,24 @@ interface Worker {
   id: string;
   label: string;
   provider: string | null;
-  triggerable: boolean;
   last_synced: string | null;
   last_metrics: Record<string, number> | null;
   next_run: string | null;
 }
 
+interface HeartbeatStatus {
+  enabled: boolean;
+  last_tick_at: string | null;
+  rounds_synced: number;
+  fixtures_synced: number;
+  matches_in_window: number;
+  tier_breakdown: Record<string, number>;
+}
+
 interface StatusResponse {
   providers: Record<string, Provider>;
   workers: Worker[];
+  heartbeat: HeartbeatStatus;
 }
 
 interface HeartbeatConfig {
@@ -36,7 +47,7 @@ interface HeartbeatConfig {
 const data = ref<StatusResponse | null>(null);
 const loading = ref(true);
 const error = ref(false);
-const syncing = ref<string | null>(null); // worker_id currently being triggered
+const oddsTicking = ref(false);
 
 // Heartbeat runtime config
 const heartbeatConfig = ref<HeartbeatConfig | null>(null);
@@ -80,20 +91,20 @@ async function fetchStatus() {
   }
 }
 
-async function triggerSync(workerId: string) {
-  syncing.value = workerId;
+async function runOddsTick() {
+  oddsTicking.value = true;
   try {
     const result = await api.post<{ message: string; duration_ms: number }>(
-      "/admin/trigger-sync",
-      { worker_id: workerId }
+      "/admin/heartbeat/odds/tick",
+      { reason: "manual_provider_overview" }
     );
     toast.success(`${result.message} (${(result.duration_ms / 1000).toFixed(1)}s)`);
     await fetchStatus();
   } catch (e: unknown) {
-    const msg = e instanceof Error ? e.message : "Sync fehlgeschlagen";
+    const msg = e instanceof Error ? e.message : t("admin.providerStatus.oddsTickFailed");
     toast.error(msg);
   } finally {
-    syncing.value = null;
+    oddsTicking.value = false;
   }
 }
 
@@ -146,13 +157,25 @@ onMounted(() => {
     <!-- Header -->
     <div class="flex items-center justify-between mb-6">
       <h1 class="text-xl font-bold text-text-primary">Provider & Worker Status</h1>
-      <button
-        class="px-3 py-1.5 text-sm rounded-lg border border-surface-3 text-text-secondary hover:bg-surface-2 transition-colors"
-        :disabled="loading"
-        @click="fetchStatus"
-      >
-        {{ loading ? "..." : "Refresh" }}
-      </button>
+      <div class="flex items-center gap-2">
+        <button
+          class="px-3 py-1.5 text-sm rounded-lg font-medium transition-colors"
+          :class="oddsTicking
+            ? 'bg-surface-3 text-text-muted cursor-wait'
+            : 'bg-primary/10 text-primary hover:bg-primary/20'"
+          :disabled="oddsTicking"
+          @click="runOddsTick"
+        >
+          {{ oddsTicking ? t("admin.providerStatus.runningOddsTick") : t("admin.providerStatus.runOddsTick") }}
+        </button>
+        <button
+          class="px-3 py-1.5 text-sm rounded-lg border border-surface-3 text-text-secondary hover:bg-surface-2 transition-colors"
+          :disabled="loading"
+          @click="fetchStatus"
+        >
+          {{ loading ? "..." : "Refresh" }}
+        </button>
+      </div>
     </div>
 
     <!-- Loading skeleton -->
@@ -196,6 +219,34 @@ onMounted(() => {
           <template v-else>
             <p class="text-sm text-text-secondary mt-1">Free API</p>
           </template>
+        </div>
+      </div>
+
+      <div class="bg-surface-1 rounded-card border border-surface-3/50 p-4 mb-6">
+        <div class="flex items-center justify-between gap-3">
+          <p class="text-sm font-semibold text-text-primary">{{ t("admin.providerStatus.lastOddsTick") }}</p>
+          <span class="text-[10px] px-1.5 py-0.5 rounded-full font-medium uppercase tracking-wide"
+            :class="data.heartbeat.enabled ? 'bg-emerald-500/20 text-emerald-400' : 'bg-amber-500/20 text-amber-400'">
+            {{ data.heartbeat.enabled ? t("admin.providerStatus.heartbeatEnabled") : t("admin.providerStatus.heartbeatDisabled") }}
+          </span>
+        </div>
+        <div class="grid grid-cols-2 md:grid-cols-4 gap-3 mt-3 text-xs text-text-secondary">
+          <div>
+            <p class="text-text-muted">{{ t("admin.providerStatus.lastRun") }}</p>
+            <p class="font-mono text-text-primary">{{ timeAgo(data.heartbeat.last_tick_at) }} ago</p>
+          </div>
+          <div>
+            <p class="text-text-muted">{{ t("admin.providerStatus.rounds") }}</p>
+            <p class="font-mono text-text-primary">{{ data.heartbeat.rounds_synced }}</p>
+          </div>
+          <div>
+            <p class="text-text-muted">{{ t("admin.providerStatus.fixtures") }}</p>
+            <p class="font-mono text-text-primary">{{ data.heartbeat.fixtures_synced }}</p>
+          </div>
+          <div>
+            <p class="text-text-muted">{{ t("admin.providerStatus.window") }}</p>
+            <p class="font-mono text-text-primary">{{ data.heartbeat.matches_in_window }}</p>
+          </div>
         </div>
       </div>
 
@@ -248,26 +299,7 @@ onMounted(() => {
                   </span>
                 </td>
                 <td class="px-4 py-2.5 text-right">
-                  <button
-                    v-if="w.triggerable"
-                    class="px-3 py-1 text-xs rounded-lg font-medium transition-colors"
-                    :class="syncing === w.id
-                      ? 'bg-surface-3 text-text-muted cursor-wait'
-                      : 'bg-primary/10 text-primary hover:bg-primary/20'"
-                    :disabled="syncing !== null"
-                    @click="triggerSync(w.id)"
-                  >
-                    <template v-if="syncing === w.id">
-                      <span class="inline-flex items-center gap-1.5">
-                        <svg class="animate-spin h-3 w-3" viewBox="0 0 24 24">
-                          <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4" fill="none" />
-                          <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
-                        </svg>
-                        Syncing...
-                      </span>
-                    </template>
-                    <template v-else>Sync</template>
-                  </button>
+                  <span class="text-text-muted">--</span>
                 </td>
               </tr>
             </tbody>

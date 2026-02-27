@@ -86,6 +86,7 @@ class Settings(BaseSettings):
     V3_QUERY_CACHE_TTL_SECONDS: int = 120
     V3_QUERY_MAX_IDS: int = 500
     MATCHDAY_V3_CACHE_TTL_SECONDS: int = 900
+    JUSTICE_CACHE_TTL_SECONDS: int = 3600
 
     # Metrics heartbeat (automated odds + xG sync)
     METRICS_HEARTBEAT_ENABLED: bool = False

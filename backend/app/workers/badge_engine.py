@@ -123,31 +123,33 @@ async def _check_user_badges(user_id: str, user: dict) -> int:
         await _award(user_id, "century_points", now)
         awarded += 1
 
-    # --- Matchday badges ---
+    # --- Matchday badges (from betting_slips with type=matchday_round) ---
     if "matchday_debut" not in existing_keys:
-        matchday_pred = await _db.db.matchday_predictions.find_one({
-            "user_id": user_id, "status": "resolved",
+        matchday_slip = await _db.db.betting_slips.find_one({
+            "user_id": user_id, "type": "matchday_round", "status": "resolved",
         })
-        if matchday_pred:
+        if matchday_slip:
             await _award(user_id, "matchday_debut", now)
             awarded += 1
 
     if "oracle" not in existing_keys:
-        exact_pred = await _db.db.matchday_predictions.find_one({
+        exact_slip = await _db.db.betting_slips.find_one({
             "user_id": user_id,
-            "predictions.points_earned": 3,
+            "type": "matchday_round",
+            "selections.points_earned": 3,
         })
-        if exact_pred:
+        if exact_slip:
             await _award(user_id, "oracle", now)
             awarded += 1
 
     if "perfect_matchday" not in existing_keys:
-        # Find a resolved prediction where ALL predictions scored 3
-        perfect = await _db.db.matchday_predictions.find_one({
+        # Find a resolved matchday slip where ALL selections scored 3
+        perfect = await _db.db.betting_slips.find_one({
             "user_id": user_id,
+            "type": "matchday_round",
             "status": "resolved",
-            "predictions": {"$not": {"$elemMatch": {"points_earned": {"$ne": 3}}}},
-            "predictions.0": {"$exists": True},  # At least 1 prediction
+            "selections": {"$not": {"$elemMatch": {"points_earned": {"$ne": 3}}}},
+            "selections.0": {"$exists": True},
         })
         if perfect:
             await _award(user_id, "perfect_matchday", now)

@@ -242,6 +242,15 @@ async def test_person_and_league_upserts_use_set_on_insert(monkeypatch):
 async def test_sync_leagues_uses_lazy_global_db_resolution(monkeypatch):
     fake_db = _FakeDB()
     fake_db.league_registry_v3 = _LeagueRegistryCollection()
+    fake_db.league_registry_v3.docs[301] = {
+        "_id": 301,
+        "sport_key": "soccer_germany_bundesliga",
+        "is_active": True,
+        "features": {"tipping": True, "match_load": True, "xg_sync": True, "odds_sync": True},
+        "ui_order": 1,
+        "available_seasons": [{"id": 25535, "name": "2024/2025"}],
+        "created_at": datetime(2026, 2, 26, 13, 0, tzinfo=timezone.utc),
+    }
     connector = connector_module.SportmonksConnector(database=None)
     fixed_now = datetime(2026, 2, 26, 14, 0, tzinfo=timezone.utc)
     monkeypatch.setattr(connector_module, "utcnow", lambda: fixed_now)
@@ -259,11 +268,34 @@ async def test_sync_leagues_uses_lazy_global_db_resolution(monkeypatch):
         ]
     )
 
-    assert result == {"inserted": 1, "updated": 0}
+    assert result == {"inserted": 0, "updated": 1, "rejected": 0}
     stored = fake_db.league_registry_v3.docs[301]
     assert stored["name"] == "Bundesliga"
-    assert stored["created_at"] == fixed_now
+    assert stored["created_at"] == datetime(2026, 2, 26, 13, 0, tzinfo=timezone.utc)
     assert stored["updated_at"] == fixed_now
+
+
+@pytest.mark.asyncio
+async def test_sync_leagues_rejects_non_provisioned_entries(monkeypatch):
+    fake_db = _FakeDB()
+    fake_db.league_registry_v3 = _LeagueRegistryCollection()
+    connector = connector_module.SportmonksConnector(database=None)
+    monkeypatch.setattr(connector_module._db, "db", fake_db, raising=False)
+
+    result = await connector.sync_leagues_to_registry(
+        [
+            {
+                "_id": 999,
+                "name": "Unknown League",
+                "country": "Nowhere",
+                "is_cup": False,
+                "available_seasons": [{"id": 1, "name": "2025"}],
+            }
+        ]
+    )
+
+    assert result == {"inserted": 0, "updated": 0, "rejected": 1}
+    assert 999 not in fake_db.league_registry_v3.docs
 
 
 @pytest.mark.asyncio

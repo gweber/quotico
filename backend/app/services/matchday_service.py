@@ -17,7 +17,6 @@ from typing import Optional
 
 from bson import ObjectId
 from fastapi import HTTPException, status
-from pymongo.errors import DuplicateKeyError
 
 import app.database as _db
 from app.config_matchday import MATCHDAY_V3_SPORTS
@@ -200,155 +199,42 @@ async def _resolve_v3_matchday_context(matchday_id: str) -> tuple[dict, dict[str
     return context, matches_by_id
 
 
-async def save_predictions(
-    user_id: str, matchday_id: str, predictions: list[dict],
-    auto_bet_strategy: str = "none",
-    squad_id: str | None = None,
-) -> dict:
-    """Save or update predictions for a matchday.
-
-    Only saves predictions for matches that aren't locked.
-    Merges with any existing locked predictions.
-    If squad_id is set, validates the squad has matchday mode for this sport.
-    """
-    matchday, matches_by_id = await _resolve_v3_matchday_context(matchday_id)
-
-    if matchday.get("all_resolved"):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="This matchday is already resolved.",
-        )
-
-    # Validate squad context if provided
-    lock_mins = LOCK_MINUTES  # Default; overridden by squad setting
-    if squad_id:
-        squad = await _db.db.squads.find_one({"_id": ObjectId(squad_id)})
-        if not squad:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Squad not found.",
-            )
-        if user_id not in squad.get("members", []):
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="You are not a member of this squad.",
-            )
-        from app.services.squad_league_service import require_active_league_config
-        require_active_league_config(squad, matchday["sport_key"], "classic")
-        if auto_bet_strategy != "none" and squad.get("auto_bet_blocked", False):
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Auto-bet is disabled in this squad.",
-            )
-        lock_mins = squad.get("lock_minutes", LOCK_MINUTES)
-
-    match_ids = matchday.get("match_ids", [])
-
-    # Get existing prediction doc (squad-scoped)
-    existing = await _db.db.matchday_predictions.find_one({
-        "user_id": user_id,
-        "matchday_id": matchday_id,
-        "squad_id": squad_id,
-    })
-
-    # Build map of existing locked predictions
-    existing_preds: dict[str, dict] = {}
-    if existing:
-        for p in existing.get("predictions", []):
-            existing_preds[p["match_id"]] = p
-
-    # Admin-unlocked matches bypass lock for this user
-    admin_unlocked = set(existing.get("admin_unlocked_matches", [])) if existing else set()
-
-    def _is_locked(match: dict, match_id: str) -> bool:
-        if match_id in admin_unlocked:
-            return False
-        return is_match_locked(match, lock_mins)
-
-    # Process new predictions
-    now = utcnow()
-    final_predictions: list[dict] = []
-
-    # Keep locked predictions unchanged
-    for match_id, pred in existing_preds.items():
-        match = matches_by_id.get(match_id)
-        if match and _is_locked(match, match_id):
-            final_predictions.append(pred)
-
-    # Add/update unlocked predictions from input
-    submitted_match_ids = set()
-    for pred_input in predictions:
-        match_id = pred_input["match_id"]
-        match = matches_by_id.get(match_id)
-        if not match:
-            continue
-
-        if _is_locked(match, match_id):
-            continue  # Silently skip locked matches
-
-        if match_id not in [str(mid) for mid in match_ids]:
-            continue  # Match not part of this matchday
-
-        submitted_match_ids.add(match_id)
-        final_predictions.append({
-            "match_id": match_id,
-            "home_score": pred_input["home_score"],
-            "away_score": pred_input["away_score"],
-            "is_auto": False,
-            "points_earned": None,
-        })
-
-    # Keep existing unlocked predictions that weren't re-submitted
-    for match_id, pred in existing_preds.items():
-        match = matches_by_id.get(match_id)
-        if match and not _is_locked(match, match_id) and match_id not in submitted_match_ids:
-            # User didn't re-submit this one, keep it
-            final_predictions.append(pred)
-
-    pred_status = "partial" if final_predictions else "open"
-
-    doc = {
-        "user_id": user_id,
-        "matchday_id": matchday_id,
-        "squad_id": squad_id,
-        "sport_key": matchday["sport_key"],
-        "season": matchday["season"],
-        "matchday_number": matchday["matchday_number"],
-        "auto_bet_strategy": auto_bet_strategy,
-        "predictions": final_predictions,
-        "total_points": None,
-        "status": pred_status,
-        "updated_at": now,
-    }
-
-    filter_key = {"user_id": user_id, "matchday_id": matchday_id, "squad_id": squad_id}
-    try:
-        await _db.db.matchday_predictions.update_one(
-            filter_key,
-            {"$set": doc, "$setOnInsert": {"created_at": now}},
-            upsert=True,
-        )
-    except DuplicateKeyError:
-        # Race condition — retry as update
-        await _db.db.matchday_predictions.update_one(
-            filter_key,
-            {"$set": doc},
-        )
-
-    logger.info(
-        "Saved %d predictions for user=%s matchday=%s (auto_bet=%s)",
-        len(final_predictions), user_id, matchday_id, auto_bet_strategy,
-    )
-
-    return doc
-
-
 async def get_user_predictions(
     user_id: str, matchday_id: str, squad_id: str | None = None,
 ) -> Optional[dict]:
-    """Get a user's predictions for a matchday (optionally squad-scoped)."""
-    return await _db.db.matchday_predictions.find_one({
+    """Get a user's predictions for a matchday from the betting_slips collection.
+
+    Returns a dict shaped like the old matchday_predictions doc for API compat:
+    {matchday_id, squad_id, auto_bet_strategy, predictions: [...], total_points, status, ...}
+    """
+    slip = await _db.db.betting_slips.find_one({
         "user_id": user_id,
         "matchday_id": matchday_id,
         "squad_id": squad_id,
+        "type": "matchday_round",
     })
+    if not slip:
+        return None
+
+    # Map selections to prediction-compatible format
+    predictions = []
+    for sel in slip.get("selections", []):
+        pick = sel.get("pick", {})
+        predictions.append({
+            "match_id": sel["match_id"],
+            "home_score": pick.get("home") if isinstance(pick, dict) else None,
+            "away_score": pick.get("away") if isinstance(pick, dict) else None,
+            "is_auto": sel.get("is_auto", False),
+            "is_admin_entry": sel.get("is_admin_entry", False),
+            "points_earned": sel.get("points_earned"),
+        })
+
+    return {
+        "matchday_id": matchday_id,
+        "squad_id": squad_id,
+        "auto_bet_strategy": slip.get("auto_bet_strategy", "none"),
+        "predictions": predictions,
+        "admin_unlocked_matches": slip.get("admin_unlocked_matches", []),
+        "total_points": slip.get("total_points"),
+        "status": slip.get("status", "draft"),
+    }

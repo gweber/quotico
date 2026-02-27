@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, watch, onMounted, computed } from "vue";
+import { ref, watch, onMounted, onBeforeUnmount, computed } from "vue";
 import { useI18n } from "vue-i18n";
 import { useRoute, useRouter } from "vue-router";
 import { useMatchdayStore } from "@/stores/matchday";
@@ -8,7 +8,6 @@ import { useSquadsStore, type Squad } from "@/stores/squads";
 import { useWalletStore } from "@/stores/wallet";
 import { useSurvivorStore } from "@/stores/survivor";
 import { useFantasyStore } from "@/stores/fantasy";
-import { useToast } from "@/composables/useToast";
 import { refreshQuoticoTips } from "@/composables/useQuoticoTip";
 import MatchdayMatchCard from "@/components/MatchdayMatchCard.vue";
 import SeasonTrack from "@/components/SeasonTrack.vue";
@@ -36,7 +35,6 @@ const squadsStore = useSquadsStore();
 const walletStore = useWalletStore();
 const survivorStore = useSurvivorStore();
 const fantasyStore = useFantasyStore();
-const toast = useToast();
 
 import { SPORT_LABELS } from "@/types/sports";
 import { GAME_MODE_I18N_KEYS } from "@/types/league";
@@ -87,9 +85,14 @@ const availableSports = computed(() => {
 // Determine which matchday is selected
 const selectedMatchdayId = ref<string | null>(null);
 
-const currentMatchdayLabel = computed(
-  () => matchday.currentMatchday?.label || t("matchday.title")
-);
+const currentMatchdayLabel = computed(() => {
+  const current = matchday.currentMatchday;
+  if (!current) return t("matchday.title");
+  if (typeof current.matchday_number === "number" && Number.isFinite(current.matchday_number)) {
+    return `${t("matchday.title")} ${current.matchday_number}`;
+  }
+  return current.label || t("matchday.title");
+});
 const legacyPredictionCount = computed(() => matchday.legacyPredictionMatches.length);
 
 const error = ref(false);
@@ -104,23 +107,10 @@ async function handleRefreshTips() {
   }
 }
 
-const hasUnsavedChanges = computed(() => {
+// Auto-save indicator: all tips synced to server
+const allTipsSaved = computed(() => {
   if (activeGameMode.value !== "classic") return false;
-  if (!matchday.predictions) return matchday.draftPredictions.size > 0;
-  const saved = new Map(
-    matchday.predictions.predictions.map((p) => [
-      p.match_id,
-      { home: p.home_score, away: p.away_score },
-    ])
-  );
-  for (const [matchId, draft] of matchday.draftPredictions) {
-    const s = saved.get(matchId);
-    if (!s || s.home !== draft.home || s.away !== draft.away) return true;
-  }
-  return (
-    matchday.draftAutoStrategy !==
-    (matchday.predictions.auto_bet_strategy || "none")
-  );
+  return matchday.allSaved && matchday.betCount > 0;
 });
 
 // Whether parlay is available (tippspiel + bankroll)
@@ -168,7 +158,12 @@ async function selectMatchday(id: string) {
     await matchday.fetchMatchdayDetail(id, selectedSquad.value?.id);
 
     if (auth.isLoggedIn) {
-      await matchday.fetchPredictions(id);
+      // Use server-side draft for classic mode, legacy fetch for others
+      if (activeGameMode.value === "classic") {
+        await matchday.ensureDraft(id, selectedSquad.value?.id);
+      } else {
+        await matchday.fetchPredictions(id);
+      }
       await loadGameModeData(id);
     }
     const md = matchday.currentMatchday;
@@ -240,7 +235,11 @@ async function selectSquad(squad: Squad | null) {
 
   if (squad && selectedMatchdayId.value && auth.isLoggedIn) {
     // Re-fetch predictions for new squad context
-    await matchday.fetchPredictions(selectedMatchdayId.value);
+    if (activeGameMode.value === "classic") {
+      await matchday.ensureDraft(selectedMatchdayId.value, squad?.id);
+    } else {
+      await matchday.fetchPredictions(selectedMatchdayId.value);
+    }
 
     // Check disclaimer for wallet-based modes
     const mode = activeGameMode.value;
@@ -255,15 +254,11 @@ async function selectSquad(squad: Squad | null) {
   }
 }
 
-async function handleSave() {
-  if (!selectedMatchdayId.value) return;
-  const ok = await matchday.savePredictions(selectedMatchdayId.value);
-  if (ok) {
-    toast.success(t("matchday.tipsSaved"));
-  } else {
-    toast.error(t("matchday.saveError"));
-  }
+// beforeunload handler: flush pending auto-save debounce timers
+function _onBeforeUnload() {
+  matchday.flushPending();
 }
+
 
 function onDisclaimerAccepted() {
   showDisclaimer.value = false;
@@ -287,7 +282,15 @@ async function reload() {
   }
 }
 
-onMounted(() => reload());
+onMounted(() => {
+  window.addEventListener("beforeunload", _onBeforeUnload);
+  reload();
+});
+
+onBeforeUnmount(() => {
+  window.removeEventListener("beforeunload", _onBeforeUnload);
+  matchday.flushPending();
+});
 
 // React to sport changes
 watch(selectedSport, (sport) => {
@@ -500,27 +503,16 @@ watch(selectedSport, (sport) => {
               {{ t('matchday.totalPoints', { points: matchday.predictions.total_points }) }}
             </span>
             <span v-else />
-            <button
-              :disabled="matchday.saving || matchday.editableMatches.length === 0"
-              class="px-6 py-2.5 rounded-lg text-sm font-semibold transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-              :class="
-                hasUnsavedChanges
-                  ? 'bg-primary text-surface-0 hover:bg-primary-hover'
-                  : 'bg-surface-2 text-text-secondary'
-              "
-              @click="handleSave"
+            <!-- Auto-save summary (replaces save button) -->
+            <span
+              v-if="allTipsSaved"
+              class="text-xs text-emerald-500 flex items-center gap-1.5"
             >
-              <template v-if="matchday.saving">
-                <span class="inline-flex items-center gap-2">
-                  <svg class="animate-spin h-4 w-4" viewBox="0 0 24 24">
-                    <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4" fill="none" />
-                    <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
-                  </svg>
-                  {{ $t('matchday.saving') }}
-                </span>
-              </template>
-              <template v-else>{{ $t('matchday.saveTips') }}</template>
-            </button>
+              <svg class="w-3.5 h-3.5" fill="none" viewBox="0 0 16 16" stroke="currentColor" stroke-width="2.5">
+                <path stroke-linecap="round" stroke-linejoin="round" d="M3 8.5l3.5 3.5L13 4" />
+              </svg>
+              {{ $t('matchday.allTipsSaved') }}
+            </span>
           </div>
         </template>
       </template>

@@ -29,7 +29,6 @@ from app.models.matchday import (
     MatchdayDetailMatch,
     MatchdayResponse,
     PredictionResponse,
-    SavePredictionsRequest,
     MatchdayPredictionResponse,
 )
 from app.services.auth_service import get_current_user
@@ -42,7 +41,6 @@ from app.utils import as_utc
 from app.services.matchday_service import (
     LOCK_MINUTES,
     get_user_predictions,
-    save_predictions,
 )
 
 logger = logging.getLogger("quotico.matchday")
@@ -248,13 +246,26 @@ async def _get_v3_matchday_detail(matchday_id: str, lock_mins: int) -> dict | No
                 "away_team_id": a_id,
             }
 
+    display_number = int(round_id)
+    display_label = f"Matchday {display_number}"
+    season_matchdays = await _list_v3_matchdays_for_sport(sport_key=sport_key, season=int(season_id))
+    for item in season_matchdays:
+        parsed_item = _parse_v3_matchday_id(item.id)
+        if parsed_item is None:
+            continue
+        _, item_season_id, item_round_id = parsed_item
+        if int(item_season_id) == int(season_id) and int(item_round_id) == int(round_id):
+            display_number = int(item.matchday_number)
+            display_label = str(item.label or f"Matchday {display_number}")
+            break
+
     return {
         "matchday": MatchdayResponse(
             id=matchday_id,
             sport_key=sport_key,
             season=int(season_id),
-            matchday_number=int(round_id),
-            label=f"Round {int(round_id)}",
+            matchday_number=int(display_number),
+            label=display_label,
             match_count=len(match_responses),
             first_kickoff=first_kickoff,
             last_kickoff=last_kickoff,
@@ -360,40 +371,6 @@ async def get_predictions(
     )
 
 
-@router.post("/matchdays/{matchday_id}/predictions")
-async def save_matchday_predictions(
-    matchday_id: str,
-    body: SavePredictionsRequest,
-    user=Depends(get_current_user),
-):
-    """Save or update predictions for a matchday."""
-    if _parse_v3_matchday_id(matchday_id) is None:
-        raise HTTPException(status_code=400, detail="Invalid matchday_id format.")
-    user_id = str(user["_id"])
-
-    predictions = [
-        {
-            "match_id": p.match_id,
-            "home_score": p.home_score,
-            "away_score": p.away_score,
-        }
-        for p in body.predictions
-    ]
-
-    result = await save_predictions(
-        user_id=user_id,
-        matchday_id=matchday_id,
-        predictions=predictions,
-        auto_bet_strategy=body.auto_bet_strategy.value,
-        squad_id=body.squad_id,
-    )
-
-    return {
-        "saved": len(result.get("predictions", [])),
-        "auto_bet_strategy": result.get("auto_bet_strategy"),
-    }
-
-
 @router.get("/matchdays/{matchday_id}/leaderboard")
 async def get_matchday_leaderboard(
     matchday_id: str,
@@ -404,8 +381,12 @@ async def get_matchday_leaderboard(
     if parsed is None:
         raise HTTPException(status_code=400, detail="Invalid matchday_id format.")
 
-    # Build match filter
-    match_filter: dict = {"matchday_id": matchday_id, "status": "resolved"}
+    # Build match filter on betting_slips (type=matchday_round)
+    match_filter: dict = {
+        "matchday_id": matchday_id,
+        "type": "matchday_round",
+        "status": "resolved",
+    }
     if squad_id:
         match_filter["squad_id"] = squad_id
         # Also restrict to squad members
@@ -413,7 +394,7 @@ async def get_matchday_leaderboard(
         if squad:
             match_filter["user_id"] = {"$in": squad.get("members", [])}
 
-    # Aggregate predictions for this matchday
+    # Aggregate betting slips for this matchday
     pipeline = [
         {"$match": match_filter},
         {"$sort": {"total_points": -1}},
@@ -432,14 +413,14 @@ async def get_matchday_leaderboard(
         {"$unwind": {"path": "$user_info", "preserveNullAndEmptyArrays": True}},
     ]
 
-    entries = await _db.db.matchday_predictions.aggregate(pipeline).to_list(length=100)
+    entries = await _db.db.betting_slips.aggregate(pipeline).to_list(length=100)
 
     leaderboard = []
     for i, entry in enumerate(entries):
-        preds = entry.get("predictions", [])
-        exact = sum(1 for p in preds if p.get("points_earned") == 3)
-        diff = sum(1 for p in preds if p.get("points_earned") == 2)
-        tendency = sum(1 for p in preds if p.get("points_earned") == 1)
+        selections = entry.get("selections", [])
+        exact = sum(1 for s in selections if s.get("points_earned") == 3)
+        diff = sum(1 for s in selections if s.get("points_earned") == 2)
+        tendency = sum(1 for s in selections if s.get("points_earned") == 1)
 
         leaderboard.append({
             "rank": i + 1,

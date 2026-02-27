@@ -151,49 +151,51 @@ async def get_active_navigation() -> list[dict]:
     if _nav_cache_data is not None and _nav_cache_expires_at is not None and now < _nav_cache_expires_at:
         return _nav_cache_data
 
-    docs = await _db.db.leagues.find(
-        {"is_active": True},
+    docs = await _db.db.league_registry_v3.find(
+        {"is_active": True, "features.tipping": True},
         {
             "_id": 1,
             "sport_key": 1,
-            "display_name": 1,
             "name": 1,
             "country": 1,
             "country_code": 1,
             "ui_order": 1,
         },
-    ).sort([("ui_order", 1), ("display_name", 1), ("name", 1)]).to_list(length=500)
+    ).sort([("ui_order", 1), ("name", 1)]).to_list(length=500)
 
     items = [
         {
             "id": str(doc["_id"]),
-            "sport_key": str(doc.get("sport_key") or ""),
-            "name": str(doc.get("display_name") or doc.get("name") or doc.get("sport_key") or ""),
+            "sport_key": str(doc["sport_key"]),
+            "name": str(doc["name"]),
             "country": doc.get("country"),
             "country_code": doc.get("country_code"),
             "ui_order": int(doc.get("ui_order", 999)),
         }
         for doc in docs
+        if isinstance(doc.get("sport_key"), str)
+        and str(doc.get("sport_key")).strip()
+        and isinstance(doc.get("name"), str)
+        and str(doc.get("name")).strip()
     ]
     _nav_cache_data = items
     _nav_cache_expires_at = now + _NAV_CACHE_TTL
     return items
 
 
-async def update_league_order(ordered_ids: list[ObjectId]) -> dict[str, int]:
+async def update_league_order(ordered_ids: list[int]) -> dict[str, int]:
     """Persist league UI ordering and invalidate navigation cache."""
     now = utcnow()
     updated = 0
-    for index, oid in enumerate(ordered_ids):
-        result = await _db.db.leagues.update_one(
-            {"_id": oid},
+    for index, league_id in enumerate(ordered_ids):
+        result = await _db.db.league_registry_v3.update_one(
+            {"_id": int(league_id)},
             {"$set": {"ui_order": index, "updated_at": now}},
         )
         if result.matched_count:
             updated += 1
 
     await invalidate_navigation_cache()
-    await LeagueRegistry.get().initialize()
     return {"updated": updated, "total": len(ordered_ids)}
 
 

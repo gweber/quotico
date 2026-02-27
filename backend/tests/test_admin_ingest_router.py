@@ -78,7 +78,11 @@ class _Collection:
         return None
 
     async def update_one(self, query, update, upsert=False):
-        doc = await self.find_one(query)
+        doc = None
+        for row in self.docs:
+            if self._matches(row, query):
+                doc = row
+                break
         if doc is None and upsert:
             doc = {"_id": query.get("_id")}
             self.docs.append(doc)
@@ -114,9 +118,14 @@ async def test_discovery_uses_cache_when_not_stale(monkeypatch):
         leagues=[
             {
                 "_id": 8,
+                "sport_key": "soccer_germany_bundesliga",
                 "name": "Bundesliga",
                 "country": "Germany",
                 "is_cup": False,
+                "is_active": True,
+                "needs_review": False,
+                "ui_order": 1,
+                "features": {"tipping": True, "match_load": True, "xg_sync": True, "odds_sync": True},
                 "available_seasons": [{"id": 1, "name": "2024/2025"}],
                 "last_synced_at": now,
             }
@@ -131,6 +140,49 @@ async def test_discovery_uses_cache_when_not_stale(monkeypatch):
     result = await ingest_router.discover_leagues(force=False, admin={"_id": ObjectId()})
     assert result["source"] == "cache"
     assert len(result["items"]) == 1
+    assert result["items"][0]["is_active"] is True
+    assert result["items"][0]["features"]["tipping"] is True
+
+
+@pytest.mark.asyncio
+async def test_patch_discovery_league_updates_runtime_flags(monkeypatch):
+    now = utcnow()
+    fake_db = _FakeDB(
+        leagues=[
+            {
+                "_id": 8,
+                "sport_key": "soccer_germany_bundesliga",
+                "name": "Bundesliga",
+                "country": "Germany",
+                "is_cup": False,
+                "is_active": False,
+                "needs_review": False,
+                "ui_order": 10,
+                "features": {"tipping": False, "match_load": True, "xg_sync": False, "odds_sync": False},
+                "available_seasons": [{"id": 1, "name": "2024/2025"}],
+                "last_synced_at": now,
+            }
+        ]
+    )
+    monkeypatch.setattr(ingest_router._db, "db", fake_db, raising=False)
+    invalidated = {"hit": False}
+
+    async def _invalidate():
+        invalidated["hit"] = True
+
+    monkeypatch.setattr(ingest_router, "invalidate_navigation_cache", _invalidate)
+    body = ingest_router.IngestLeaguePatchBody(
+        is_active=True,
+        features=ingest_router.IngestLeagueFeaturesPatchBody(tipping=True),
+    )
+    result = await ingest_router.patch_discovery_league(
+        league_id=8,
+        body=body,
+        admin={"_id": ObjectId()},
+    )
+    assert result["item"]["is_active"] is True
+    assert result["item"]["features"]["tipping"] is True
+    assert invalidated["hit"] is True
 
 
 @pytest.mark.asyncio

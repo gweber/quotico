@@ -180,50 +180,6 @@ async def _ensure_indexes() -> None:
     await db.matchdays.create_index([("sport_key", 1), ("first_kickoff", 1)])
     await db.matchdays.create_index("updated_at")
 
-    # ---- Matchday Predictions (squad-scoped) ----
-    # v3.1 hard-cut: matchday_id is stored as stable string (v3:sport:season:round).
-    # Rebuild unique index deterministically to avoid stale legacy index definitions.
-    duplicate_probe = await db.matchday_predictions.aggregate(
-        [
-            {
-                "$group": {
-                    "_id": {
-                        "user_id": "$user_id",
-                        "matchday_id": "$matchday_id",
-                        "squad_id": "$squad_id",
-                    },
-                    "n": {"$sum": 1},
-                }
-            },
-            {"$match": {"n": {"$gt": 1}}},
-            {"$limit": 1},
-        ]
-    ).to_list(length=1)
-    if duplicate_probe:
-        logger.warning(
-            "matchday_predictions has duplicate tuples for (user_id, matchday_id, squad_id); "
-            "unique index rebuild skipped until data is cleaned."
-        )
-    else:
-        try:
-            await db.matchday_predictions.drop_index("matchday_predictions_user_matchday_squad_unique")
-        except Exception:
-            pass
-        try:
-            await db.matchday_predictions.drop_index("user_id_1_matchday_id_1_squad_id_1")
-        except Exception:
-            pass
-        await db.matchday_predictions.create_index(
-            [("user_id", 1), ("matchday_id", 1), ("squad_id", 1)],
-            unique=True,
-            name="matchday_predictions_user_matchday_squad_unique",
-        )
-    await db.matchday_predictions.create_index([("matchday_id", 1), ("status", 1)])
-    await db.matchday_predictions.create_index([("status", 1), ("updated_at", 1)])
-    await db.matchday_predictions.create_index(
-        [("squad_id", 1), ("matchday_id", 1), ("status", 1)]
-    )
-
     # ---- Matchday Leaderboard (materialized, squad-scoped) ----
 
     await db.matchday_leaderboard.create_index(

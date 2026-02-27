@@ -171,15 +171,19 @@ function handleSelect(prediction: string) {
 }
 
 // --- Date formatting ---
-const formattedDate = computed(() =>
-  new Date(props.match.match_date).toLocaleDateString(localeTag.value, {
+const formattedDate = computed(() => {
+  const d = new Date(props.match.match_date);
+  if (d.getUTCHours() === 0 && d.getUTCMinutes() === 0) {
+    return d.toLocaleDateString(localeTag.value, { weekday: "short", day: "numeric", month: "short" }) + ` · ${t("match.timeTbd")}`;
+  }
+  return d.toLocaleDateString(localeTag.value, {
     weekday: "short",
     day: "numeric",
     month: "short",
     hour: "2-digit",
     minute: "2-digit",
-  })
-);
+  });
+});
 const leagueLabel = computed(() => sportLabel(props.match.sport_key));
 const leagueFlag = computed(() => sportFlag(props.match.sport_key));
 

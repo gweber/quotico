@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import traceback
 from collections import defaultdict
 from datetime import timedelta
@@ -79,6 +80,26 @@ class SportmonksConnector:
             return int(value)
         except (TypeError, ValueError):
             return default
+
+    @staticmethod
+    def _to_slug(value: Any) -> str:
+        raw = str(value or "").strip().lower()
+        slug = re.sub(r"[^a-z0-9]+", "_", raw).strip("_")
+        return slug
+
+    def _extract_sport_key(self, row: dict[str, Any]) -> str | None:
+        sport = (row or {}).get("sport")
+        sport_name = self._first_non_empty((sport or {}).get("name"))
+        country_name = self._first_non_empty(((row or {}).get("country") or {}).get("name"))
+        league_name = self._first_non_empty((row or {}).get("name"))
+        if not sport_name or not country_name or not league_name:
+            return None
+        sport_slug = self._to_slug(sport_name)
+        country_slug = self._to_slug(country_name)
+        league_slug = self._to_slug(league_name)
+        if not sport_slug or not country_slug or not league_slug:
+            return None
+        return f"{sport_slug}_{country_slug}_{league_slug}"
 
     def _recompute_manual_check_fields(self, reasons: list[str] | None) -> dict[str, Any]:
         """Normalize reasons and derive manual_check_required from critical reasons."""
@@ -224,6 +245,7 @@ class SportmonksConnector:
             items.append(
                 {
                     "_id": league_id,
+                    "sport_key": self._extract_sport_key(row) or "",
                     "name": self._norm_name((row or {}).get("name")),
                     "country": self._norm_name(country_node.get("name")),
                     "is_cup": bool((row or {}).get("is_cup", False)),
@@ -250,17 +272,43 @@ class SportmonksConnector:
         now = utcnow()
         updated = 0
         inserted = 0
+        rejected = 0
         for item in items:
             lid = self._to_int(item.get("_id"))
             if lid is None:
+                rejected += 1
                 continue
-            existing = await self.db.league_registry_v3.find_one({"_id": lid}, {"available_seasons": 1})
+            existing = await self.db.league_registry_v3.find_one(
+                {"_id": lid},
+                {"available_seasons": 1, "sport_key": 1, "is_active": 1, "features": 1, "ui_order": 1},
+            )
+            if not isinstance(existing, dict):
+                logger.warning("Discovery league rejected: missing runtime fields for _id=%s (not pre-provisioned).", lid)
+                rejected += 1
+                continue
+            if not isinstance(existing.get("sport_key"), str) or not str(existing.get("sport_key")).strip():
+                logger.warning("Discovery league rejected: missing sport_key for _id=%s.", lid)
+                rejected += 1
+                continue
+            # Auto-provision missing runtime fields with safe defaults
+            if not isinstance(existing.get("features"), dict):
+                logger.info("Discovery: auto-provisioning default features for _id=%s.", lid)
+                existing["features"] = {"tipping": False, "match_load": False, "xg_sync": False, "odds_sync": False}
+            if not isinstance(existing.get("is_active"), bool):
+                logger.info("Discovery: auto-provisioning is_active=false for _id=%s.", lid)
+                existing["is_active"] = False
+            if not isinstance(existing.get("ui_order"), int):
+                logger.info("Discovery: auto-provisioning ui_order=999 for _id=%s.", lid)
+                existing["ui_order"] = 999
             merged_seasons = self._merge_seasons(existing, item.get("available_seasons") or [])
-            payload = {
+            payload: dict[str, Any] = {
                 "name": self._norm_name(item.get("name")),
                 "country": self._norm_name(item.get("country")),
                 "is_cup": bool(item.get("is_cup", False)),
                 "available_seasons": merged_seasons,
+                "features": existing["features"],
+                "is_active": existing["is_active"],
+                "ui_order": existing["ui_order"],
                 "last_synced_at": now,
                 "updated_at": now,
             }
@@ -268,15 +316,14 @@ class SportmonksConnector:
                 {"_id": lid},
                 {
                     "$set": payload,
-                    "$setOnInsert": {"created_at": now},
                 },
-                upsert=True,
+                upsert=False,
             )
             if result.upserted_id is not None:
                 inserted += 1
             else:
                 updated += 1
-        return {"inserted": inserted, "updated": updated}
+        return {"inserted": inserted, "updated": updated, "rejected": rejected}
 
     def _merge_seasons(self, existing: dict[str, Any] | None, incoming: list[dict[str, Any]]) -> list[dict[str, Any]]:
         existing_rows = ((existing or {}).get("available_seasons") or []) if isinstance(existing, dict) else []
@@ -545,16 +592,9 @@ class SportmonksConnector:
                     },
                 )
 
-        xg_result: dict[str, int] = {}
-        try:
-            xg_result = await self.sync_season_xg(int(season_id), job_id=job_id)
-        except Exception as exc:
-            await self._append_job_error(
-                job_id=job_id,
-                round_id=None,
-                message=f"xG sync failed (odds were synced successfully): {exc}",
-                trace=self._safe_trace(),
-            )
+        # xG sync skipped — the background xG crawler (two-pointer walker)
+        # continuously fills xg_raw and resolves to matches_v3.
+        xg_result: dict[str, int] = {"skipped": True}
         total_fixtures = len(seen_fixture_ids) if seen_fixture_ids else len(docs)
         saved_calls_estimate = max(0, int(total_fixtures) - (int(bulk_round_calls) + int(repair_calls)))
         savings_ratio = round((saved_calls_estimate / int(total_fixtures)), 4) if int(total_fixtures) > 0 else 0.0

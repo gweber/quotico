@@ -218,8 +218,6 @@ async def _rewrite_match_references(
     rewrite_stats = {
         "betting_slips_selections": 0,
         "betting_slips_admin_unlocked": 0,
-        "matchday_predictions_predictions": 0,
-        "matchday_predictions_admin_unlocked": 0,
         "matchdays_match_ids": 0,
         "parlays_legs": 0,
         "bankroll_bets": 0,
@@ -267,45 +265,6 @@ async def _rewrite_match_references(
             session=session,
         )
         rewrite_stats["betting_slips_admin_unlocked"] += slips_unlock.modified_count
-
-        md_preds = await _db.db.matchday_predictions.update_many(
-            {"predictions.match_id": loser_id},
-            {"$set": {"predictions.$[pred].match_id": keeper_id, "updated_at": now}},
-            array_filters=[{"pred.match_id": loser_id}],
-            session=session,
-        )
-        rewrite_stats["matchday_predictions_predictions"] += md_preds.modified_count
-
-        md_unlock = await _db.db.matchday_predictions.update_many(
-            {"admin_unlocked_matches": loser_id},
-            [
-                {
-                    "$set": {
-                        "admin_unlocked_matches": {
-                            "$setUnion": [
-                                {
-                                    "$map": {
-                                        "input": {"$ifNull": ["$admin_unlocked_matches", []]},
-                                        "as": "mid",
-                                        "in": {
-                                            "$cond": [
-                                                {"$in": [{"$toString": "$$mid"}, [loser_id, keeper_id]]},
-                                                keeper_id,
-                                                "$$mid",
-                                            ]
-                                        },
-                                    }
-                                },
-                                [],
-                            ]
-                        },
-                        "updated_at": now,
-                    }
-                }
-            ],
-            session=session,
-        )
-        rewrite_stats["matchday_predictions_admin_unlocked"] += md_unlock.modified_count
 
         md_rows = await _db.db.matchdays.update_many(
             {"match_ids": loser_id},

@@ -1,12 +1,14 @@
 <script setup lang="ts">
 import { computed, ref, watch } from "vue";
 import type { Matchday } from "@/stores/matchday";
+import { useI18n } from "vue-i18n";
 
 const props = defineProps<{
   matchdays: Matchday[];
   currentId: string | null;
   totalMatchdays: number;
 }>();
+const { t } = useI18n();
 
 const emit = defineEmits<{
   select: [id: string];
@@ -255,6 +257,10 @@ function seasonMarkerColor(slot: {
   }
   return "bg-primary/60";
 }
+
+function matchdayLabel(md: Matchday): string {
+  return `${t("matchday.title")} ${md.matchday_number}`;
+}
 </script>
 
 <template>
@@ -302,7 +308,7 @@ function seasonMarkerColor(slot: {
             class="bg-surface-2 border border-surface-3 rounded-lg px-3 py-2 text-xs whitespace-nowrap shadow-lg"
           >
             <div class="font-semibold text-text-primary">
-              {{ tooltipSlot.md!.label }}
+              {{ matchdayLabel(tooltipSlot.md!) }}
             </div>
             <div v-if="tooltipDateRange" class="text-text-secondary mt-0.5">
               {{ tooltipDateRange }}
@@ -333,8 +339,8 @@ function seasonMarkerColor(slot: {
         :disabled="!slot.md"
         :aria-label="
           slot.md
-            ? `${slot.md.label}${slot.md.all_resolved ? ', abgeschlossen' : slot.md.status === 'in_progress' ? ', läuft' : ', geplant'}`
-            : `Spieltag ${slot.number}`
+            ? `${matchdayLabel(slot.md)}${slot.md.all_resolved ? ', abgeschlossen' : slot.md.status === 'in_progress' ? ', läuft' : ', geplant'}`
+            : `${t('matchday.title')} ${slot.number}`
         "
         :aria-current="slot.md?.id === currentId ? 'true' : undefined"
         @click="!isDragging && !justDragged && slot.md && emit('select', slot.md.id)"

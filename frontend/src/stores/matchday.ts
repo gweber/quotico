@@ -70,6 +70,27 @@ export interface MoneylineBet {
   status: string; // "pending", "won", "lost", "void"
 }
 
+/** Per-match save state for the auto-save indicator */
+export type SaveState = "idle" | "syncing" | "saved" | "error";
+
+/** Betslip response from the server */
+interface SlipResponse {
+  id: string;
+  selections: Array<{
+    match_id: string;
+    market: string;
+    pick: { home: number; away: number } | string;
+    points_earned: number | null;
+    is_auto: boolean;
+    is_admin_entry?: boolean;
+    status: string;
+  }>;
+  auto_bet_strategy?: string;
+  total_points?: number | null;
+  admin_unlocked_matches?: string[];
+  status: string;
+}
+
 export const useMatchdayStore = defineStore("matchday", () => {
   const api = useApi();
 
@@ -81,9 +102,13 @@ export const useMatchdayStore = defineStore("matchday", () => {
   const predictions = ref<MatchdayPrediction | null>(null);
   const legacyPredictionMatches = ref<string[]>([]);
 
-  // Draft state (local edits before saving)
+  // Draft slip state (server-side draft)
+  const slipId = ref<string | null>(null);
   const draftPredictions = ref<Map<string, { home: number; away: number }>>(new Map());
   const draftAutoStrategy = ref<string>("none");
+
+  // Per-match save state for indicator (idle/syncing/saved/error)
+  const saveStates = ref<Map<string, SaveState>>(new Map());
 
   // Moneyline bets state (keyed by match_id)
   const moneylineBets = ref<Map<string, MoneylineBet>>(new Map());
@@ -92,6 +117,11 @@ export const useMatchdayStore = defineStore("matchday", () => {
   const saving = ref(false);
   const activeSport = ref<string>("soccer_germany_bundesliga");
   const activeSquadId = ref<string | null>(null);
+
+  // --- Per-match debounce timers ---
+  const _debounceTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  const _pendingPatches = new Map<string, { home: number; away: number }>();
+  const DEBOUNCE_MS = 300;
 
   // --- In-memory caches (not reactive — internal bookkeeping only) ---
   interface CachedDetail {
@@ -117,6 +147,33 @@ export const useMatchdayStore = defineStore("matchday", () => {
   );
 
   const betCount = computed(() => draftPredictions.value.size);
+
+  /** Whether all draft predictions are synced to server (no pending debounced saves) */
+  const allSaved = computed(() =>
+    _pendingPatches.size === 0 &&
+    Array.from(saveStates.value.values()).every((s) => s === "idle" || s === "saved")
+  );
+
+  function getSaveState(matchId: string): SaveState {
+    return saveStates.value.get(matchId) ?? "idle";
+  }
+
+  function _setSaveState(matchId: string, state: SaveState) {
+    const newMap = new Map(saveStates.value);
+    newMap.set(matchId, state);
+    saveStates.value = newMap;
+
+    // Auto-clear "saved" state after 1.5s
+    if (state === "saved") {
+      setTimeout(() => {
+        if (saveStates.value.get(matchId) === "saved") {
+          const m = new Map(saveStates.value);
+          m.set(matchId, "idle");
+          saveStates.value = m;
+        }
+      }, 1500);
+    }
+  }
 
   // Actions
   async function fetchSports() {
@@ -205,6 +262,7 @@ export const useMatchdayStore = defineStore("matchday", () => {
       predictions.value = null;
       draftPredictions.value = new Map();
       legacyPredictionMatches.value = [];
+      slipId.value = null;
     }
     const cached = detailCache.get(matchdayId);
 
@@ -232,6 +290,221 @@ export const useMatchdayStore = defineStore("matchday", () => {
     applyDetail(cached);
     return true;
   }
+
+  // ---------- Server-side draft lifecycle ----------
+
+  /**
+   * Ensure a server-side draft slip exists for this matchday.
+   * Creates one via POST /api/betting-slips/draft if none exists.
+   * Populates slipId + draftPredictions from server state.
+   */
+  async function ensureDraft(matchdayId: string, squadId?: string | null) {
+    try {
+      const slip = await api.post<SlipResponse>("/betting-slips/draft", {
+        type: "matchday_round",
+        matchday_id: matchdayId,
+        squad_id: squadId || null,
+        sport_key: activeSport.value,
+      });
+      slipId.value = slip.id;
+
+      // Populate draft predictions from server state
+      draftPredictions.value = new Map();
+      legacyPredictionMatches.value = [];
+      const activeMatchIds = new Set(matches.value.map((m) => String(m.id)));
+
+      for (const sel of slip.selections) {
+        const pick = sel.pick as { home: number; away: number };
+        if (!pick || pick.home == null || pick.away == null) continue;
+        if (!activeMatchIds.has(String(sel.match_id))) {
+          legacyPredictionMatches.value.push(String(sel.match_id));
+          continue;
+        }
+        draftPredictions.value.set(sel.match_id, {
+          home: pick.home,
+          away: pick.away,
+        });
+      }
+      draftAutoStrategy.value = slip.auto_bet_strategy || "none";
+
+      // Also set predictions for display compatibility (points, total_points, etc.)
+      predictions.value = {
+        matchday_id: matchdayId,
+        squad_id: squadId || null,
+        auto_bet_strategy: slip.auto_bet_strategy || "none",
+        predictions: slip.selections
+          .filter((s) => s.market === "exact_score" && typeof s.pick === "object")
+          .map((s) => {
+            const p = s.pick as { home: number; away: number };
+            return {
+              match_id: s.match_id,
+              home_score: p.home,
+              away_score: p.away,
+              is_auto: s.is_auto,
+              is_admin_entry: s.is_admin_entry ?? false,
+              points_earned: s.points_earned,
+            };
+          }),
+        admin_unlocked_matches: slip.admin_unlocked_matches || [],
+        total_points: slip.total_points ?? null,
+        status: slip.status,
+      };
+    } catch {
+      slipId.value = null;
+    }
+  }
+
+  /**
+   * Update a single leg on the server-side draft.
+   * Per-match debounce: only fires when both home AND away are filled.
+   * 300ms timer per match_id — resets on each call.
+   */
+  function updateLeg(matchId: string, home: number | null, away: number | null) {
+    // Update local draft immediately for responsive UI
+    if (home != null && away != null) {
+      const newMap = new Map(draftPredictions.value);
+      newMap.set(matchId, { home, away });
+      draftPredictions.value = newMap;
+    }
+
+    // Only fire PATCH when both scores are filled
+    if (home == null || away == null) return;
+    if (!slipId.value) return;
+
+    // Store pending patch
+    _pendingPatches.set(matchId, { home, away });
+
+    // Clear existing timer for this match
+    const existing = _debounceTimers.get(matchId);
+    if (existing) clearTimeout(existing);
+
+    // Set new debounce timer
+    _debounceTimers.set(
+      matchId,
+      setTimeout(() => {
+        _debounceTimers.delete(matchId);
+        void _firePatch(matchId);
+      }, DEBOUNCE_MS)
+    );
+  }
+
+  /** Fire a PATCH for a single match to the server. */
+  async function _firePatch(matchId: string) {
+    const patch = _pendingPatches.get(matchId);
+    if (!patch || !slipId.value) return;
+    _pendingPatches.delete(matchId);
+
+    _setSaveState(matchId, "syncing");
+
+    // Determine action: add if not in selections, update if already there
+    const existingPred = predictions.value?.predictions.find(
+      (p) => p.match_id === matchId
+    );
+    const action = existingPred ? "update" : "add";
+
+    try {
+      await api.patch(`/betting-slips/${slipId.value}/selections`, {
+        action,
+        match_id: matchId,
+        market: "exact_score",
+        pick: { home: patch.home, away: patch.away },
+      });
+
+      // Update predictions state to reflect the save
+      if (predictions.value) {
+        const idx = predictions.value.predictions.findIndex(
+          (p) => p.match_id === matchId
+        );
+        const pred: Prediction = {
+          match_id: matchId,
+          home_score: patch.home,
+          away_score: patch.away,
+          is_auto: false,
+          is_admin_entry: false,
+          points_earned: null,
+        };
+        if (idx >= 0) {
+          predictions.value.predictions[idx] = pred;
+        } else {
+          predictions.value.predictions.push(pred);
+        }
+      }
+
+      _setSaveState(matchId, "saved");
+    } catch {
+      _setSaveState(matchId, "error");
+    }
+  }
+
+  /** Remove a leg from the server-side draft. */
+  async function removeLeg(matchId: string) {
+    // Cancel any pending debounce
+    const timer = _debounceTimers.get(matchId);
+    if (timer) {
+      clearTimeout(timer);
+      _debounceTimers.delete(matchId);
+    }
+    _pendingPatches.delete(matchId);
+
+    // Remove from local state
+    const newMap = new Map(draftPredictions.value);
+    newMap.delete(matchId);
+    draftPredictions.value = newMap;
+
+    if (!slipId.value) return;
+
+    _setSaveState(matchId, "syncing");
+    try {
+      await api.patch(`/betting-slips/${slipId.value}/selections`, {
+        action: "remove",
+        match_id: matchId,
+        market: "exact_score",
+      });
+
+      if (predictions.value) {
+        predictions.value.predictions = predictions.value.predictions.filter(
+          (p) => p.match_id !== matchId
+        );
+      }
+
+      _setSaveState(matchId, "idle");
+    } catch {
+      _setSaveState(matchId, "error");
+    }
+  }
+
+  /**
+   * Flush all pending debounced saves immediately.
+   * Called on beforeunload to prevent data loss.
+   */
+  function flushPending() {
+    for (const [matchId, timer] of _debounceTimers) {
+      clearTimeout(timer);
+      _debounceTimers.delete(matchId);
+      // Fire synchronously via sendBeacon if available
+      const patch = _pendingPatches.get(matchId);
+      if (patch && slipId.value) {
+        _pendingPatches.delete(matchId);
+        const body = JSON.stringify({
+          action: predictions.value?.predictions.find((p) => p.match_id === matchId)
+            ? "update"
+            : "add",
+          match_id: matchId,
+          market: "exact_score",
+          pick: { home: patch.home, away: patch.away },
+        });
+        // Use sendBeacon for reliable delivery on page unload
+        if (navigator.sendBeacon) {
+          navigator.sendBeacon(
+            `/api/betting-slips/${slipId.value}/selections`,
+            new Blob([body], { type: "application/json" })
+          );
+        }
+      }
+    }
+  }
+
+  // ---------- Legacy fetchPredictions (now reads from draft) ----------
 
   async function fetchPredictions(matchdayId: string) {
     try {
@@ -267,42 +540,17 @@ export const useMatchdayStore = defineStore("matchday", () => {
   }
 
   function setDraftPrediction(matchId: string, home: number, away: number) {
-    const newMap = new Map(draftPredictions.value);
-    newMap.set(matchId, { home, away });
-    draftPredictions.value = newMap;
+    updateLeg(matchId, home, away);
   }
 
   function removeDraftPrediction(matchId: string) {
-    const newMap = new Map(draftPredictions.value);
-    newMap.delete(matchId);
-    draftPredictions.value = newMap;
+    removeLeg(matchId);
   }
 
-  async function savePredictions(matchdayId: string): Promise<boolean> {
-    saving.value = true;
-    try {
-      const preds = Array.from(draftPredictions.value.entries()).map(
-        ([matchId, scores]) => ({
-          match_id: matchId,
-          home_score: scores.home,
-          away_score: scores.away,
-        })
-      );
-
-      await api.post(`/matchday/matchdays/${matchdayId}/predictions`, {
-        predictions: preds,
-        auto_bet_strategy: draftAutoStrategy.value,
-        squad_id: activeSquadId.value,
-      });
-
-      // Refresh predictions from server
-      await fetchPredictions(matchdayId);
-      return true;
-    } catch {
-      return false;
-    } finally {
-      saving.value = false;
-    }
+  async function savePredictions(_matchdayId: string): Promise<boolean> {
+    // No-op in new auto-save flow — predictions are saved per-leg via PATCH
+    // This remains for backward compatibility but the save button is removed
+    return true;
   }
 
   async function fetchMoneylineBets(matchIds: string[]) {
@@ -384,6 +632,8 @@ export const useMatchdayStore = defineStore("matchday", () => {
     predictions.value = null;
     draftPredictions.value = new Map();
     moneylineBets.value = new Map();
+    slipId.value = null;
+    saveStates.value = new Map();
   }
 
   function invalidateCache(matchdayId?: string) {
@@ -401,6 +651,8 @@ export const useMatchdayStore = defineStore("matchday", () => {
     predictions.value = null;
     draftPredictions.value = new Map();
     moneylineBets.value = new Map();
+    slipId.value = null;
+    saveStates.value = new Map();
   }
 
   return {
@@ -419,11 +671,18 @@ export const useMatchdayStore = defineStore("matchday", () => {
     editableMatches,
     lockedMatches,
     betCount,
+    allSaved,
+    saveStates,
+    getSaveState,
     fetchSports,
     fetchMatchdays,
     fetchMatchdayDetail,
     previewCached,
     fetchPredictions,
+    ensureDraft,
+    updateLeg,
+    removeLeg,
+    flushPending,
     setDraftPrediction,
     removeDraftPrediction,
     savePredictions,

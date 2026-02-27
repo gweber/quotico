@@ -26,6 +26,9 @@ const matchday = useMatchdayStore();
 const draft = computed(() => matchday.draftPredictions.get(props.match.id));
 const isEditable = computed(() => !props.match.is_locked);
 
+// Per-field save indicator
+const saveState = computed(() => matchday.getSaveState(props.match.id));
+
 const pointsEarned = computed(() => {
   if (!matchday.predictions) return null;
   const pred = matchday.predictions.predictions.find(
@@ -91,6 +94,14 @@ onMounted(() => {
 
 const kickoffLabel = computed(() => {
   const d = new Date(props.match.match_date);
+  if (d.getUTCHours() === 0 && d.getUTCMinutes() === 0) {
+    const datePart = d.toLocaleString(localeTag.value, {
+      weekday: "short",
+      day: "2-digit",
+      month: "2-digit",
+    });
+    return `${datePart} · ${t("match.timeTbd")}`;
+  }
   return d.toLocaleString(localeTag.value, {
     weekday: "short",
     day: "2-digit",
@@ -114,22 +125,30 @@ const countdown = computed(() => {
   return `${mins}m`;
 });
 
+// Track local input values separately so we can detect when both are filled
+let localHome: number | null = draft.value?.home ?? null;
+let localAway: number | null = draft.value?.away ?? null;
+
 function updateHome(e: Event) {
-  const val = parseInt((e.target as HTMLInputElement).value) || 0;
-  matchday.setDraftPrediction(
-    props.match.id,
-    Math.max(0, Math.min(99, val)),
-    draft.value?.away ?? 0
-  );
+  const raw = (e.target as HTMLInputElement).value;
+  if (raw === "") {
+    localHome = null;
+  } else {
+    localHome = Math.max(0, Math.min(99, parseInt(raw) || 0));
+  }
+  // Only trigger auto-save when both scores are filled
+  matchday.updateLeg(props.match.id, localHome, localAway);
 }
 
 function updateAway(e: Event) {
-  const val = parseInt((e.target as HTMLInputElement).value) || 0;
-  matchday.setDraftPrediction(
-    props.match.id,
-    draft.value?.home ?? 0,
-    Math.max(0, Math.min(99, val))
-  );
+  const raw = (e.target as HTMLInputElement).value;
+  if (raw === "") {
+    localAway = null;
+  } else {
+    localAway = Math.max(0, Math.min(99, parseInt(raw) || 0));
+  }
+  // Only trigger auto-save when both scores are filled
+  matchday.updateLeg(props.match.id, localHome, localAway);
 }
 </script>
 
@@ -138,28 +157,53 @@ function updateAway(e: Event) {
     class="bg-surface-1 rounded-card p-4 border border-surface-3/50 transition-colors"
     :class="{ 'opacity-60': match.is_locked && !pointsEarned }"
   >
-    <!-- Top row: kickoff + countdown/points -->
+    <!-- Top row: kickoff + countdown/points + save indicator -->
     <div class="flex items-center justify-between mb-3">
       <span class="text-xs text-text-muted">{{ kickoffLabel }}</span>
-      <span
-        v-if="pointsEarned !== null"
-        class="text-xs font-bold px-2 py-0.5 rounded-full"
-        :class="pointsColor"
-      >
-        {{ pointsEarned }}P
-      </span>
-      <span
-        v-else-if="countdown"
-        class="text-xs text-warning font-medium"
-      >
-        {{ countdown }}
-      </span>
-      <span
-        v-else-if="match.is_locked"
-        class="text-xs text-text-muted"
-      >
-        {{ t('match.locked') }}
-      </span>
+      <div class="flex items-center gap-2">
+        <!-- Per-field save indicator -->
+        <span
+          v-if="saveState === 'syncing'"
+          class="w-3.5 h-3.5 text-text-muted animate-spin"
+        >
+          <svg viewBox="0 0 16 16" fill="none" class="w-full h-full">
+            <circle cx="8" cy="8" r="6" stroke="currentColor" stroke-width="2" opacity="0.25" />
+            <path d="M14 8a6 6 0 00-6-6" stroke="currentColor" stroke-width="2" stroke-linecap="round" />
+          </svg>
+        </span>
+        <span
+          v-else-if="saveState === 'saved'"
+          class="text-emerald-500 transition-opacity"
+        >
+          <svg class="w-3.5 h-3.5" fill="none" viewBox="0 0 16 16" stroke="currentColor" stroke-width="2.5">
+            <path stroke-linecap="round" stroke-linejoin="round" d="M3 8.5l3.5 3.5L13 4" />
+          </svg>
+        </span>
+        <span
+          v-else-if="saveState === 'error'"
+          class="text-red-500 text-[10px] font-medium"
+        >!</span>
+
+        <span
+          v-if="pointsEarned !== null"
+          class="text-xs font-bold px-2 py-0.5 rounded-full"
+          :class="pointsColor"
+        >
+          {{ pointsEarned }}P
+        </span>
+        <span
+          v-else-if="countdown"
+          class="text-xs text-warning font-medium"
+        >
+          {{ countdown }}
+        </span>
+        <span
+          v-else-if="match.is_locked"
+          class="text-xs text-text-muted"
+        >
+          {{ t('match.locked') }}
+        </span>
+      </div>
     </div>
 
     <!-- Teams + Score/Inputs -->

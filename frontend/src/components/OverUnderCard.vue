@@ -30,6 +30,9 @@ const existingBet = computed(() =>
 
 const kickoffLabel = computed(() => {
   const d = new Date(props.match.match_date);
+  if (d.getUTCHours() === 0 && d.getUTCMinutes() === 0) {
+    return d.toLocaleString("de-DE", { weekday: "short", day: "2-digit", month: "2-digit" }) + " · Uhrzeit offen";
+  }
   return d.toLocaleString("de-DE", {
     weekday: "short",
     day: "2-digit",

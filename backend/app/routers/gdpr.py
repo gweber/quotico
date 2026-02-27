@@ -177,22 +177,6 @@ async def export_data(request: Request, user=Depends(get_current_user), db=Depen
         for t in wallet_txns
     ]
 
-    # Matchday predictions
-    matchday_preds = await db.matchday_predictions.find(
-        {"user_id": user_id}
-    ).to_list(length=10000)
-    matchday_export = [
-        {
-            "match_id": s["match_id"],
-            "home_score": s.get("home_score"),
-            "away_score": s.get("away_score"),
-            "points_earned": s.get("points_earned"),
-            "status": s.get("status"),
-            "created_at": ensure_utc(s["created_at"]).isoformat(),
-        }
-        for s in matchday_preds
-    ]
-
     # Device fingerprints (hash-only, no raw data)
     fingerprints = await db.device_fingerprints.find(
         {"user_id": user_id}
@@ -218,7 +202,6 @@ async def export_data(request: Request, user=Depends(get_current_user), db=Depen
         "battle_participations": battles_export,
         "wallets": wallets_export,
         "wallet_transactions": wallet_txns_export,
-        "matchday_predictions": matchday_export,
         "device_fingerprints": fingerprints_export,
     }
 
@@ -311,7 +294,6 @@ async def delete_account(
     anon_user_id = f"anon-{anon_hash}"
     game_collections = [
         "betting_slips", "wallets", "wallet_transactions",
-        "matchday_predictions",
     ]
     for coll_name in game_collections:
         coll = db[coll_name]

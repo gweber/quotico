@@ -16,11 +16,8 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-from collections import defaultdict
 from datetime import timedelta
 from typing import Any
-
-import numpy as np
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
@@ -39,6 +36,7 @@ from app.models.v3_query_models import (
     V3ListMeta,
 )
 from app.services.auth_service import get_current_user
+from app.services.justice_service import JusticeService
 from app.utils import ensure_utc, utcnow
 
 logger = logging.getLogger("quotico.v3_query")
@@ -47,6 +45,7 @@ router = APIRouter(prefix="/api/v3", tags=["v3"])
 
 _QUERY_CACHE: dict[str, tuple[Any, Any]] = {}
 _ANALYSIS_CACHE: dict[str, tuple[Any, Any]] = {}
+_JUSTICE_SERVICE = JusticeService()
 
 
 def _compute_justice(doc: dict) -> dict | None:
@@ -408,189 +407,13 @@ async def analysis_leagues() -> dict[str, Any]:
     return result
 
 
-def _poisson_xp(
-    xg_home: float,
-    xg_away: float,
-    match_id: int,
-    n_sims: int = 10_000,
-) -> tuple[float, float]:
-    """Poisson Monte Carlo: return (xP_home, xP_away) as fractional expected points."""
-    rng = np.random.default_rng(seed=match_id)
-    home_goals = rng.poisson(lam=max(xg_home, 0.01), size=n_sims)
-    away_goals = rng.poisson(lam=max(xg_away, 0.01), size=n_sims)
-    home_wins = int(np.sum(home_goals > away_goals))
-    away_wins = int(np.sum(away_goals > home_goals))
-    draws = n_sims - home_wins - away_wins
-    xp_home = (3 * home_wins + draws) / n_sims
-    xp_away = (3 * away_wins + draws) / n_sims
-    return round(xp_home, 3), round(xp_away, 3)
-
-
 @router.get("/analysis/unjust-table/{league_id}")
 async def analysis_unjust_table(
     league_id: int,
     season_id: int | None = Query(default=None),
 ) -> dict[str, Any]:
-    """Compute the Unjust League Table for a given league/season using Poisson MC."""
-
-    # Resolve season_id if not provided
-    if season_id is None:
-        reg = await _db.db.league_registry_v3.find_one({"_id": int(league_id)}, {"available_seasons": 1})
-        if not reg or not reg.get("available_seasons"):
-            raise HTTPException(status_code=404, detail="League not found in registry.")
-        seasons = reg["available_seasons"]
-        current = max(seasons, key=lambda s: s.get("id") or 0)
-        season_id = current.get("id")
-        if not isinstance(season_id, int):
-            raise HTTPException(status_code=404, detail="No valid season found.")
-
-    cache_key = f"unjust:{league_id}:{season_id}"
-    cached = _analysis_cache_get(cache_key)
-    if cached is not None:
-        return cached
-
-    # Fetch all qualifying matches
-    rows = await _db.db.matches_v3.find(
-        {
-            "league_id": int(league_id),
-            "season_id": int(season_id),
-            "status": "FINISHED",
-            "has_advanced_stats": True,
-        },
-        {
-            "_id": 1,
-            "start_at": 1,
-            "teams": 1,
-        },
-    ).sort("start_at", 1).to_list(length=5000)
-
-    if not rows:
-        raise HTTPException(status_code=404, detail="No matches with xG data found for this league/season.")
-
-    # Aggregate per team
-    team_data: dict[int, dict[str, Any]] = defaultdict(lambda: {
-        "name": "",
-        "xp_values": [],
-        "real_pts_values": [],
-        "xg_for": [],
-        "xg_against": [],
-        "goals_for": [],
-        "goals_against": [],
-    })
-
-    for doc in rows:
-        match_id = doc.get("_id", 0)
-        teams = doc.get("teams") or {}
-        home = teams.get("home") or {}
-        away = teams.get("away") or {}
-
-        xg_h = home.get("xg")
-        xg_a = away.get("xg")
-        score_h = home.get("score")
-        score_a = away.get("score")
-        h_id = home.get("sm_id")
-        a_id = away.get("sm_id")
-
-        if not all(isinstance(v, (int, float)) for v in [xg_h, xg_a]) or h_id is None or a_id is None:
-            continue
-        if not all(isinstance(v, int) for v in [score_h, score_a]):
-            continue
-
-        # Poisson xP
-        xp_h, xp_a = _poisson_xp(float(xg_h), float(xg_a), int(match_id))
-
-        # Real points
-        if score_h > score_a:
-            rp_h, rp_a = 3, 0
-        elif score_a > score_h:
-            rp_h, rp_a = 0, 3
-        else:
-            rp_h, rp_a = 1, 1
-
-        # Home team
-        td_h = team_data[int(h_id)]
-        td_h["name"] = home.get("name") or td_h["name"]
-        td_h["short_code"] = home.get("short_code") or td_h.get("short_code")
-        td_h["image_path"] = home.get("image_path") or td_h.get("image_path")
-        td_h["xp_values"].append(xp_h)
-        td_h["real_pts_values"].append(rp_h)
-        td_h["xg_for"].append(float(xg_h))
-        td_h["xg_against"].append(float(xg_a))
-        td_h["goals_for"].append(int(score_h))
-        td_h["goals_against"].append(int(score_a))
-
-        # Away team
-        td_a = team_data[int(a_id)]
-        td_a["name"] = away.get("name") or td_a["name"]
-        td_a["short_code"] = away.get("short_code") or td_a.get("short_code")
-        td_a["image_path"] = away.get("image_path") or td_a.get("image_path")
-        td_a["xp_values"].append(xp_a)
-        td_a["real_pts_values"].append(rp_a)
-        td_a["xg_for"].append(float(xg_a))
-        td_a["xg_against"].append(float(xg_h))
-        td_a["goals_for"].append(int(score_a))
-        td_a["goals_against"].append(int(score_h))
-
-    # Build table
-    table: list[dict[str, Any]] = []
-    for sm_id, td in team_data.items():
-        if not td["name"]:
-            continue
-        played = len(td["xp_values"])
-        if played == 0:
-            continue
-        real_pts = sum(td["real_pts_values"])
-        expected_pts = round(sum(td["xp_values"]), 1)
-        diff = round(expected_pts - real_pts, 1)
-
-        # 95% confidence interval
-        xp_arr = np.array(td["xp_values"])
-        std_total = float(np.std(xp_arr)) * (played ** 0.5)
-        ci_low = round(expected_pts - 1.96 * std_total, 1)
-        ci_high = round(expected_pts + 1.96 * std_total, 1)
-
-        # Goal difference justice
-        xg_diff = round(sum(td["xg_for"]) - sum(td["xg_against"]), 1)
-        real_gd = sum(td["goals_for"]) - sum(td["goals_against"])
-        gd_justice = round(xg_diff - real_gd, 1)
-
-        # Last 5 xP (most recent first — values are in chronological order)
-        last_5_xp = list(reversed(td["xp_values"][-5:]))
-
-        table.append({
-            "team_sm_id": sm_id,
-            "team_name": td["name"],
-            "team_short_code": td.get("short_code"),
-            "team_image_path": td.get("image_path"),
-            "played": played,
-            "real_pts": real_pts,
-            "expected_pts": expected_pts,
-            "diff": diff,
-            "luck_range": [ci_low, ci_high],
-            "avg_xg_for": round(sum(td["xg_for"]) / played, 2),
-            "avg_xg_against": round(sum(td["xg_against"]) / played, 2),
-            "xg_diff": xg_diff,
-            "real_gd": real_gd,
-            "gd_justice": gd_justice,
-            "last_5_xp": last_5_xp,
-        })
-
-    # Sort by diff descending (most "robbed" first), assign rank
-    table.sort(key=lambda r: r["diff"], reverse=True)
-    for i, row in enumerate(table):
-        row["rank"] = i + 1
-
-    # Resolve league name
-    reg = await _db.db.league_registry_v3.find_one({"_id": int(league_id)}, {"name": 1})
-    league_name = (reg or {}).get("name", "")
-
-    result: dict[str, Any] = {
-        "league_id": int(league_id),
-        "league_name": league_name,
-        "season_id": int(season_id),
-        "match_count": len(rows),
-        "table": table,
-    }
-    _analysis_cache_set(cache_key, result)
-    return result
-
+    """Compute unjust table for a league/season using the justice service."""
+    try:
+        return await _JUSTICE_SERVICE.get_unjust_table(league_id=int(league_id), season_id=season_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc

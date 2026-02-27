@@ -28,6 +28,7 @@ from pymongo.errors import DuplicateKeyError
 import app.database as _db
 from app.config import settings
 from app.services.auth_service import get_admin_user
+from app.services.league_service import invalidate_navigation_cache
 from app.services.sportmonks_connector import sportmonks_connector
 from app.utils import ensure_utc, utcnow
 
@@ -94,15 +95,42 @@ class ManualCheckAutoHealResponse(BaseModel):
     healed_odds: int
 
 
+class IngestLeagueFeaturesPatchBody(BaseModel):
+    tipping: bool | None = None
+    match_load: bool | None = None
+    xg_sync: bool | None = None
+    odds_sync: bool | None = None
+
+
+class IngestLeaguePatchBody(BaseModel):
+    is_active: bool | None = None
+    ui_order: int | None = None
+    name: str | None = None
+    features: IngestLeagueFeaturesPatchBody | None = None
+
+
 def _serialize_discovery_items(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     for row in rows:
+        features_raw = row.get("features")
+        if not isinstance(features_raw, dict):
+            features_raw = {}
         out.append(
             {
                 "league_id": int(row.get("_id")),
+                "sport_key": str(row.get("sport_key") or ""),
                 "name": str(row.get("name") or ""),
                 "country": str(row.get("country") or ""),
                 "is_cup": bool(row.get("is_cup", False)),
+                "is_active": bool(row.get("is_active", False)),
+                "needs_review": bool(row.get("needs_review", False)),
+                "ui_order": int(row.get("ui_order", 999)),
+                "features": {
+                    "tipping": bool(features_raw.get("tipping", False)),
+                    "match_load": bool(features_raw.get("match_load", False)),
+                    "xg_sync": bool(features_raw.get("xg_sync", False)),
+                    "odds_sync": bool(features_raw.get("odds_sync", False)),
+                },
                 "available_seasons": row.get("available_seasons") or [],
                 "last_synced_at": (
                     ensure_utc(row.get("last_synced_at")).isoformat()
@@ -318,6 +346,61 @@ async def discover_leagues(
         "rate_limit_remaining": remaining,
         "items": _serialize_discovery_items(refreshed),
     }
+
+
+@router.patch("/leagues/{league_id}")
+async def patch_discovery_league(
+    league_id: int,
+    body: IngestLeaguePatchBody,
+    admin=Depends(get_admin_user),
+):
+    _ = admin
+    if (
+        body.is_active is None
+        and body.ui_order is None
+        and body.name is None
+        and body.features is None
+    ):
+        raise HTTPException(status_code=400, detail="Nothing to update.")
+
+    doc = await _db.db.league_registry_v3.find_one({"_id": int(league_id)})
+    if not isinstance(doc, dict):
+        raise HTTPException(status_code=404, detail="League not found.")
+
+    updates: dict[str, Any] = {"updated_at": utcnow()}
+    if body.is_active is not None:
+        updates["is_active"] = bool(body.is_active)
+    if body.ui_order is not None:
+        updates["ui_order"] = int(body.ui_order)
+    if body.name is not None:
+        cleaned_name = str(body.name).strip()
+        if not cleaned_name:
+            raise HTTPException(status_code=400, detail="name must not be empty.")
+        updates["name"] = cleaned_name
+    if body.features is not None:
+        existing_features = doc.get("features") if isinstance(doc.get("features"), dict) else {}
+        next_features = {
+            "tipping": bool(existing_features.get("tipping")),
+            "match_load": bool(existing_features.get("match_load")),
+            "xg_sync": bool(existing_features.get("xg_sync")),
+            "odds_sync": bool(existing_features.get("odds_sync")),
+        }
+        if body.features.tipping is not None:
+            next_features["tipping"] = bool(body.features.tipping)
+        if body.features.match_load is not None:
+            next_features["match_load"] = bool(body.features.match_load)
+        if body.features.xg_sync is not None:
+            next_features["xg_sync"] = bool(body.features.xg_sync)
+        if body.features.odds_sync is not None:
+            next_features["odds_sync"] = bool(body.features.odds_sync)
+        updates["features"] = next_features
+
+    await _db.db.league_registry_v3.update_one({"_id": int(league_id)}, {"$set": updates})
+    await invalidate_navigation_cache()
+    updated = await _db.db.league_registry_v3.find_one({"_id": int(league_id)})
+    if not isinstance(updated, dict):
+        raise HTTPException(status_code=500, detail="League update failed.")
+    return {"item": _serialize_discovery_items([updated])[0]}
 
 
 async def _run_sportmonks_ingest_job(job_id: ObjectId, season_id: int) -> None:

@@ -571,7 +571,7 @@ COOKIE_SECURE=false
 **The Issue:** All 13 scheduled workers run on a 30-minute interval and start simultaneously:
 
 ```python
-scheduler.add_job(poll_odds, "interval", minutes=30, id="odds_poller")
+scheduler.add_job(metrics_heartbeat._odds_scheduler_loop, "interval", minutes=10, id="heartbeat_odds_sync")
 scheduler.add_job(resolve_matches, "interval", minutes=30, id="match_resolver")
 scheduler.add_job(materialize_leaderboard, "interval", minutes=30, id="leaderboard")
 # ... 10 more jobs, all minutes=30
@@ -582,7 +582,7 @@ At each 30-minute mark, all workers fire simultaneously, causing a spike in Mong
 **Remediation:** Stagger jobs:
 
 ```python
-scheduler.add_job(poll_odds, "interval", minutes=30, id="odds_poller")
+scheduler.add_job(metrics_heartbeat._odds_scheduler_loop, "interval", minutes=10, id="heartbeat_odds_sync")
 scheduler.add_job(resolve_matches, "interval", minutes=30, id="match_resolver", next_run_time=now + timedelta(seconds=30))
 scheduler.add_job(materialize_leaderboard, "interval", minutes=30, id="leaderboard", next_run_time=now + timedelta(seconds=60))
 # etc.
@@ -661,7 +661,7 @@ Internet
 [MongoDB] localhost:27017 (authenticated, TTL indexes on tokens)
 
 Background Workers (APScheduler, 13 jobs @ 30min):
-    odds_poller, match_resolver, leaderboard, badge_engine,
+    heartbeat_odds_sync, match_resolver, leaderboard, badge_engine,
     matchday_sync, spieltag_resolver, spieltag_leaderboard,
     bankroll_resolver, survivor_resolver, over_under_resolver,
     fantasy_resolver, parlay_resolver, wallet_maintenance (6h)
@@ -677,7 +677,7 @@ Background Workers (APScheduler, 13 jobs @ 30min):
 `services/`: auth_service, encryption, alias_service, audit_service, bankroll_service, battle_service, fantasy_service, fingerprint_service, match_service, over_under_service, parlay_service, spieltag_service, squad_service, survivor_service, tip_service, wallet_service
 `models/`: user, match, tip, squad, battle, badge, wallet, matchday, survivor, game_mode
 `middleware/`: logging
-`workers/`: _state, odds_poller, match_resolver, leaderboard, badge_engine, matchday_sync, spieltag_resolver, spieltag_leaderboard, bankroll_resolver, survivor_resolver, over_under_resolver, fantasy_resolver, parlay_resolver, wallet_maintenance
+`workers/`: _state, match_resolver, leaderboard, badge_engine, matchday_sync, spieltag_resolver, spieltag_leaderboard, bankroll_resolver, survivor_resolver, over_under_resolver, fantasy_resolver, parlay_resolver, wallet_maintenance
 `providers/`: http_client, odds_api, football_data, openligadb, espn
 
 **Frontend (32 files):**

@@ -10,6 +10,7 @@ import { computed, onMounted, onUnmounted, reactive, ref } from "vue";
 import { useI18n } from "vue-i18n";
 import { HttpError, useApi } from "@/composables/useApi";
 import { useToast } from "@/composables/useToast";
+import { useLeagueStore } from "@/stores/leagues";
 
 interface SeasonOption {
   id: number;
@@ -18,9 +19,19 @@ interface SeasonOption {
 
 interface DiscoveryLeague {
   league_id: number;
+  sport_key: string;
   name: string;
   country: string;
   is_cup: boolean;
+  is_active: boolean;
+  needs_review: boolean;
+  ui_order: number;
+  features: {
+    tipping: boolean;
+    match_load: boolean;
+    xg_sync: boolean;
+    odds_sync: boolean;
+  };
   available_seasons: SeasonOption[];
   last_synced_at: string | null;
 }
@@ -108,6 +119,7 @@ interface OpsSnapshot {
 const api = useApi();
 const toast = useToast();
 const { t } = useI18n();
+const leagueStore = useLeagueStore();
 
 const loading = ref(false);
 const refreshing = ref(false);
@@ -123,6 +135,7 @@ const metricsHealthBySeason = reactive<Record<number, MetricsHealth | null>>({})
 const drawerOpenBySeason = reactive<Record<number, boolean>>({});
 const startBusyBySeason = reactive<Record<number, boolean>>({});
 const metricsBusyBySeason = reactive<Record<number, boolean>>({});
+const leaguePatchBusyById = reactive<Record<number, boolean>>({});
 const pollTimer = ref<number | null>(null);
 const opsSnapshot = ref<OpsSnapshot | null>(null);
 
@@ -371,6 +384,36 @@ async function refreshOpenSeasonHealth(): Promise<void> {
   await Promise.all(Array.from(seasons).map((sid) => refreshSeasonHealth(sid)));
 }
 
+async function patchLeagueFlags(
+  league: DiscoveryLeague,
+  payload: Record<string, unknown>,
+): Promise<void> {
+  leaguePatchBusyById[league.league_id] = true;
+  try {
+    const result = await api.patch<{ item: DiscoveryLeague }>(`/admin/ingest/leagues/${league.league_id}`, payload);
+    const updated = result.item;
+    Object.assign(league, updated);
+    toast.success(t("admin.ingest.leagueUpdated"));
+    leagueStore.fetchNavigation(true);
+  } catch (error) {
+    toast.error(error instanceof Error ? error.message : t("common.genericError"));
+  } finally {
+    leaguePatchBusyById[league.league_id] = false;
+  }
+}
+
+function navStatusLabel(league: DiscoveryLeague): string {
+  if (league.is_active && league.features.tipping) return t("admin.ingest.statusLiveNav");
+  if (league.is_active && league.features.match_load) return t("admin.ingest.statusDataOnly");
+  return t("admin.ingest.statusHidden");
+}
+
+function navStatusClass(league: DiscoveryLeague): string {
+  if (league.is_active && league.features.tipping) return "bg-primary/15 text-primary";
+  if (league.is_active && league.features.match_load) return "bg-sky-100 text-sky-800";
+  return "bg-surface-2 text-text-muted";
+}
+
 function toggleDrawer(seasonId: number): void {
   drawerOpenBySeason[seasonId] = !drawerOpenBySeason[seasonId];
   if (drawerOpenBySeason[seasonId]) {
@@ -441,7 +484,7 @@ onUnmounted(() => {
         <div class="flex items-start justify-between">
           <div>
             <h2 class="text-base font-semibold text-text-primary">{{ league.name }}</h2>
-            <p class="text-xs text-text-muted">{{ league.country || "—" }}</p>
+            <p class="text-xs text-text-muted">{{ league.country || "—" }} · {{ league.sport_key || "—" }}</p>
           </div>
           <button
             type="button"
@@ -450,6 +493,94 @@ onUnmounted(() => {
           >
             {{ t("admin.ingest.health") }}
           </button>
+        </div>
+
+        <div class="rounded-md border border-surface-3/60 bg-surface-2/50 p-2 space-y-2">
+          <div class="flex items-center justify-between gap-2">
+            <div class="flex items-center gap-2">
+              <span class="inline-flex rounded-full px-2 py-1 text-[11px] font-medium" :class="navStatusClass(league)">
+                {{ navStatusLabel(league) }}
+              </span>
+              <span class="text-[11px] text-text-muted">
+                {{ league.last_synced_at ? new Date(league.last_synced_at).toLocaleDateString("de-DE", { day: "2-digit", month: "2-digit", year: "2-digit", hour: "2-digit", minute: "2-digit" }) : t("admin.ingest.neverSynced") }}
+              </span>
+            </div>
+            <span v-if="league.needs_review" class="text-[11px] text-warning">{{ t("admin.ingest.needsReview") }}</span>
+          </div>
+          <div class="space-y-2 text-xs">
+            <!-- Active -->
+            <div class="flex items-center justify-between">
+              <div class="flex items-center gap-1.5">
+                <span class="text-text-secondary">{{ t("admin.ingest.toggleActive") }}</span>
+                <span class="group relative">
+                  <svg class="w-3.5 h-3.5 text-text-muted cursor-help" fill="none" viewBox="0 0 20 20" stroke="currentColor" stroke-width="1.5">
+                    <circle cx="10" cy="10" r="8" /><path d="M8 7.5a2.5 2.5 0 0 1 4 2c0 1.5-2 2-2 2" stroke-linecap="round" /><circle cx="10" cy="14" r=".5" fill="currentColor" stroke="none" />
+                  </svg>
+                  <span class="pointer-events-none absolute bottom-full left-1/2 -translate-x-1/2 mb-1.5 w-48 rounded bg-surface-3 px-2 py-1 text-[11px] text-text-secondary opacity-0 group-hover:opacity-100 transition-opacity shadow-md z-10">
+                    {{ t("admin.ingest.toggleActiveDesc") }}
+                  </span>
+                </span>
+              </div>
+              <button
+                type="button" role="switch" :aria-checked="league.is_active"
+                :disabled="Boolean(leaguePatchBusyById[league.league_id])"
+                class="relative inline-flex h-5 w-9 shrink-0 rounded-full transition-colors duration-200 focus:outline-none disabled:opacity-50"
+                :class="league.is_active ? 'bg-primary' : 'bg-surface-3'"
+                @click="patchLeagueFlags(league, { is_active: !league.is_active })"
+              >
+                <span class="pointer-events-none inline-block h-4 w-4 rounded-full bg-white shadow transform transition-transform duration-200 mt-0.5" :class="league.is_active ? 'translate-x-[18px]' : 'translate-x-0.5'" />
+              </button>
+            </div>
+            <!-- Tipping + Match Load: disabled when league inactive -->
+            <div :class="{ 'opacity-40 pointer-events-none': !league.is_active }" class="space-y-2">
+              <!-- Tipping -->
+              <div class="flex items-center justify-between">
+                <div class="flex items-center gap-1.5">
+                  <span class="text-text-secondary">{{ t("admin.ingest.toggleTipping") }}</span>
+                  <span class="group relative">
+                    <svg class="w-3.5 h-3.5 text-text-muted cursor-help" fill="none" viewBox="0 0 20 20" stroke="currentColor" stroke-width="1.5">
+                      <circle cx="10" cy="10" r="8" /><path d="M8 7.5a2.5 2.5 0 0 1 4 2c0 1.5-2 2-2 2" stroke-linecap="round" /><circle cx="10" cy="14" r=".5" fill="currentColor" stroke="none" />
+                    </svg>
+                    <span class="pointer-events-none absolute bottom-full left-1/2 -translate-x-1/2 mb-1.5 w-48 rounded bg-surface-3 px-2 py-1 text-[11px] text-text-secondary opacity-0 group-hover:opacity-100 transition-opacity shadow-md z-10">
+                      {{ t("admin.ingest.toggleTippingDesc") }}
+                    </span>
+                  </span>
+                </div>
+                <button
+                  type="button" role="switch" :aria-checked="league.features.tipping"
+                  :disabled="Boolean(leaguePatchBusyById[league.league_id])"
+                  class="relative inline-flex h-5 w-9 shrink-0 rounded-full transition-colors duration-200 focus:outline-none disabled:opacity-50"
+                  :class="league.features.tipping ? 'bg-primary' : 'bg-surface-3'"
+                  @click="patchLeagueFlags(league, { features: { tipping: !league.features.tipping } })"
+                >
+                  <span class="pointer-events-none inline-block h-4 w-4 rounded-full bg-white shadow transform transition-transform duration-200 mt-0.5" :class="league.features.tipping ? 'translate-x-[18px]' : 'translate-x-0.5'" />
+                </button>
+              </div>
+              <!-- Match Load -->
+              <div class="flex items-center justify-between">
+                <div class="flex items-center gap-1.5">
+                  <span class="text-text-secondary">{{ t("admin.ingest.toggleMatchLoad") }}</span>
+                  <span class="group relative">
+                    <svg class="w-3.5 h-3.5 text-text-muted cursor-help" fill="none" viewBox="0 0 20 20" stroke="currentColor" stroke-width="1.5">
+                      <circle cx="10" cy="10" r="8" /><path d="M8 7.5a2.5 2.5 0 0 1 4 2c0 1.5-2 2-2 2" stroke-linecap="round" /><circle cx="10" cy="14" r=".5" fill="currentColor" stroke="none" />
+                    </svg>
+                    <span class="pointer-events-none absolute bottom-full left-1/2 -translate-x-1/2 mb-1.5 w-48 rounded bg-surface-3 px-2 py-1 text-[11px] text-text-secondary opacity-0 group-hover:opacity-100 transition-opacity shadow-md z-10">
+                      {{ t("admin.ingest.toggleMatchLoadDesc") }}
+                    </span>
+                  </span>
+                </div>
+                <button
+                  type="button" role="switch" :aria-checked="league.features.match_load"
+                  :disabled="Boolean(leaguePatchBusyById[league.league_id])"
+                  class="relative inline-flex h-5 w-9 shrink-0 rounded-full transition-colors duration-200 focus:outline-none disabled:opacity-50"
+                  :class="league.features.match_load ? 'bg-primary' : 'bg-surface-3'"
+                  @click="patchLeagueFlags(league, { features: { match_load: !league.features.match_load } })"
+                >
+                  <span class="pointer-events-none inline-block h-4 w-4 rounded-full bg-white shadow transform transition-transform duration-200 mt-0.5" :class="league.features.match_load ? 'translate-x-[18px]' : 'translate-x-0.5'" />
+                </button>
+              </div>
+            </div>
+          </div>
         </div>
 
         <select

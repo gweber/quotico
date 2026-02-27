@@ -165,6 +165,7 @@ from app.routers.historical import router as historical_router
 from app.routers.quotico_tips import router as quotico_tips_router
 from app.routers.qbot import router as qbot_router
 from app.routers.betting_slips import router as betting_slips_router
+from app.routers.leagues import router as leagues_router
 from app.routers.admin import router as admin_router
 from app.routers.admin_ingest import router as admin_ingest_router
 from app.routers.admin_teams_v3 import router as admin_teams_v3_router
@@ -190,6 +191,7 @@ app.include_router(historical_router)
 app.include_router(quotico_tips_router)
 app.include_router(qbot_router)
 app.include_router(betting_slips_router)
+app.include_router(leagues_router)
 app.include_router(admin_router)
 app.include_router(admin_ingest_router)
 app.include_router(admin_teams_v3_router)
