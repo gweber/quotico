@@ -31,6 +31,44 @@ from app.utils import ensure_utc, utcnow
 logger = logging.getLogger("quotico.betting_slip_service")
 
 
+def _is_v3_id(match_id: str) -> bool:
+    """Check if match_id is a numeric v3 integer ID (not a MongoDB ObjectId)."""
+    try:
+        int(match_id)
+        return len(match_id) != 24  # ObjectIds are 24-char hex strings
+    except (ValueError, TypeError):
+        return False
+
+
+async def _resolve_match(match_id: str, projection: dict | None = None) -> dict | None:
+    """Look up a match from either matches_v3 (integer IDs) or matches (ObjectId)."""
+    if _is_v3_id(match_id):
+        return await _db.db.matches_v3.find_one({"_id": int(match_id)}, projection)
+    return await _db.db.matches.find_one({"_id": ObjectId(match_id)}, projection)
+
+
+async def _resolve_matches_batch(match_ids: list[str], projection: dict | None = None) -> dict[str, dict]:
+    """Batch-resolve matches, splitting between v3 and legacy collections."""
+    v3_ids = [mid for mid in match_ids if _is_v3_id(mid)]
+    legacy_ids = [mid for mid in match_ids if not _is_v3_id(mid)]
+
+    result: dict[str, dict] = {}
+
+    if v3_ids:
+        int_ids = [int(mid) for mid in v3_ids]
+        cursor = _db.db.matches_v3.find({"_id": {"$in": int_ids}}, projection)
+        async for m in cursor:
+            result[str(m["_id"])] = m
+
+    if legacy_ids:
+        oid_list = [ObjectId(mid) for mid in legacy_ids]
+        cursor = _db.db.matches.find({"_id": {"$in": oid_list}}, projection)
+        async for m in cursor:
+            result[str(m["_id"])] = m
+
+    return result
+
+
 # ---------- Classic slip creation (direct submit, no draft) ----------
 
 async def create_slip(
@@ -66,13 +104,12 @@ async def create_slip(
             )
         match_ids_seen.add(sel["match_id"])
 
-    # Fetch all matches in one query
-    oid_list = [ObjectId(s["match_id"]) for s in selections]
-    matches_cursor = _db.db.matches.find(
-        {"_id": {"$in": oid_list}},
-        {"status": 1, "match_date": 1, "odds": 1},
+    # Fetch all matches in one query (supports both v3 integer IDs and legacy ObjectIds)
+    all_match_ids = [s["match_id"] for s in selections]
+    matches_by_id = await _resolve_matches_batch(
+        all_match_ids,
+        {"status": 1, "match_date": 1, "start_at": 1, "odds": 1, "odds_meta": 1},
     )
-    matches_by_id = {str(m["_id"]): m async for m in matches_cursor}
 
     # Check for existing bets on these matches by this user
     existing_slips = await _db.db.betting_slips.find(
@@ -113,9 +150,10 @@ async def create_slip(
                 detail=f"Match {sel['match_id']} not found.",
             )
 
-        # Check match hasn't started
-        commence = ensure_utc(match["match_date"])
-        if commence <= now or match["status"] != "scheduled":
+        # Check match hasn't started (v3 uses start_at, legacy uses match_date)
+        commence = ensure_utc(match.get("start_at") or match.get("match_date"))
+        match_status = (match.get("status") or "").lower()
+        if commence <= now or match_status != "scheduled":
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"Match {sel['match_id']} is not available for betting.",
@@ -235,8 +273,8 @@ async def create_slip_internal(
 ) -> dict | None:
     """Create a single h2h bet without HTTP validation. Used by Q-Bot auto-bet."""
     now = utcnow()
-    match = await _db.db.matches.find_one({"_id": ObjectId(match_id)})
-    if not match or match.get("status") != "scheduled":
+    match = await _resolve_match(match_id)
+    if not match or (match.get("status") or "").lower() != "scheduled":
         return None
 
     odds = build_legacy_like_odds(match).get("h2h", {})
@@ -434,11 +472,8 @@ async def patch_selection(
                 "exact_score pick requires both home and away scores.",
             )
 
-    # Validate match exists — matchday_round uses matches_v3 (integer IDs)
-    if is_matchday:
-        match = await _db.db.matches_v3.find_one({"_id": int(match_id)})
-    else:
-        match = await _db.db.matches.find_one({"_id": ObjectId(match_id)})
+    # Validate match exists (supports both v3 integer IDs and legacy ObjectIds)
+    match = await _resolve_match(match_id)
     if not match:
         raise HTTPException(status.HTTP_404_NOT_FOUND, f"Match {match_id} not found.")
 
@@ -554,7 +589,7 @@ async def submit_slip(slip_id: str, user_id: str) -> dict:
         if sel.get("status") != "draft":
             continue  # Already locked (e.g. per-leg auto-lock)
 
-        match = await _db.db.matches.find_one({"_id": ObjectId(sel["match_id"])})
+        match = await _resolve_match(sel["match_id"])
         if not match:
             raise HTTPException(
                 status.HTTP_400_BAD_REQUEST, f"Match {sel['match_id']} not found.",
@@ -656,12 +691,13 @@ async def create_bankroll_bet(
     if user_id not in squad.get("members", []):
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Not a member of this squad.")
 
-    match = await _db.db.matches.find_one({"_id": ObjectId(match_id)})
+    match = await _resolve_match(match_id)
     if not match:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Match not found.")
 
-    commence = ensure_utc(match["match_date"])
-    if commence <= now or match["status"] != "scheduled":
+    commence = ensure_utc(match.get("start_at") or match.get("match_date"))
+    match_status = (match.get("status") or "").lower()
+    if commence <= now or match_status != "scheduled":
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Match is not available for betting.")
 
     # Get squad bankroll config
@@ -760,12 +796,13 @@ async def create_over_under_bet(
     if user_id not in squad.get("members", []):
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Not a member of this squad.")
 
-    match = await _db.db.matches.find_one({"_id": ObjectId(match_id)})
+    match = await _resolve_match(match_id)
     if not match:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Match not found.")
 
-    commence = ensure_utc(match["match_date"])
-    if commence <= now or match["status"] != "scheduled":
+    commence = ensure_utc(match.get("start_at") or match.get("match_date"))
+    match_status = (match.get("status") or "").lower()
+    if commence <= now or match_status != "scheduled":
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Match is not available for betting.")
 
     if prediction not in ("over", "under"):
@@ -874,12 +911,13 @@ async def create_parlay(
     combined_odds = 1.0
 
     for leg in legs:
-        match = await _db.db.matches.find_one({"_id": ObjectId(leg["match_id"])})
+        match = await _resolve_match(leg["match_id"])
         if not match:
             raise HTTPException(status.HTTP_404_NOT_FOUND, f"Match {leg['match_id']} not found.")
 
-        commence = ensure_utc(match["match_date"])
-        if commence <= now or match["status"] != "scheduled":
+        commence = ensure_utc(match.get("start_at") or match.get("match_date"))
+        match_status = (match.get("status") or "").lower()
+        if commence <= now or match_status != "scheduled":
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "One of the matches has already started.")
 
         prediction = leg["prediction"]
@@ -995,7 +1033,7 @@ async def make_survivor_pick(
     if user_id not in squad.get("members", []):
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Not a member of this squad.")
 
-    match = await _db.db.matches.find_one({"_id": ObjectId(match_id)})
+    match = await _resolve_match(match_id)
     if not match:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Match not found.")
 
@@ -1115,7 +1153,7 @@ async def make_fantasy_pick(
     if user_id not in squad.get("members", []):
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Not a member of this squad.")
 
-    match = await _db.db.matches.find_one({"_id": ObjectId(match_id)})
+    match = await _resolve_match(match_id)
     if not match:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Match not found.")
 

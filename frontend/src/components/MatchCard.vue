@@ -11,7 +11,7 @@ import OddsTimelineToggle from "./OddsTimelineToggle.vue";
 import QuoticoTipBadge from "./QuoticoTipBadge.vue";
 import { useQuoticoTip } from "@/composables/useQuoticoTip";
 import { getCachedUserBet } from "@/composables/useUserBets";
-import { sportFlag, sportLabel } from "@/types/sports";
+import { countryFlag } from "@/types/sports";
 import { toOddsSummary, toOddsBadge, oddsValueBySelection, computeJusticeDiff } from "@/composables/useMatchV3Adapter";
 import type { MatchV3, OddsButtonKey } from "@/types/MatchV3";
 
@@ -102,9 +102,9 @@ const totals = computed(() => {
 const oddsSummary = computed(() => toOddsSummary(props.match as unknown as MatchV3));
 const oddsBadge = computed(() => toOddsBadge(props.match as unknown as MatchV3));
 const oddsEntries = computed(() => [
-  { key: "1" as OddsButtonKey, label: props.match.home_team },
-  { key: "X" as OddsButtonKey, label: t("match.draw") },
-  { key: "2" as OddsButtonKey, label: props.match.away_team },
+  { key: "1" as OddsButtonKey, label: props.match.home_team, shortLabel: props.match.teams?.home?.short_code || "1" },
+  { key: "X" as OddsButtonKey, label: t("match.draw"), shortLabel: "X" },
+  { key: "2" as OddsButtonKey, label: props.match.away_team, shortLabel: props.match.teams?.away?.short_code || "2" },
 ]);
 const oddsByKey = computed<Record<OddsButtonKey, { avg: number | null; min: number | null; max: number | null; count: number | null }>>(() => {
   const out: Record<OddsButtonKey, { avg: number | null; min: number | null; max: number | null; count: number | null }> = {
@@ -184,8 +184,8 @@ const formattedDate = computed(() => {
     minute: "2-digit",
   });
 });
-const leagueLabel = computed(() => sportLabel(props.match.sport_key));
-const leagueFlag = computed(() => sportFlag(props.match.sport_key));
+const leagueLabel = computed(() => props.match.league_name || props.match.sport_key);
+const leagueFlag = computed(() => countryFlag(props.match.league_country));
 
 const statusLabel = computed(() => {
   if (isLive.value && liveMinute.value) return `${liveMinute.value}'`;
@@ -288,6 +288,7 @@ const statusClass = computed(() => {
           :match-id="match.id"
           :prediction="entry.key"
           :label="entry.label"
+          :short-label="entry.shortLabel"
           :odds="oddsByKey[entry.key].avg ?? undefined"
           :min="oddsByKey[entry.key].min"
           :max="oddsByKey[entry.key].max"
@@ -376,6 +377,8 @@ const statusClass = computed(() => {
       v-if="match.teams?.home?.sm_id && match.teams?.away?.sm_id"
       :home-team="match.home_team"
       :away-team="match.away_team"
+      :home-short-code="match.teams.home.short_code"
+      :away-short-code="match.teams.away.short_code"
       :home-s-m-id="match.teams.home.sm_id"
       :away-s-m-id="match.teams.away.sm_id"
     />

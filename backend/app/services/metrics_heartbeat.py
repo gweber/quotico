@@ -137,7 +137,7 @@ class MetricsHeartbeat:
             {"status": "SCHEDULED", "start_at": {"$gte": now, "$lte": now + lookahead}},
             {
                 "_id": 1, "season_id": 1, "round_id": 1, "start_at": 1,
-                "odds_meta.updated_at": 1, "odds_meta.source": 1,
+                "odds_meta.updated_at": 1, "odds_meta.updated_at_utc": 1, "odds_meta.source": 1,
             },
         ).to_list(length=2000)
 
@@ -267,6 +267,7 @@ class MetricsHeartbeat:
                 "matches_in_window": len(upcoming),
                 "tier_breakdown": dict(tier_counts),
                 "triggered_by": triggered_by,
+                "updated_at_utc": utcnow(),
             }},
             upsert=True,
         )
@@ -280,6 +281,11 @@ class MetricsHeartbeat:
                      synced_rounds, synced_fixtures, repair_count, dict(tier_counts))
 
         await self._publish_metrics_event("odds_scheduler", synced_fixtures)
+
+        # v3.2: fixed-snapshot passes (no API calls, local data only)
+        omega_count = await self._omega_finalizer_pass()
+        anchor_count = await self._fixed_snapshot_pass(upcoming)
+
         return {
             "status": "ok",
             "triggered_by": triggered_by,
@@ -289,6 +295,8 @@ class MetricsHeartbeat:
             "repairs": repair_count,
             "tier_breakdown": dict(tier_counts),
             "deferred_rounds": deferred_rounds,
+            "omega_finalized": omega_count,
+            "anchors_written": anchor_count,
         }
 
     @staticmethod
@@ -318,7 +326,7 @@ class MetricsHeartbeat:
             return ("FAR", False)
 
         odds_meta = doc.get("odds_meta") if isinstance(doc.get("odds_meta"), dict) else {}
-        updated_at = (odds_meta or {}).get("updated_at")
+        updated_at = (odds_meta or {}).get("updated_at_utc") or (odds_meta or {}).get("updated_at")
         if updated_at is None:
             return (tier, True)
         age_minutes = (now - ensure_utc(updated_at)).total_seconds() / 60.0
@@ -376,7 +384,7 @@ class MetricsHeartbeat:
                 await sportmonks_connector.sync_fixture_odds_summary(fixture_id, source="heartbeat_post_match")
                 await _db.db.matches_v3.update_one(
                     {"_id": fixture_id},
-                    {"$set": {"_heartbeat_xg_synced": True, "updated_at": utcnow()}},
+                    {"$set": {"_heartbeat_xg_synced": True, "updated_at": utcnow(), "updated_at_utc": utcnow()}},
                 )
                 synced += 1
                 backoff = _BACKOFF_BASE_S
@@ -447,7 +455,7 @@ class MetricsHeartbeat:
                         await asyncio.sleep(3600)
                         await _db.db.meta.update_one(
                             {"_id": self._XG_CRAWLER_STATE_KEY},
-                            {"$set": {"deep_next_page": 1, "deep_done": False, "updated_at": utcnow()}},
+                            {"$set": {"deep_next_page": 1, "deep_done": False, "updated_at": utcnow(), "updated_at_utc": utcnow()}},
                             upsert=True,
                         )
 
@@ -527,6 +535,7 @@ class MetricsHeartbeat:
             "fresh_next_page": (fresh_page % self._FRESH_MAX_PAGE) + 1,
             "total_stored": total_stored,
             "updated_at": utcnow(),
+            "updated_at_utc": utcnow(),
         }
 
         if fresh_page == 1 and page_max_id > 0:
@@ -587,6 +596,7 @@ class MetricsHeartbeat:
                 "deep_done": not has_more,
                 "total_stored": total_stored,
                 "updated_at": utcnow(),
+                "updated_at_utc": utcnow(),
             }},
             upsert=True,
         )
@@ -653,6 +663,7 @@ class MetricsHeartbeat:
             "created_at": now,
             "started_at": now,
             "updated_at": now,
+            "updated_at_utc": now,
             "finished_at": None,
             "error": None,
             "error_log": [],
@@ -667,15 +678,154 @@ class MetricsHeartbeat:
         now = utcnow()
         await _db.db.admin_import_jobs.update_one(
             {"_id": job_id},
-            {"$set": {"status": "succeeded", "phase": "done", "results": results, "updated_at": now, "finished_at": now}},
+            {"$set": {"status": "succeeded", "phase": "done", "results": results, "updated_at": now, "updated_at_utc": now, "finished_at": now}},
         )
 
     async def _fail_job(self, job_id: ObjectId, message: str) -> None:
         now = utcnow()
         await _db.db.admin_import_jobs.update_one(
             {"_id": job_id},
-            {"$set": {"status": "failed", "phase": "failed", "error": {"message": message, "type": "HeartbeatError"}, "updated_at": now, "finished_at": now}},
+            {"$set": {"status": "failed", "phase": "failed", "error": {"message": message, "type": "HeartbeatError"}, "updated_at": now, "updated_at_utc": now, "finished_at": now}},
         )
+
+    # ------------------------------------------------------------------
+    # v3.2: Omega-Finalizer & fixed-snapshot safety-net passes
+    # ------------------------------------------------------------------
+
+    async def _omega_finalizer_pass(self) -> int:
+        """Write closing snapshot from last pre-kickoff odds_timeline entry.
+
+        Runs after the main odds sync loop. Queries matches past kickoff that
+        still lack a closing snapshot. Pulls the value from timeline history —
+        no Sportmonks API calls.
+        """
+        now = utcnow()
+        cutoff = now - timedelta(hours=24)
+        candidates = await _db.db.matches_v3.find(
+            {
+                "start_at": {"$gte": cutoff, "$lte": now},
+                "odds_meta.fixed_snapshots.closing": {"$exists": False},
+                "odds_timeline.0": {"$exists": True},
+            },
+            {"_id": 1, "start_at": 1, "odds_timeline": 1},
+        ).to_list(length=500)
+
+        finalized = 0
+        for doc in candidates:
+            start_at = doc.get("start_at")
+            timeline = doc.get("odds_timeline")
+            if not isinstance(timeline, list) or not timeline or start_at is None:
+                continue
+            kickoff = ensure_utc(start_at)
+
+            # Find the last timeline entry before kickoff
+            pre_kickoff = [
+                e for e in timeline
+                if isinstance(e, dict)
+                and e.get("timestamp") is not None
+                and ensure_utc(e["timestamp"]) <= kickoff
+            ]
+            entry = pre_kickoff[-1] if pre_kickoff else timeline[0]
+
+            try:
+                closing_snap = {
+                    "h": float(entry.get("home", 0)),
+                    "d": float(entry.get("draw", 0)),
+                    "a": float(entry.get("away", 0)),
+                    "ts_utc": entry.get("timestamp", now),
+                }
+            except (TypeError, ValueError):
+                continue
+
+            result = await _db.db.matches_v3.update_one(
+                {
+                    "_id": doc["_id"],
+                    "odds_meta.fixed_snapshots.closing": {"$exists": False},
+                },
+                {"$set": {
+                    "odds_meta.fixed_snapshots.closing": closing_snap,
+                    "schema_version": "v3.2.0",
+                }},
+            )
+            if result.modified_count:
+                finalized += 1
+
+        if finalized:
+            logger.info("Omega-finalizer: wrote closing snapshot for %d matches", finalized)
+        return finalized
+
+    _SNAPSHOT_WINDOWS: list[tuple[str, float, float]] = [
+        ("alpha_24h", 23.0, 25.0),
+        ("beta_6h", 5.0, 7.0),
+        ("omega_1h", 0.75, 1.25),
+    ]
+
+    async def _fixed_snapshot_pass(self, upcoming: list[dict[str, Any]]) -> int:
+        """Safety-net pass: lock time-window anchors for matches in the upcoming list.
+
+        Catches cases where the connector path missed a window because the sync
+        didn't run at the right moment.
+        """
+        now = utcnow()
+        written = 0
+
+        for doc in upcoming:
+            start_at = doc.get("start_at")
+            if start_at is None:
+                continue
+            kickoff = ensure_utc(start_at)
+            hours_until = (kickoff - now).total_seconds() / 3600.0
+
+            # Determine which slots are in-window
+            slots_to_check: list[str] = []
+            for slot_name, h_min, h_max in self._SNAPSHOT_WINDOWS:
+                if h_min <= hours_until <= h_max:
+                    slots_to_check.append(slot_name)
+
+            if not slots_to_check:
+                continue
+
+            # Fetch current state for this match
+            match_doc = await _db.db.matches_v3.find_one(
+                {"_id": doc["_id"]},
+                {"odds_meta.summary_1x2": 1, "odds_meta.fixed_snapshots": 1},
+            )
+            if not match_doc:
+                continue
+            summary = ((match_doc.get("odds_meta") or {}).get("summary_1x2") or {})
+            existing_snaps = ((match_doc.get("odds_meta") or {}).get("fixed_snapshots") or {})
+            if not summary:
+                continue
+
+            try:
+                snap = {
+                    "h": float(((summary.get("home") or {}).get("avg"))),
+                    "d": float(((summary.get("draw") or {}).get("avg"))),
+                    "a": float(((summary.get("away") or {}).get("avg"))),
+                    "ts_utc": now,
+                }
+            except (TypeError, ValueError):
+                continue
+
+            for slot_name in slots_to_check:
+                if existing_snaps.get(slot_name):
+                    continue
+                result = await _db.db.matches_v3.update_one(
+                    {
+                        "_id": doc["_id"],
+                        f"odds_meta.fixed_snapshots.{slot_name}": {"$exists": False},
+                    },
+                    {"$set": {
+                        f"odds_meta.fixed_snapshots.{slot_name}": snap,
+                        "schema_version": "v3.2.0",
+                    }},
+                )
+                if result.modified_count:
+                    written += 1
+
+        if written:
+            logger.info("Fixed-snapshot pass: wrote %d anchors", written)
+        return written
 
     async def _publish_metrics_event(self, tick_type: str, count: int) -> None:
         """Publish METRICS_UPDATED event via the event bus if enabled."""

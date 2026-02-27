@@ -61,6 +61,8 @@ class PeriodScoresOut(BaseModel):
 class MatchV3Out(BaseModel):
     id: int = Field(alias="_id")
     league_id: int
+    league_name: str | None = None
+    league_country: str | None = None
     season_id: int
     round_id: int | None = None
     referee_id: int | None = None

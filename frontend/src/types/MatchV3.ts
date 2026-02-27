@@ -13,12 +13,32 @@ export interface OddSummary {
   count: number;
 }
 
+export interface FixedSnapshot {
+  h: number;
+  d: number;
+  a: number;
+  ts_utc: string;
+}
+
+export interface MarketEntropy {
+  current_spread_pct: number;
+  drift_velocity_3h: number;
+}
+
 export interface OddsMetaV3 {
   summary_1x2?: {
     home?: OddSummary;
     draw?: OddSummary;
     away?: OddSummary;
   };
+  fixed_snapshots?: {
+    opening?: FixedSnapshot;
+    alpha_24h?: FixedSnapshot;
+    beta_6h?: FixedSnapshot;
+    omega_1h?: FixedSnapshot;
+    closing?: FixedSnapshot;
+  };
+  market_entropy?: MarketEntropy;
   source?: string;
   updated_at?: string;
 }

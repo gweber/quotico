@@ -18,6 +18,7 @@ from typing import Any
 from bson import ObjectId
 
 import app.database as _db
+from app.services.shared_gate_logic import can_signal_be_emitted
 from app.utils import ensure_utc, parse_utc, utcnow
 
 DEFAULT_BANKROLL = 1000.0
@@ -296,12 +297,35 @@ async def simulate_strategy_backtest(
     odds_by_match: dict[str, dict[str, float]] = {}
     match_ids = sorted({str(t.get("match_id")) for t in tips if t.get("match_id")})
     object_ids = []
+    int_ids = []
     for mid in match_ids:
+        if mid.isdigit():
+            int_ids.append(int(mid))
+            continue
         if len(mid) == 24:
             try:
                 object_ids.append(ObjectId(mid))
             except Exception:
                 continue
+    if int_ids:
+        matches_v3 = await _db.db.matches_v3.find(
+            {"_id": {"$in": int_ids}},
+            {"_id": 1, "odds_meta.markets.h2h.current": 1, "odds_meta.summary_1x2": 1},
+        ).to_list(length=len(int_ids))
+        for m in matches_v3:
+            h2h = (((m.get("odds_meta") or {}).get("markets") or {}).get("h2h") or {}).get("current", {})
+            if not h2h:
+                summary = ((m.get("odds_meta") or {}).get("summary_1x2") or {})
+                h2h = {
+                    "1": ((summary.get("home") or {}).get("avg")),
+                    "X": ((summary.get("draw") or {}).get("avg")),
+                    "2": ((summary.get("away") or {}).get("avg")),
+                }
+            odds_by_match[str(m["_id"])] = {
+                "1": float(h2h.get("1", 0.0)) if h2h.get("1") is not None else 0.0,
+                "X": float(h2h.get("X", 0.0)) if h2h.get("X") is not None else 0.0,
+                "2": float(h2h.get("2", 0.0)) if h2h.get("2") is not None else 0.0,
+            }
     if object_ids:
         matches = await _db.db.matches.find(
             {"_id": {"$in": object_ids}},
@@ -320,6 +344,8 @@ async def simulate_strategy_backtest(
     total_bets = 0
     weighted_staked = 0.0
     weighted_profit = 0.0
+    gate_blocked = 0
+    gate_damped = 0
     points: list[dict[str, Any]] = []
     ledger: list[dict[str, Any]] = []
     reference_now = utcnow()
@@ -334,6 +360,36 @@ async def simulate_strategy_backtest(
     )
 
     for tip in tips:
+        selection = str(tip.get("recommended_selection") or "1")
+        gate_ctx = {
+            "xg_home": float((((tip.get("tier_signals") or {}).get("poisson") or {}).get("lambda_home") or 0.0)),
+            "xg_away": float((((tip.get("tier_signals") or {}).get("poisson") or {}).get("lambda_away") or 0.0)),
+            "odds_opening": None,
+            "odds_current": (odds_by_match.get(str(tip.get("match_id"))) or {}).get(selection),
+            "event_count": 1,
+            "match_status": "FINISHED",
+            "p_model": float(tip.get("true_probability") or 1 / 3),
+            "odds_h2h": odds_by_match.get(str(tip.get("match_id"))) or {},
+            "selection": selection,
+            "xg_delta": 0.0,
+            "has_event_update": False,
+            "case_similarity": 0.7,
+            "data_integrity_score": 1.0,
+            "model_agreement_score": 0.7,
+            "absurdity_z_score": 0.0,
+            "moral_trace": ((tip.get("qbot_logic") or {}).get("moral_trace")) or {
+                "claim": "historical backtest decision",
+                "grounds": "tip snapshot",
+                "counterfactual": "unknown",
+                "user_value_if_wrong": "calibration value",
+                "limits_of_knowledge": "historical data constraints",
+            },
+        }
+        gate = await can_signal_be_emitted(gate_ctx)
+        if not gate.allowed:
+            gate_blocked += 1
+            continue
+
         odds = _resolve_tip_odds(tip, odds_by_match)
         stake, profit, is_win, odds = _tip_profit_and_stake(
             tip,
@@ -343,6 +399,11 @@ async def simulate_strategy_backtest(
         )
         if stake <= 0.0:
             continue
+        if gate.damping_factor < 0.999:
+            gate_damped += 1
+            stake *= float(gate.damping_factor)
+            profit *= float(gate.damping_factor)
+
         bankroll_before = bankroll
         total_bets += 1
         if is_win:
@@ -385,6 +446,8 @@ async def simulate_strategy_backtest(
                 "match_id": tip.get("match_id"),
                 "time_weight": round(float(time_weight), 4),
                 "weighted_net_profit": round(float(profit * time_weight), 4),
+                "decision_reason_code": gate.reason_code,
+                "policy_version_used": gate.policy_version_used,
             }
         )
 
@@ -404,6 +467,8 @@ async def simulate_strategy_backtest(
         "weighted_roi": round(float(weighted_roi), 6),
         "weighted_profit": round(float(weighted_profit), 4),
         "weighted_staked": round(float(weighted_staked), 4),
+        "gate_blocked": int(gate_blocked),
+        "gate_damped": int(gate_damped),
         "points": points,
         "ledger": ledger,
         "window": window_meta,

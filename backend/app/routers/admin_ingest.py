@@ -142,6 +142,15 @@ def _serialize_discovery_items(rows: list[dict[str, Any]]) -> list[dict[str, Any
     return out
 
 
+def _read_updated_at(doc: dict[str, Any] | None):
+    if not isinstance(doc, dict):
+        return None
+    value = doc.get("updated_at_utc")
+    if value is None:
+        value = doc.get("updated_at")
+    return ensure_utc(value) if value is not None else None
+
+
 @router.get("/overview/stats", response_model=AdminOverviewStatsResponse)
 async def get_admin_overview_stats(admin=Depends(get_admin_user)):
     _ = admin
@@ -174,21 +183,18 @@ async def get_admin_overview_stats(admin=Depends(get_admin_user)):
     )
 
     latest_finished = await _db.db.matches_v3.find_one(
-        {"status": "FINISHED", "updated_at": {"$exists": True}},
-        {"updated_at": 1},
-        sort=[("updated_at", -1)],
+        {"status": "FINISHED", "updated_at_utc": {"$exists": True}},
+        {"updated_at_utc": 1, "updated_at": 1},
+        sort=[("updated_at_utc", -1)],
     )
     if not latest_finished:
         latest_finished = await _db.db.matches_v3.find_one(
             {"updated_at": {"$exists": True}},
-            {"updated_at": 1},
+            {"updated_at_utc": 1, "updated_at": 1},
             sort=[("updated_at", -1)],
         )
-    last_match_update = (
-        ensure_utc(latest_finished["updated_at"]).isoformat()
-        if isinstance(latest_finished, dict) and latest_finished.get("updated_at") is not None
-        else None
-    )
+    last_updated = _read_updated_at(latest_finished if isinstance(latest_finished, dict) else None)
+    last_match_update = last_updated.isoformat() if last_updated else None
 
     ingest_queued = int(await _db.db.admin_import_jobs.count_documents({"status": "queued"}))
     ingest_running = int(await _db.db.admin_import_jobs.count_documents({"status": "running"}))
@@ -319,7 +325,7 @@ async def discover_leagues(
     if remaining is not None and int(remaining) <= 1:
         await _db.db.meta.update_one(
             {"_id": _RATE_META_ID},
-            {"$set": {"remaining": int(remaining), "reset_at": reset_at, "updated_at": now}},
+            {"$set": {"remaining": int(remaining), "reset_at": reset_at, "updated_at": now, "updated_at_utc": now}},
             upsert=True,
         )
         return {
@@ -334,7 +340,7 @@ async def discover_leagues(
     await sportmonks_connector.sync_leagues_to_registry(discovery.get("items") or [])
     await _db.db.meta.update_one(
         {"_id": _RATE_META_ID},
-        {"$set": {"remaining": remaining, "reset_at": reset_at, "updated_at": now}},
+        {"$set": {"remaining": remaining, "reset_at": reset_at, "updated_at": now, "updated_at_utc": now}},
         upsert=True,
     )
     refreshed = await _list_cached_leagues()
@@ -367,7 +373,8 @@ async def patch_discovery_league(
     if not isinstance(doc, dict):
         raise HTTPException(status_code=404, detail="League not found.")
 
-    updates: dict[str, Any] = {"updated_at": utcnow()}
+    stamp_now = utcnow()
+    updates: dict[str, Any] = {"updated_at": stamp_now, "updated_at_utc": stamp_now}
     if body.is_active is not None:
         updates["is_active"] = bool(body.is_active)
     if body.ui_order is not None:
@@ -417,6 +424,7 @@ async def _run_sportmonks_ingest_job(job_id: ObjectId, season_id: int) -> None:
                     "active_lock": False,
                     "error": {"message": str(exc), "type": type(exc).__name__},
                     "updated_at": now,
+                    "updated_at_utc": now,
                     "finished_at": now,
                 }
             },
@@ -437,6 +445,7 @@ async def _run_sportmonks_metrics_job(job_id: ObjectId, season_id: int) -> None:
                     "active_lock": False,
                     "error": {"message": str(exc), "type": type(exc).__name__},
                     "updated_at": now,
+                    "updated_at_utc": now,
                     "finished_at": now,
                 }
             },
@@ -496,6 +505,7 @@ async def start_season_ingest(
         "created_at": now,
         "started_at": None,
         "updated_at": now,
+        "updated_at_utc": now,
         "finished_at": None,
     }
     try:
@@ -585,6 +595,7 @@ async def start_metrics_sync(
         "created_at": now,
         "started_at": None,
         "updated_at": now,
+        "updated_at_utc": now,
         "finished_at": None,
     }
     try:
@@ -1244,12 +1255,12 @@ async def get_ops_snapshot(admin=Depends(get_admin_user)):
     )
     active_docs = await _db.db.admin_import_jobs.find(
         {"type": {"$in": [_JOB_TYPE, _JOB_TYPE_METRICS]}, "status": {"$in": ["queued", "running", "paused"]}},
-        {"_id": 1, "type": 1, "season_id": 1, "status": 1, "phase": 1, "updated_at": 1, "progress": 1},
-    ).sort("updated_at", -1).to_list(length=50)
+        {"_id": 1, "type": 1, "season_id": 1, "status": 1, "phase": 1, "updated_at": 1, "updated_at_utc": 1, "progress": 1},
+    ).sort("updated_at_utc", -1).to_list(length=50)
     active_items = []
     stale_minutes = int(settings.SPORTMONKS_STALE_JOB_MINUTES)
     for doc in active_docs:
-        updated_at = ensure_utc(doc.get("updated_at")) if doc.get("updated_at") else None
+        updated_at = _read_updated_at(doc)
         is_stale = bool(updated_at is not None and (now - updated_at) > timedelta(minutes=stale_minutes))
         active_items.append(
             {
@@ -1266,13 +1277,13 @@ async def get_ops_snapshot(admin=Depends(get_admin_user)):
 
     metrics_job = await _db.db.admin_import_jobs.find_one(
         {"type": _JOB_TYPE_METRICS, "status": {"$in": ["running", "queued", "paused"]}},
-        {"results": 1, "season_id": 1, "updated_at": 1},
-        sort=[("updated_at", -1)],
+        {"results": 1, "season_id": 1, "updated_at": 1, "updated_at_utc": 1},
+        sort=[("updated_at_utc", -1)],
     )
     if not metrics_job:
         metrics_job = await _db.db.admin_import_jobs.find_one(
             {"type": _JOB_TYPE_METRICS, "status": {"$in": ["succeeded", "failed"]}},
-            {"results": 1, "season_id": 1, "updated_at": 1},
+            {"results": 1, "season_id": 1, "updated_at": 1, "updated_at_utc": 1},
             sort=[("updated_at", -1)],
         )
     results = (metrics_job or {}).get("results") if isinstance(metrics_job, dict) else {}
@@ -1332,8 +1343,8 @@ async def list_active_jobs(admin=Depends(get_admin_user)):
     _ = admin
     docs = await _db.db.admin_import_jobs.find(
         {"type": {"$in": [_JOB_TYPE, _JOB_TYPE_METRICS]}, "status": {"$in": ["queued", "running", "paused"]}},
-        {"_id": 1, "type": 1, "status": 1, "season_id": 1, "updated_at": 1, "processed_rounds": 1, "total_rounds": 1},
-    ).sort("updated_at", -1).to_list(length=200)
+        {"_id": 1, "type": 1, "status": 1, "season_id": 1, "updated_at": 1, "updated_at_utc": 1, "processed_rounds": 1, "total_rounds": 1},
+    ).sort("updated_at_utc", -1).to_list(length=200)
     items = []
     for doc in docs:
         total = int(doc.get("total_rounds") or 0)
@@ -1347,7 +1358,7 @@ async def list_active_jobs(admin=Depends(get_admin_user)):
                 "processed_rounds": processed,
                 "total_rounds": total,
                 "progress_percent": round((processed / total) * 100.0, 2) if total > 0 else 0.0,
-                "updated_at": ensure_utc(doc.get("updated_at")).isoformat() if doc.get("updated_at") else None,
+                "updated_at": (_read_updated_at(doc).isoformat() if _read_updated_at(doc) else None),
             }
         )
     return {"items": items}
@@ -1366,7 +1377,7 @@ async def get_ingest_job(job_id: str, admin=Depends(get_admin_user)):
     now = utcnow()
     stale_minutes = int(settings.SPORTMONKS_STALE_JOB_MINUTES)
     started_at = ensure_utc(doc.get("started_at")) if doc.get("started_at") else None
-    updated_at = ensure_utc(doc.get("updated_at")) if doc.get("updated_at") else None
+    updated_at = _read_updated_at(doc)
     is_stale = bool(
         doc.get("status") == "running"
         and updated_at is not None
@@ -1417,7 +1428,7 @@ async def get_ingest_job(job_id: str, admin=Depends(get_admin_user)):
         "can_retry": can_retry,
         "created_at": ensure_utc(doc.get("created_at")).isoformat() if doc.get("created_at") else None,
         "started_at": started_at.isoformat() if started_at else None,
-        "updated_at": ensure_utc(doc.get("updated_at")).isoformat() if doc.get("updated_at") else None,
+        "updated_at": updated_at.isoformat() if updated_at else None,
         "finished_at": ensure_utc(doc.get("finished_at")).isoformat() if doc.get("finished_at") else None,
         "results": doc.get("results"),
     }
@@ -1437,14 +1448,14 @@ async def resume_ingest_job(
 
     doc = await _db.db.admin_import_jobs.find_one(
         {"_id": oid, "type": {"$in": [_JOB_TYPE, _JOB_TYPE_METRICS]}},
-        {"_id": 1, "type": 1, "status": 1, "season_id": 1, "updated_at": 1},
+        {"_id": 1, "type": 1, "status": 1, "season_id": 1, "updated_at": 1, "updated_at_utc": 1},
     )
     if not doc:
         raise HTTPException(status_code=404, detail="Ingest job not found.")
 
     now = utcnow()
     stale_minutes = int(settings.SPORTMONKS_STALE_JOB_MINUTES)
-    updated_at = ensure_utc(doc.get("updated_at")) if doc.get("updated_at") else None
+    updated_at = _read_updated_at(doc)
     is_stale = bool(
         doc.get("status") == "running"
         and updated_at is not None
@@ -1492,6 +1503,7 @@ async def resume_ingest_job(
                 "started_at": None,
                 "finished_at": None,
                 "updated_at": now,
+                "updated_at_utc": now,
             },
             "$inc": {"retry_count": 1},
         },

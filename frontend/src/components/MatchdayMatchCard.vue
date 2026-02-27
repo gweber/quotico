@@ -5,6 +5,7 @@ import type { MatchdayMatch } from "@/stores/matchday";
 import { useMatchdayStore } from "@/stores/matchday";
 import MatchHistory from "./MatchHistory.vue";
 import QuoticoTipBadge from "./QuoticoTipBadge.vue";
+import OddsTimelineToggle from "./OddsTimelineToggle.vue";
 import { getCachedTip } from "@/composables/useQuoticoTip";
 import { toMatchCardVM, toOddsSummary, toOddsBadge } from "@/composables/useMatchV3Adapter";
 import type { MatchV3 } from "@/types/MatchV3";
@@ -65,6 +66,29 @@ const displayOdds = computed(() => {
 });
 
 const isClosingLine = computed(() => oddsBadge.value === "closing");
+
+// Trend arrows + opening delta from fixed_snapshots
+const TREND_THRESHOLD = 0.03; // minimum delta to show an arrow
+const oddsTrends = computed(() => {
+  const meta = (props.match as unknown as MatchV3).odds_meta;
+  const opening = meta?.fixed_snapshots?.opening;
+  const summary = meta?.summary_1x2;
+  if (!opening || !summary) return null;
+
+  const calc = (current: number | undefined, open: number) => {
+    if (current == null) return { arrow: "" as const, delta: 0, pct: 0 };
+    const delta = current - open;
+    const pct = open > 0 ? (delta / open) * 100 : 0;
+    const arrow = delta > TREND_THRESHOLD ? "\u2191" : delta < -TREND_THRESHOLD ? "\u2193" : "";
+    return { arrow, delta, pct };
+  };
+
+  return {
+    "1": calc(summary.home?.avg, opening.h),
+    X: calc(summary.draw?.avg, opening.d),
+    "2": calc(summary.away?.avg, opening.a),
+  };
+});
 
 const xgHome = computed(() => {
   const v = (props.match.teams?.home as { xg?: number } | undefined)?.xg;
@@ -332,27 +356,42 @@ function updateAway(e: Event) {
       <span
         class="inline-flex items-baseline gap-1"
         :aria-label="t('match.homeWinOdds', { odds: displayOdds['1']?.toFixed(2) ?? '-' })"
-        :title="t('match.homeWinOdds', { odds: displayOdds['1']?.toFixed(2) ?? '-' })"
+        :title="oddsTrends?.['1']?.delta ? `Opening: ${(displayOdds['1']! - oddsTrends['1'].delta).toFixed(2)} (${oddsTrends['1'].pct >= 0 ? '+' : ''}${oddsTrends['1'].pct.toFixed(1)}%)` : t('match.homeWinOdds', { odds: displayOdds['1']?.toFixed(2) ?? '-' })"
       >
         <span class="text-[10px] leading-none text-text-secondary" aria-hidden="true">1</span>
         <span class="text-xs font-mono tabular-nums">{{ displayOdds['1']?.toFixed(2) ?? '-' }}</span>
+        <span
+          v-if="oddsTrends?.['1']?.arrow"
+          class="text-[9px] leading-none font-bold"
+          :class="oddsTrends['1'].arrow === '\u2191' ? 'text-emerald-400' : 'text-rose-400'"
+        >{{ oddsTrends['1'].arrow }}</span>
       </span>
       <span
         v-if="displayOdds['X'] !== undefined"
         class="inline-flex items-baseline gap-1"
         :aria-label="t('match.drawOdds', { odds: displayOdds['X'].toFixed(2) })"
-        :title="t('match.drawOdds', { odds: displayOdds['X'].toFixed(2) })"
+        :title="oddsTrends?.X?.delta ? `Opening: ${(displayOdds['X']! - oddsTrends.X.delta).toFixed(2)} (${oddsTrends.X.pct >= 0 ? '+' : ''}${oddsTrends.X.pct.toFixed(1)}%)` : t('match.drawOdds', { odds: displayOdds['X'].toFixed(2) })"
       >
         <span class="text-[10px] leading-none text-text-secondary" aria-hidden="true">X</span>
         <span class="text-xs font-mono tabular-nums">{{ displayOdds['X'].toFixed(2) }}</span>
+        <span
+          v-if="oddsTrends?.X?.arrow"
+          class="text-[9px] leading-none font-bold"
+          :class="oddsTrends.X.arrow === '\u2191' ? 'text-emerald-400' : 'text-rose-400'"
+        >{{ oddsTrends.X.arrow }}</span>
       </span>
       <span
         class="inline-flex items-baseline gap-1"
         :aria-label="t('match.awayWinOdds', { odds: displayOdds['2']?.toFixed(2) ?? '-' })"
-        :title="t('match.awayWinOdds', { odds: displayOdds['2']?.toFixed(2) ?? '-' })"
+        :title="oddsTrends?.['2']?.delta ? `Opening: ${(displayOdds['2']! - oddsTrends['2'].delta).toFixed(2)} (${oddsTrends['2'].pct >= 0 ? '+' : ''}${oddsTrends['2'].pct.toFixed(1)}%)` : t('match.awayWinOdds', { odds: displayOdds['2']?.toFixed(2) ?? '-' })"
       >
         <span class="text-[10px] leading-none text-text-secondary" aria-hidden="true">2</span>
         <span class="text-xs font-mono tabular-nums">{{ displayOdds['2']?.toFixed(2) ?? '-' }}</span>
+        <span
+          v-if="oddsTrends?.['2']?.arrow"
+          class="text-[9px] leading-none font-bold"
+          :class="oddsTrends['2'].arrow === '\u2191' ? 'text-emerald-400' : 'text-rose-400'"
+        >{{ oddsTrends['2'].arrow }}</span>
       </span>
     </div>
 
@@ -361,6 +400,13 @@ function updateAway(e: Event) {
         {{ oddsBadge === "live" ? $t("match.liveOdds") : $t("match.closingLine") }}
       </span>
     </div>
+
+    <!-- Odds timeline (lazy-loaded on expand) -->
+    <OddsTimelineToggle
+      :match-id="match.id"
+      :home-team="match.home_team"
+      :away-team="match.away_team"
+    />
 
     <!-- Bottom: prediction vs result comparison -->
     <div
@@ -375,6 +421,8 @@ function updateAway(e: Event) {
       v-if="match.teams?.home?.sm_id && match.teams?.away?.sm_id"
       :home-team="match.home_team"
       :away-team="match.away_team"
+      :home-short-code="match.teams.home.short_code"
+      :away-short-code="match.teams.away.short_code"
       :home-s-m-id="match.teams.home.sm_id"
       :away-s-m-id="match.teams.away.sm_id"
       :context="(match.h2h_context as any) ?? undefined"

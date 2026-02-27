@@ -87,6 +87,13 @@ class SportmonksConnector:
         slug = re.sub(r"[^a-z0-9]+", "_", raw).strip("_")
         return slug
 
+    @staticmethod
+    def _stamp_updated_fields(target: dict[str, Any], now=None) -> dict[str, Any]:
+        ts = now or utcnow()
+        target["updated_at"] = ts
+        target["updated_at_utc"] = ts
+        return target
+
     def _extract_sport_key(self, row: dict[str, Any]) -> str | None:
         sport = (row or {}).get("sport")
         sport_name = self._first_non_empty((sport or {}).get("name"))
@@ -137,6 +144,7 @@ class SportmonksConnector:
         now = utcnow()
         stage_set = dict(set_fields)
         stage_set.setdefault("updated_at", now)
+        stage_set.setdefault("updated_at_utc", now)
         reasons_expr = self._manual_check_reasons_expr(clear_reasons=clear_reasons)
         stage_set["manual_check_reasons"] = reasons_expr
         stage_set["manual_check_required"] = {
@@ -154,14 +162,9 @@ class SportmonksConnector:
         }
         if timeline_entry is not None:
             stage_set["odds_timeline"] = {
-                "$slice": [
-                    {
-                        "$concatArrays": [
-                            {"$ifNull": ["$odds_timeline", []]},
-                            [timeline_entry],
-                        ]
-                    },
-                    -20,
+                "$concatArrays": [
+                    {"$ifNull": ["$odds_timeline", []]},
+                    [timeline_entry],
                 ]
             }
         try:
@@ -182,6 +185,7 @@ class SportmonksConnector:
                 "$set": {
                     **set_fields,
                     "updated_at": stage_set["updated_at"],
+                    "updated_at_utc": stage_set["updated_at_utc"],
                     "manual_check_reasons": recomputed["manual_check_reasons"],
                     "manual_check_required": recomputed["manual_check_required"],
                 }
@@ -190,7 +194,6 @@ class SportmonksConnector:
                 update_doc["$push"] = {
                     "odds_timeline": {
                         "$each": [timeline_entry],
-                        "$slice": -20,
                     }
                 }
             await self.db.matches_v3.update_one({"_id": match_id}, update_doc)
@@ -311,6 +314,7 @@ class SportmonksConnector:
                 "ui_order": existing["ui_order"],
                 "last_synced_at": now,
                 "updated_at": now,
+                "updated_at_utc": now,
             }
             result = await self.db.league_registry_v3.update_one(
                 {"_id": lid},
@@ -667,20 +671,22 @@ class SportmonksConnector:
                 summary, has_market_1 = self._build_1x2_summary_from_rows(odds_rows)
                 del odds_rows
                 now = utcnow()
-                update_fields: dict[str, Any] = {"updated_at": now}
+                update_fields: dict[str, Any] = self._stamp_updated_fields({}, now=now)
                 push_fields: dict[str, Any] = {}
                 if summary:
                     update_fields["odds_meta.summary_1x2"] = summary
                     update_fields["odds_meta.source"] = "sportmonks_round_bulk"
                     update_fields["odds_meta.updated_at"] = now
+                    update_fields["odds_meta.updated_at_utc"] = now
                     existing = await self.db.matches_v3.find_one(
                         {"_id": int(fixture_id)},
-                        {"odds_timeline": 1},
+                        {"odds_timeline": 1, "start_at": 1, "odds_meta.fixed_snapshots": 1},
                     )
+                    entropy = self._compute_market_entropy(summary, (existing or {}).get("odds_timeline"), now)
+                    update_fields["odds_meta.market_entropy"] = entropy
                     if self._should_append_odds_timeline(existing, summary, now):
                         push_fields["odds_timeline"] = {
                             "$each": [self._build_timeline_entry(summary=summary, source="sportmonks_round_bulk", ts=now)],
-                            "$slice": -20,
                         }
                 else:
                     repair_candidates.append(int(fixture_id))
@@ -691,6 +697,14 @@ class SportmonksConnector:
                     {"_id": int(fixture_id), "season_id": int(season_id)},
                     update_doc,
                 )
+                # v3.2: try to lock fixed snapshot anchors
+                if summary:
+                    _start_at = (existing or {}).get("start_at")
+                    await self._try_set_fixed_snapshots(
+                        int(fixture_id), summary, now,
+                        start_at=ensure_utc(_start_at) if _start_at else None,
+                        existing_snapshots=((existing or {}).get("odds_meta") or {}).get("fixed_snapshots"),
+                    )
                 if not has_market_1:
                     repair_candidates.append(int(fixture_id))
                 processed += 1
@@ -932,14 +946,18 @@ class SportmonksConnector:
         now = utcnow()
         existing = await self.db.matches_v3.find_one(
             {"_id": int(fixture_id)},
-            {"odds_timeline": 1},
+            {"odds_timeline": 1, "start_at": 1, "odds_meta.fixed_snapshots": 1},
         )
+        entropy = self._compute_market_entropy(summary, (existing or {}).get("odds_timeline"), now)
         update_doc: dict[str, Any] = {
             "$set": {
                 "odds_meta.summary_1x2": summary,
                 "odds_meta.source": source,
                 "odds_meta.updated_at": now,
+                "odds_meta.updated_at_utc": now,
+                "odds_meta.market_entropy": entropy,
                 "updated_at": now,
+                "updated_at_utc": now,
             }
         }
         timeline_entry = None
@@ -953,6 +971,13 @@ class SportmonksConnector:
             set_fields=update_doc["$set"],
             clear_reasons=clear_reasons,
             timeline_entry=timeline_entry,
+        )
+        # v3.2: try to lock fixed snapshot anchors
+        _start_at = (existing or {}).get("start_at")
+        await self._try_set_fixed_snapshots(
+            int(fixture_id), summary, now,
+            start_at=ensure_utc(_start_at) if _start_at else None,
+            existing_snapshots=((existing or {}).get("odds_meta") or {}).get("fixed_snapshots"),
         )
         return True
 
@@ -970,6 +995,134 @@ class SportmonksConnector:
             "away": float(((summary.get("away") or {}).get("avg"))),
             "source": str(source or ""),
         }
+
+    # ------------------------------------------------------------------
+    # v3.2: Fixed snapshots & market entropy
+    # ------------------------------------------------------------------
+
+    def _build_fixed_snapshot(
+        self,
+        summary: dict[str, dict[str, float | int]],
+        ts,
+    ) -> dict[str, Any] | None:
+        """Build a compact {h, d, a, ts_utc} snapshot from a 1x2 summary."""
+        try:
+            return {
+                "h": float(((summary.get("home") or {}).get("avg"))),
+                "d": float(((summary.get("draw") or {}).get("avg"))),
+                "a": float(((summary.get("away") or {}).get("avg"))),
+                "ts_utc": ts,
+            }
+        except (TypeError, ValueError):
+            return None
+
+    def _compute_market_entropy(
+        self,
+        summary: dict[str, dict[str, float | int]],
+        timeline: list[dict[str, Any]] | None,
+        now,
+    ) -> dict[str, float]:
+        """Compute mutable market-entropy metrics from summary + timeline."""
+        # --- current_spread_pct: avg of per-outcome (max-min)/avg ---
+        spreads: list[float] = []
+        for label in ("home", "draw", "away"):
+            node = summary.get(label)
+            if not isinstance(node, dict):
+                continue
+            mn = self._to_float(node.get("min"))
+            mx = self._to_float(node.get("max"))
+            avg = self._to_float(node.get("avg"))
+            if mn is not None and mx is not None and avg is not None:
+                spreads.append((mx - mn) / max(avg, 0.01))
+        current_spread_pct = round(sum(spreads) / max(len(spreads), 1), 6)
+
+        # --- drift_velocity_3h: max abs change / hour across outcomes ---
+        drift_velocity_3h = 0.0
+        if isinstance(timeline, list) and len(timeline) >= 2:
+            cutoff = now - timedelta(hours=3)
+            recent = [
+                e for e in timeline
+                if isinstance(e, dict) and e.get("timestamp") is not None
+                and ensure_utc(e["timestamp"]) >= cutoff
+            ]
+            if len(recent) >= 2:
+                first, last = recent[0], recent[-1]
+                try:
+                    hours_elapsed = max(
+                        (ensure_utc(last["timestamp"]) - ensure_utc(first["timestamp"])).total_seconds() / 3600.0,
+                        0.083,  # floor ~5 min to prevent velocity explosion
+                    )
+                    max_delta = max(
+                        abs(float(last.get("home", 0)) - float(first.get("home", 0))),
+                        abs(float(last.get("draw", 0)) - float(first.get("draw", 0))),
+                        abs(float(last.get("away", 0)) - float(first.get("away", 0))),
+                    )
+                    drift_velocity_3h = round(max_delta / hours_elapsed, 6)
+                except (TypeError, ValueError, KeyError):
+                    pass
+
+        return {
+            "current_spread_pct": current_spread_pct,
+            "drift_velocity_3h": drift_velocity_3h,
+        }
+
+    _FIXED_SNAPSHOT_WINDOWS: list[tuple[str, float, float]] = [
+        # (slot_name, hours_min, hours_max)
+        ("alpha_24h", 23.0, 25.0),
+        ("beta_6h", 5.0, 7.0),
+        ("omega_1h", 0.75, 1.25),
+    ]
+
+    async def _try_set_fixed_snapshots(
+        self,
+        fixture_id: int,
+        summary: dict[str, dict[str, float | int]],
+        now,
+        start_at,
+        existing_snapshots: dict[str, Any] | None,
+    ) -> None:
+        """Atomically write immutable fixed_snapshot slots + schema_version (write-once)."""
+        snap = self._build_fixed_snapshot(summary, now)
+        if snap is None:
+            return
+        existing = existing_snapshots or {}
+
+        # Collect slots to write
+        slots: dict[str, dict[str, Any]] = {}
+
+        # Opening: first time we ever get valid odds
+        if not existing.get("opening"):
+            slots["opening"] = snap
+
+        # Time-window anchors (only if start_at is known)
+        if start_at is not None:
+            try:
+                hours_until = (ensure_utc(start_at) - now).total_seconds() / 3600.0
+            except Exception:
+                hours_until = None
+            if hours_until is not None:
+                for slot_name, h_min, h_max in self._FIXED_SNAPSHOT_WINDOWS:
+                    if h_min <= hours_until <= h_max and not existing.get(slot_name):
+                        slots[slot_name] = snap
+
+        if not slots:
+            return
+
+        # Write each slot atomically (write-once via $exists filter)
+        for slot_name, slot_snap in slots.items():
+            try:
+                await self.db.matches_v3.update_one(
+                    {
+                        "_id": int(fixture_id),
+                        f"odds_meta.fixed_snapshots.{slot_name}": {"$exists": False},
+                    },
+                    {"$set": {
+                        f"odds_meta.fixed_snapshots.{slot_name}": slot_snap,
+                        "schema_version": "v3.2.0",
+                    }},
+                )
+            except Exception:
+                logger.debug("Fixed snapshot write-once failed for %s on fixture %d", slot_name, fixture_id)
 
     def _should_append_odds_timeline(
         self,
@@ -1093,7 +1246,7 @@ class SportmonksConnector:
             stale_after_minutes = int(settings.ODDS_SCHEDULER_TIER_APPROACHING_HOURS) * 60
         elif delta_minutes < (2 * 60):
             stale_after_minutes = int(settings.ODDS_SCHEDULER_TIER_CLOSING_MINUTES)
-        updated_at = odds_meta.get("updated_at")
+        updated_at = odds_meta.get("updated_at_utc") or odds_meta.get("updated_at")
         if updated_at is None:
             return True
         age_minutes = (now - ensure_utc(updated_at)).total_seconds() / 60.0
@@ -1221,7 +1374,7 @@ class SportmonksConnector:
             {"_id": "sportmonks_guard_metrics"},
             {
                 "$inc": {str(field): 1},
-                "$set": {"updated_at": utcnow()},
+                "$set": {"updated_at": utcnow(), "updated_at_utc": utcnow()},
                 "$setOnInsert": {"created_at": utcnow()},
             },
             upsert=True,
@@ -1250,7 +1403,7 @@ class SportmonksConnector:
         await self.sync_leagues_to_registry(discovery.get("items") or [])
         await self.db.meta.update_one(
             {"_id": "sportmonks_discovery_startup"},
-            {"$set": {"last_synced_at": now, "updated_at": now}},
+            {"$set": {"last_synced_at": now, "updated_at": now, "updated_at_utc": now}},
             upsert=True,
         )
 
@@ -1533,7 +1686,7 @@ class SportmonksConnector:
             if team_id is None or team_id in seen_team_ids:
                 continue
             seen_team_ids.add(team_id)
-            set_payload: dict[str, Any] = {"updated_at": utcnow()}
+            set_payload: dict[str, Any] = {"updated_at": utcnow(), "updated_at_utc": utcnow()}
             name = self._first_non_empty((participant or {}).get("name"))
             if name is not None:
                 set_payload["name"] = name
@@ -1554,6 +1707,7 @@ class SportmonksConnector:
                     "is_default": True,
                     "created_at": utcnow(),
                     "updated_at": utcnow(),
+                    "updated_at_utc": utcnow(),
                 }
                 if normalized
                 else None
@@ -1664,7 +1818,7 @@ class SportmonksConnector:
             },
             {
                 "$addToSet": {"manual_check_reasons": "finished_without_xg"},
-                "$set": {"updated_at": now},
+                "$set": {"updated_at": now, "updated_at_utc": now},
             },
         )
         result_odds = await self.db.matches_v3.update_many(
@@ -1675,7 +1829,7 @@ class SportmonksConnector:
             },
             {
                 "$addToSet": {"manual_check_reasons": "finished_without_odds"},
-                "$set": {"updated_at": now},
+                "$set": {"updated_at": now, "updated_at_utc": now},
             },
         )
         # Keep manual_check_required aligned for all flagged docs.
@@ -1687,7 +1841,7 @@ class SportmonksConnector:
                     "$in": sorted(CRITICAL_MANUAL_CHECK_REASONS),
                 },
             },
-            {"$set": {"manual_check_required": True, "updated_at": now}},
+            {"$set": {"manual_check_required": True, "updated_at": now, "updated_at_utc": now}},
         )
         return {
             "xg_flagged": result_xg.modified_count,
@@ -1760,6 +1914,7 @@ class SportmonksConnector:
                         "manual_check_reasons": recomputed["manual_check_reasons"],
                         "manual_check_required": recomputed["manual_check_required"],
                         "updated_at": now,
+                        "updated_at_utc": now,
                     }
                 },
             )
@@ -1800,12 +1955,14 @@ class SportmonksConnector:
     async def _job_update(self, job_id: ObjectId | None, **fields: Any) -> None:
         if job_id is None:
             return
+        now = utcnow()
         payload = dict(fields)
         if "rate_limit_remaining" not in payload and self._remaining is not None:
             payload["rate_limit_remaining"] = self._remaining
         if "rate_limit_reset_at" not in payload and self._reset_at is not None:
             payload["rate_limit_reset_at"] = self._reset_at
-        payload["updated_at"] = utcnow()
+        payload["updated_at"] = now
+        payload["updated_at_utc"] = now
         await self.db.admin_import_jobs.update_one({"_id": job_id}, {"$set": payload})
 
     async def _append_job_error(
@@ -1830,7 +1987,7 @@ class SportmonksConnector:
                         "trace": str(trace or "")[:4000],
                     }
                 },
-                "$set": {"updated_at": now},
+                "$set": {"updated_at": now, "updated_at_utc": now},
             },
         )
 
@@ -1844,7 +2001,7 @@ class SportmonksConnector:
         safe_payload = {
             key: value
             for key, value in payload.items()
-            if key not in {"_id", "created_at", "updated_at"}
+            if key not in {"_id", "created_at", "updated_at", "updated_at_utc"}
         }
         await collection.update_one(
             {"_id": int(doc_id)},
@@ -1852,6 +2009,7 @@ class SportmonksConnector:
                 "$set": {
                     **safe_payload,
                     "updated_at": now,
+                    "updated_at_utc": now,
                 },
                 "$setOnInsert": {
                     "created_at": now,

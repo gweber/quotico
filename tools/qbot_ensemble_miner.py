@@ -1,8 +1,14 @@
 """
-Qbot Ensemble Miner — robustness mining across deterministic GA seeds.
+tools/qbot_ensemble_miner.py
 
-Runs the GA multiple times for a sport (or all discovered leagues) and builds a
-consensus DNA from cross-seed statistics.
+Purpose:
+    Robustness miner for Qbot DNA ensembles on v3.1/v3.2.
+    Computes consensus with xROI stability, explicit xg_trust_factor CV and
+    correlation-aware run diversity to avoid clone clusters.
+
+Dependencies:
+    - tools/qbot_evolution_arena.py
+    - backend/app/database.py
 
 Usage:
     python -m tools.qbot_ensemble_miner --sport soccer_epl
@@ -29,6 +35,8 @@ if "MONGO_URI" not in os.environ:
 CV_ROBUST_MAX = 0.10
 CV_UNSTABLE_MIN = 0.30
 CV_EPSILON = 1e-9
+MAX_CLUSTER_CAP = 0.30
+MAX_ACCEPTED_CORR = 0.92
 _ARENA: Any = None
 
 
@@ -74,6 +82,64 @@ def _stability_tag(cv: float) -> str:
 def _print_gene_table(gene_rows: list[dict[str, Any]]) -> None:
     print("\nConsensus DNA Statistics")
     print("=" * 88)
+
+
+def _cluster_label(dna: dict[str, float]) -> str:
+    xg = float(dna.get("xg_trust_factor", 0.0))
+    momentum = float(dna.get("momentum_weight", 0.0))
+    sharp = float(dna.get("sharp_weight", 0.0))
+    ref = float(dna.get("ref_cards_sensitivity", 0.0))
+    if ref >= max(xg, momentum, sharp):
+        return "referee_specialist"
+    if xg >= max(momentum, sharp):
+        return "justice_oracle"
+    if sharp >= momentum:
+        return "sharp_edge"
+    return "momentum"
+
+
+def _run_xroi(run: dict[str, Any]) -> float:
+    val = run.get("validation_fitness") or {}
+    if "xroi" in val:
+        return float(val.get("xroi") or 0.0)
+    return float(val.get("roi") or 0.0)
+
+
+def _select_diverse_runs(valid: list[dict[str, Any]], genes: list[str]) -> list[int]:
+    import numpy as np
+
+    if len(valid) <= 2:
+        return list(range(len(valid)))
+    matrix = np.array(
+        [[float((r.get("dna") or {}).get(g, 0.0)) for g in genes] for r in valid],
+        dtype=np.float64,
+    )
+    corr = np.corrcoef(matrix)
+    corr = np.nan_to_num(corr, nan=0.0, posinf=0.0, neginf=0.0)
+    order = sorted(
+        range(len(valid)),
+        key=lambda i: (
+            _run_xroi(valid[i]),
+            float((valid[i].get("validation_fitness") or {}).get("roi", 0.0)),
+        ),
+        reverse=True,
+    )
+    cap = max(1, int(math.floor(len(valid) * MAX_CLUSTER_CAP)))
+    selected: list[int] = []
+    cluster_counts: dict[str, int] = {}
+    for idx in order:
+        dna = valid[idx].get("dna") or {}
+        cluster = _cluster_label(dna)
+        if cluster_counts.get(cluster, 0) >= cap:
+            continue
+        too_close = any(abs(float(corr[idx, s])) >= MAX_ACCEPTED_CORR for s in selected)
+        if too_close:
+            continue
+        selected.append(idx)
+        cluster_counts[cluster] = cluster_counts.get(cluster, 0) + 1
+    if not selected:
+        selected = order[: max(1, min(3, len(order)))]
+    return selected
     header = f"{'Gene':<22}{'Mean':>12}{'StdDev':>12}{'CV':>10}{'Confidence':>13}{'Source':>19}"
     print(header)
     print("-" * 88)
@@ -135,17 +201,21 @@ def _build_consensus(
     if not valid:
         raise RuntimeError("No successful runs produced DNA.")
 
+    genes = list(_arena().DNA_GENES)
+    selected_indices = _select_diverse_runs(valid, genes)
+    selected_runs = [valid[i] for i in selected_indices]
+
     best_run = max(
-        valid,
+        selected_runs,
         key=lambda r: (
+            _run_xroi(r),
             float((r.get("validation_fitness") or {}).get("roi", -1e9)),
             bool((r.get("stress_test") or {}).get("stress_passed", False)),
         ),
     )
 
-    genes = list(_arena().DNA_GENES)
     matrix = np.array(
-        [[float((r.get("dna") or {}).get(g, 0.0)) for g in genes] for r in valid],
+        [[float((r.get("dna") or {}).get(g, 0.0)) for g in genes] for r in selected_runs],
         dtype=np.float64,
     )
     means = matrix.mean(axis=0)
@@ -192,19 +262,39 @@ def _build_consensus(
             "source": source,
         }
 
+    xg_gene = gene_stats.get("xg_trust_factor", {})
+    xroi_values = np.array([_run_xroi(r) for r in selected_runs], dtype=np.float64)
+    xroi_mean = float(xroi_values.mean()) if xroi_values.size else 0.0
+    xroi_std = float(xroi_values.std()) if xroi_values.size else 0.0
+    xroi_cv = _cv(xroi_mean, xroi_std)
+
     robust = [g for g in genes if gene_stats[g]["stability"] == "robust"]
     unstable = [g for g in genes if gene_stats[g]["stability"] == "unstable"]
     medium = [g for g in genes if gene_stats[g]["stability"] == "medium"]
 
     summary = {
         "successful_runs": len(valid),
+        "selected_runs_for_consensus": len(selected_runs),
         "robust_genes": robust,
         "unstable_genes": unstable,
         "medium_genes": medium,
         "best_run_roi": _round_float(float((best_run.get("validation_fitness") or {}).get("roi", 0.0)), 6),
+        "best_run_xroi": _round_float(_run_xroi(best_run), 6),
         "best_run_seed": best_run.get("optimization_notes", {}).get("seed"),
         "source_by_gene": source_by_gene,
         "gene_stats": gene_stats,
+        "xroi_stability": {
+            "mean": _round_float(xroi_mean, 6),
+            "std": _round_float(xroi_std, 6),
+            "cv": (None if math.isinf(xroi_cv) else _round_float(xroi_cv, 6)),
+            "confidence": _confidence_label(xroi_cv),
+        },
+        "xg_trust_factor_cv": xg_gene.get("cv"),
+        "diversity_controls": {
+            "max_cluster_cap": MAX_CLUSTER_CAP,
+            "max_pairwise_corr": MAX_ACCEPTED_CORR,
+            "selected_indices": selected_indices,
+        },
         "best_run": best_run,
     }
     return consensus, gene_rows, summary
@@ -257,7 +347,7 @@ async def _persist_ensemble_strategy(
         "fitness_history": {"best": [], "avg": []},
         "deployment_method": "ensemble_miner",
         "optimization_notes": {
-            "schema_version": "v1",
+            "schema_version": "v3.1",
             "ensemble": {
                 "identity": "consensus",
                 "mode": mode,
@@ -277,6 +367,9 @@ async def _persist_ensemble_strategy(
                     for r in run_results
                     if isinstance(r.get("_id"), str)
                 ],
+                "xroi_stability": summary.get("xroi_stability"),
+                "xg_trust_factor_cv": summary.get("xg_trust_factor_cv"),
+                "diversity_controls": summary.get("diversity_controls"),
             },
             "why_shadow": "Ensemble consensus strategy requires explicit promotion.",
         },
@@ -336,7 +429,7 @@ async def _persist_ensemble_strategy(
             "fitness_history": source.get("fitness_history", {"best": [], "avg": []}),
             "deployment_method": "ensemble_miner",
             "optimization_notes": {
-                "schema_version": "v1",
+                "schema_version": "v3.1",
                 "ensemble": {
                     "identity": archetype,
                     "mode": mode,
@@ -402,6 +495,15 @@ async def _mine_sport(
     print("Robust genes :", ", ".join(summary["robust_genes"]) or "-")
     print("Unstable genes:", ", ".join(summary["unstable_genes"]) or "-")
     print("Medium genes  :", ", ".join(summary["medium_genes"]) or "-")
+    xs = summary.get("xroi_stability") or {}
+    print(
+        "xROI stability:",
+        f"mean={xs.get('mean', 0.0):+.4f}",
+        f"std={xs.get('std', 0.0):.4f}",
+        f"cv={xs.get('cv')}",
+        f"confidence={xs.get('confidence', 'n/a')}",
+    )
+    print("xg_trust_factor CV:", summary.get("xg_trust_factor_cv"))
 
     inserted = await _persist_ensemble_strategy(
         sport_key=sport_key,

@@ -205,7 +205,9 @@ async def _ensure_indexes() -> None:
     # ---- Admin Import Jobs ----
 
     await db.admin_import_jobs.create_index([("type", 1), ("status", 1), ("updated_at", -1)])
+    await db.admin_import_jobs.create_index([("type", 1), ("status", 1), ("updated_at_utc", -1)])
     await db.admin_import_jobs.create_index([("season_id", 1), ("status", 1)])
+    await db.admin_import_jobs.create_index([("season_id", 1), ("status", 1), ("updated_at_utc", -1)])
     await db.admin_import_jobs.create_index(
         [("season_id", 1), ("active_lock", 1)],
         unique=True,
@@ -227,6 +229,7 @@ async def _ensure_indexes() -> None:
     await db.matches_v3.create_index([("league_id", 1), ("start_at", 1)])
     await db.matches_v3.create_index([("referee_id", 1), ("start_at", -1)])
     await db.matches_v3.create_index([("status", 1), ("updated_at", -1)])
+    await db.matches_v3.create_index([("status", 1), ("updated_at_utc", -1)])
     await db.matches_v3.create_index([("has_advanced_stats", 1)])
     await db.matches_v3.create_index([("season_id", 1), ("has_advanced_stats", 1)])
     await db.matches_v3.create_index(
@@ -257,10 +260,12 @@ async def _ensure_indexes() -> None:
             name="matches_v3_repair_scan_fallback",
         )
     await db.matches_v3.create_index([("season_id", 1), ("odds_meta.updated_at", -1)])
+    await db.matches_v3.create_index([("season_id", 1), ("odds_meta.updated_at_utc", -1)])
     await db.matches_v3.create_index([("season_id", 1), ("round_id", 1)])
     await db.matches_v3.create_index([("teams.home.sm_id", 1), ("start_at", -1)])
     await db.matches_v3.create_index([("teams.away.sm_id", 1), ("start_at", -1)])
     await db.teams_v3.create_index([("updated_at", -1)])
+    await db.teams_v3.create_index([("updated_at_utc", -1)])
     await db.teams_v3.create_index([("name", 1)])
     await db.teams_v3.create_index([("aliases.normalized", 1)])
     await db.teams_v3.create_index([("aliases.alias_key", 1)])
@@ -281,12 +286,14 @@ async def _ensure_indexes() -> None:
         name="v3_query_cache_ttl",
     )
     await db.v3_query_cache.create_index([("kind", 1), ("updated_at", -1)], name="v3_query_cache_kind_updated")
+    await db.v3_query_cache.create_index([("kind", 1), ("updated_at_utc", -1)], name="v3_query_cache_kind_updated_utc")
     await db.sportmonks_page_cache.create_index(
         [("expires_at", 1)],
         expireAfterSeconds=0,
         name="sportmonks_page_cache_ttl",
     )
     await db.sportmonks_page_cache.create_index([("endpoint", 1)], name="sportmonks_page_cache_endpoint")
+    await db.sportmonks_page_cache.create_index([("endpoint", 1), ("updated_at_utc", -1)], name="sportmonks_page_cache_endpoint_updated_utc")
 
     # ---- Provider Runtime Settings ----
 
@@ -363,6 +370,8 @@ async def _ensure_indexes() -> None:
     await db.quotico_tips.create_index(
         [("status", 1), ("was_correct", 1), ("match_date", -1)]
     )
+    await db.quotico_tips.create_index([("qbot_logic.signal_stage", 1), ("match_date", -1)])
+    await db.quotico_tips.create_index([("decision_trace.reason_code", 1), ("generated_at", -1)])
 
     # ---- Qbot Intelligence ----
 
@@ -378,6 +387,7 @@ async def _ensure_indexes() -> None:
     await db.qbot_strategies.create_index(
         [("optimization_notes.stage_info.stage_used", 1), ("created_at", -1)]
     )
+    await db.qbot_strategies.create_index([("status", 1), ("sport_key", 1), ("created_at", -1)])
 
     await db.qbot_cluster_stats.create_index("sport_key")
     # _id = cluster_key string, no additional unique index needed
@@ -396,3 +406,21 @@ async def _ensure_indexes() -> None:
     )
     await db.engine_time_machine_justice.create_index([("sport_key", 1), ("snapshot_date", -1)])
     await db.engine_time_machine_justice.create_index([("meta.generated_at", -1)])
+
+    # ---- Engine Policies v3 ----
+    await db.engine_policies_v3.create_index([("policy_key", 1)], unique=True)
+    await db.engine_policies_v3.create_index([("updated_at_utc", -1)])
+    await db.engine_policies_v3.create_index([("scope", 1), ("policy_key", 1)])
+
+    await db.engine_policy_audit_v3.create_index([("policy_key", 1), ("changed_at_utc", -1)])
+    await db.engine_policy_audit_v3.create_index([("changed_by", 1), ("changed_at_utc", -1)])
+
+    await db.engine_manual_overrides_v3.create_index([("league_id", 1), ("until_utc", -1)])
+    await db.engine_manual_overrides_v3.create_index(
+        [("until_utc", 1)],
+        expireAfterSeconds=0,
+        name="engine_manual_overrides_v3_ttl",
+    )
+
+    # ---- Meta / runtime docs ----
+    await db.meta.create_index([("updated_at_utc", -1)])

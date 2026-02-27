@@ -11,6 +11,7 @@ const props = defineProps<{
   matchId: string;
   prediction: string;
   label: string;
+  shortLabel?: string;
   odds: number | undefined;
   min?: number | null;
   max?: number | null;
@@ -157,8 +158,8 @@ watch(
     @pointercancel="onPointerUp"
     @click="toggleTooltipTouch"
   >
-    <span class="text-[10px] leading-none" :class="isTipped ? 'text-success' : 'text-text-muted'">
-      {{ prediction }}
+    <span class="text-[10px] leading-none font-semibold tracking-wide" :class="isTipped ? 'text-success' : 'text-text-muted'">
+      {{ shortLabel || prediction }}
     </span>
     <span
       class="text-sm font-mono font-bold mt-0.5 transition-colors duration-500"

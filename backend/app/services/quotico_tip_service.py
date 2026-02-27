@@ -27,6 +27,7 @@ from app.services.historical_service import (
     sport_keys_for,
 )
 from app.services.odds_meta_service import get_current_market
+from app.services.shared_gate_logic import can_signal_be_emitted
 from app.services.team_registry_service import TeamRegistry
 from app.utils import ensure_utc, utcnow
 
@@ -180,6 +181,7 @@ def _no_signal_bet(
     *,
     poisson_data: dict | None = None,
     player_prediction: dict | None = None,
+    decision_trace: dict | None = None,
 ) -> dict:
     """Build a stored tip with status 'no_signal' and skip_reason."""
     tier_signals: dict = {}
@@ -222,6 +224,7 @@ def _no_signal_bet(
         "actual_result": None,
         "was_correct": None,
         "generated_at": utcnow(),
+        "decision_trace": decision_trace or {"reason_code": reason},
     }
 
     if player_prediction:
@@ -1417,6 +1420,60 @@ async def generate_quotico_tip(match: dict, *, before_date: datetime | None = No
 
     true_prob = poisson[prob_map[best_outcome]]
     imp_prob = implied.get(best_outcome, 0)
+    stage = "omega" if match.get("lineups") else "beta" if match.get("referee_id") else "alpha"
+
+    moral_trace = {
+        "claim": f"{best_outcome} has value edge",
+        "grounds": {
+            "edge_pct": round(best_edge, 2),
+            "true_probability": round(true_prob, 4),
+            "implied_probability": round(imp_prob, 4),
+        },
+        "counterfactual": "Model edge can fail due to low-probability match events.",
+        "user_value_if_wrong": "Decision remains EV-grounded and policy-audited.",
+        "limits_of_knowledge": "Unknown late news and lineup volatility can shift outcomes.",
+    }
+
+    gate_ctx = {
+        "xg_home": poisson.get("lambda_home"),
+        "xg_away": poisson.get("lambda_away"),
+        "odds_opening": ((match.get("odds_meta") or {}).get("markets") or {}).get("h2h", {}).get("opening", {}).get(best_outcome),
+        "odds_current": current_odds.get(best_outcome),
+        "event_count": len(match.get("events") or []),
+        "match_status": match.get("status"),
+        "p_model": true_prob,
+        "odds_h2h": current_odds,
+        "selection": best_outcome,
+        "xg_delta": 0.0,
+        "has_event_update": False,
+        "case_similarity": 0.7,
+        "data_integrity_score": 1.0,
+        "model_agreement_score": max(0.0, 1.0 - abs(true_prob - imp_prob)),
+        "absurdity_z_score": 0.0,
+        "moral_trace": moral_trace,
+    }
+    gate = await can_signal_be_emitted(gate_ctx)
+    decision_trace = {
+        "reason_code": gate.reason_code,
+        "policy_version_used": gate.policy_version_used,
+        "gate_results": gate.gate_results,
+        "signal_stage_before": stage,
+        "signal_stage_after": ("caution" if gate.reason_code == "WARN_MARKET_DRIFT_WITHOUT_DATA_TRIGGER" else stage),
+    }
+
+    if not gate.allowed:
+        player_pred = compute_player_prediction(poisson)
+        return _no_signal_bet(
+            match,
+            gate.reason_code,
+            poisson_data=poisson,
+            player_prediction=player_pred,
+            decision_trace=decision_trace,
+        )
+
+    confidence = min(0.99, max(0.0, confidence * gate.damping_factor))
+    if gate.reason_code == "WARN_MARKET_DRIFT_WITHOUT_DATA_TRIGGER":
+        stage = "caution"
 
     return {
         "match_id": match_id,
@@ -1471,10 +1528,20 @@ async def generate_quotico_tip(match: dict, *, before_date: datetime | None = No
         },
         "justification": justification,
         "player_prediction": compute_player_prediction(poisson),
+        "qbot_logic": {
+            "signal_stage": stage,
+            "market_inference": {
+                "reason_code": gate.reason_code,
+                "damping_factor": gate.damping_factor,
+                "policy_version_used": gate.policy_version_used,
+            },
+            "moral_trace": moral_trace,
+        },
         "status": "active",
         "actual_result": None,
         "was_correct": None,
         "generated_at": utcnow(),
+        "decision_trace": decision_trace,
     }
 
 

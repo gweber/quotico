@@ -1,10 +1,12 @@
 <script setup lang="ts">
-import { ref, onMounted, onUnmounted } from "vue";
+import { ref, computed, onMounted, onUnmounted } from "vue";
 import { useI18n } from "vue-i18n";
 import { useMatchesStore } from "@/stores/matches";
+import type { Match } from "@/stores/matches";
 import { useAuthStore } from "@/stores/auth";
 import { prefetchMatchHistory } from "@/composables/useMatchHistory";
 import { prefetchUserBets } from "@/composables/useUserBets";
+import { countryFlag } from "@/types/sports";
 import SportNav from "@/components/layout/SportNav.vue";
 import BetSlip from "@/components/layout/BetSlip.vue";
 import MatchCard from "@/components/MatchCard.vue";
@@ -13,6 +15,41 @@ const matches = useMatchesStore();
 const auth = useAuthStore();
 const aliasBannerDismissed = ref(false);
 const error = ref(false);
+
+interface LeagueGroup {
+  leagueId: number;
+  name: string;
+  flag: string;
+  matches: Match[];
+}
+
+// Preferred column order: Bundesliga first, then Premier League, then others alphabetically
+const LEAGUE_ORDER: Record<number, number> = {
+  82: 0,   // Bundesliga
+  8: 1,    // Premier League
+  564: 2,  // La Liga
+};
+
+const leagueGroups = computed<LeagueGroup[]>(() => {
+  const grouped = new Map<number, LeagueGroup>();
+  for (const match of matches.matches) {
+    const lid = match.league_id ?? 0;
+    if (!grouped.has(lid)) {
+      grouped.set(lid, {
+        leagueId: lid,
+        name: match.league_name || "Unknown",
+        flag: countryFlag(match.league_country),
+        matches: [],
+      });
+    }
+    grouped.get(lid)!.matches.push(match);
+  }
+  return [...grouped.values()].sort(
+    (a, b) => (LEAGUE_ORDER[a.leagueId] ?? 99) - (LEAGUE_ORDER[b.leagueId] ?? 99)
+  );
+});
+
+const hasMultipleLeagues = computed(() => leagueGroups.value.length > 1);
 
 async function reload() {
   error.value = false;
@@ -94,12 +131,15 @@ onUnmounted(() => {
         </div>
 
         <!-- Loading skeleton -->
-        <div v-if="matches.loading" class="space-y-4">
-          <div
-            v-for="n in 5"
-            :key="n"
-            class="bg-surface-1 rounded-card h-32 animate-pulse"
-          />
+        <div v-if="matches.loading" class="grid grid-cols-1 lg:grid-cols-2 gap-4">
+          <div v-for="n in 2" :key="n" class="space-y-3">
+            <div class="h-6 w-32 bg-surface-2 rounded animate-pulse" />
+            <div
+              v-for="m in 3"
+              :key="m"
+              class="bg-surface-1 rounded-card h-32 animate-pulse"
+            />
+          </div>
         </div>
 
         <!-- Error state -->
@@ -122,10 +162,10 @@ onUnmounted(() => {
           </p>
         </div>
 
-        <!-- Match cards -->
-        <div v-else class="space-y-3" :aria-label="$t('dashboard.matchOverview')">
+        <!-- Match cards: 2-column when multiple leagues, single column otherwise -->
+        <div v-else :aria-label="$t('dashboard.matchOverview')">
           <!-- Refresh countdown -->
-          <div class="flex items-center justify-end gap-2 text-xs text-text-muted">
+          <div class="flex items-center justify-end gap-2 text-xs text-text-muted mb-3">
             <span
               class="inline-flex items-center gap-1 tabular-nums"
               :title="$t('dashboard.oddsRefreshInfo')"
@@ -136,11 +176,32 @@ onUnmounted(() => {
               {{ Math.floor(matches.refreshCountdown / 60) }}:{{ String(matches.refreshCountdown % 60).padStart(2, '0') }}
             </span>
           </div>
-          <MatchCard
-            v-for="match in matches.matches"
-            :key="match.id"
-            :match="match"
-          />
+
+          <!-- League columns -->
+          <div
+            class="grid gap-4"
+            :class="hasMultipleLeagues ? 'grid-cols-1 lg:grid-cols-2' : 'grid-cols-1'"
+          >
+            <section v-for="group in leagueGroups" :key="group.leagueId">
+              <!-- League header -->
+              <div class="flex items-center gap-2 mb-3 pb-2 border-b border-surface-3/50">
+                <span class="text-base" aria-hidden="true">{{ group.flag }}</span>
+                <h2 class="text-sm font-semibold text-text-primary">{{ group.name }}</h2>
+                <span class="text-xs text-text-muted ml-auto tabular-nums">
+                  {{ group.matches.length }}
+                </span>
+              </div>
+
+              <!-- Cards -->
+              <div class="space-y-3">
+                <MatchCard
+                  v-for="match in group.matches"
+                  :key="match.id"
+                  :match="match"
+                />
+              </div>
+            </section>
+          </div>
         </div>
       </main>
 

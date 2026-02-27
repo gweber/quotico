@@ -1,9 +1,14 @@
 """
-Engine Time Machine — retroactive calibration across historical data.
+tools/engine_time_machine.py
 
-Steps through history in configurable intervals, performing point-in-time
-Dixon-Coles calibrations and (optionally) reliability analysis at each step.
-Results are stored in the ``engine_config_history`` collection.
+Purpose:
+    Retroactive calibration across historical v3 snapshots with strict temporal
+    integrity (`updated_at_utc`) and optional justice/referee/lineup analysis.
+
+Dependencies:
+    - backend/app/services/optimizer_service.py
+    - backend/app/services/quotico_tip_service.py
+    - backend/app/database.py
 
 Each snapshot only sees data that existed at the snapshot date — no temporal
 leakage.  The live ``engine_config`` document is never modified.
@@ -83,13 +88,14 @@ def _snapshot_match_query(sport_key: str, step_date: datetime, window_days: int)
     """Strict temporal-safe match query for snapshot analytics."""
     return {
         "sport_key": sport_key,
-        "status": "final",
-        "match_date": {
+        "status": "FINISHED",
+        "start_at": {
             "$gte": step_date - timedelta(days=window_days),
             "$lt": step_date,
         },
-        "result.home_score": {"$exists": True},
-        "result.away_score": {"$exists": True},
+        "updated_at_utc": {"$lte": step_date},
+        "teams.home.score": {"$exists": True},
+        "teams.away.score": {"$exists": True},
         "odds_meta.markets.h2h.current.1": {"$gt": 0},
         "odds_meta.markets.h2h.current.X": {"$gt": 0},
         "odds_meta.markets.h2h.current.2": {"$gt": 0},
@@ -170,6 +176,75 @@ def _extract_h2h_market(match: dict) -> dict:
     return (((match.get("odds_meta") or {}).get("markets") or {}).get("h2h") or {})
 
 
+def _extract_scores_and_xg(match: dict) -> tuple[int | None, int | None, float | None, float | None]:
+    """Read score/xG from v3 shape, with legacy fallback for safety."""
+    teams = match.get("teams") or {}
+    home_t = teams.get("home") or {}
+    away_t = teams.get("away") or {}
+    hs = _safe_int(home_t.get("score"))
+    aw = _safe_int(away_t.get("score"))
+    hxg = _safe_float(home_t.get("xg"))
+    axg = _safe_float(away_t.get("xg"))
+    if hs is None or aw is None:
+        result = match.get("result") or {}
+        hs = _safe_int(result.get("home_score"))
+        aw = _safe_int(result.get("away_score"))
+    if hxg is None or axg is None:
+        result = match.get("result") or {}
+        hxg = _safe_float(result.get("home_xg"))
+        axg = _safe_float(result.get("away_xg"))
+    return hs, aw, hxg, axg
+
+
+def _lineup_density(match: dict) -> float:
+    lineups = match.get("lineups")
+    if not isinstance(lineups, list) or not lineups:
+        return 0.0
+    starters = 0
+    for row in lineups:
+        if not isinstance(row, dict):
+            continue
+        if bool(row.get("is_starter")):
+            starters += 1
+    if starters <= 0:
+        return min(1.0, len(lineups) / 22.0)
+    return min(1.0, starters / 22.0)
+
+
+def _apply_data_delay_simulator(matches: list[dict], *, seed: int, lineup_drop_pct: float, referee_drop_pct: float) -> tuple[list[dict], dict]:
+    """Simulate dirty-data latency for robustness training."""
+    import copy
+    import random
+
+    rng = random.Random(seed)
+    changed = 0
+    delayed_lineups = 0
+    delayed_referee = 0
+    out: list[dict] = []
+    for m in matches:
+        row = copy.deepcopy(m)
+        local_changed = False
+        if row.get("lineups") and rng.random() < lineup_drop_pct:
+            row["lineups"] = []
+            delayed_lineups += 1
+            local_changed = True
+        if row.get("referee_id") and rng.random() < referee_drop_pct:
+            row["referee_id"] = None
+            delayed_referee += 1
+            local_changed = True
+        if local_changed:
+            changed += 1
+        out.append(row)
+    return out, {
+        "simulated": True,
+        "changed_matches": changed,
+        "lineups_dropped": delayed_lineups,
+        "referee_dropped": delayed_referee,
+        "lineup_drop_pct": lineup_drop_pct,
+        "referee_drop_pct": referee_drop_pct,
+    }
+
+
 def _extract_market_prices(match: dict, pick: str) -> tuple[float | None, float | None]:
     h2h = _extract_h2h_market(match)
     opening = _safe_float((h2h.get("opening") or {}).get(pick))
@@ -247,21 +322,24 @@ async def _load_snapshot_matches(
     projection = {
         "_id": 1,
         "sport_key": 1,
-        "match_date": 1,
-        "home_team_id": 1,
-        "away_team_id": 1,
-        "home_team": 1,
-        "away_team": 1,
-        "result.home_score": 1,
-        "result.away_score": 1,
-        "result.home_xg": 1,
-        "result.away_xg": 1,
+        "start_at": 1,
+        "updated_at_utc": 1,
+        "referee_id": 1,
+        "lineups": 1,
+        "teams.home.sm_id": 1,
+        "teams.away.sm_id": 1,
+        "teams.home.name": 1,
+        "teams.away.name": 1,
+        "teams.home.score": 1,
+        "teams.away.score": 1,
+        "teams.home.xg": 1,
+        "teams.away.xg": 1,
         "odds_meta.markets.h2h.current": 1,
         "odds_meta.markets.h2h.opening": 1,
         "odds_meta.markets.h2h.max": 1,
         "odds_meta.markets.h2h.min": 1,
     }
-    return await db.matches.find(query, projection).sort("match_date", 1).to_list(length=5000)
+    return await db.matches_v3.find(query, projection).sort("start_at", 1).to_list(length=5000)
 
 
 async def _build_engine_predictions(
@@ -411,9 +489,7 @@ def _compute_archetype_backtest(matches: list[dict], predictions: dict[str, dict
         pred = predictions.get(str(m.get("_id")))
         if not pred:
             continue
-        result = m.get("result") or {}
-        hs = _safe_int(result.get("home_score"))
-        aw = _safe_int(result.get("away_score"))
+        hs, aw, _, _ = _extract_scores_and_xg(m)
         if hs is None or aw is None:
             continue
         actual = _outcome_from_scores(hs, aw)
@@ -465,11 +541,7 @@ def _compute_statistical_integrity(
     used_xg = 0
 
     for m in matches:
-        result = m.get("result") or {}
-        hs = _safe_int(result.get("home_score"))
-        aw = _safe_int(result.get("away_score"))
-        hxg = _safe_float(result.get("home_xg"))
-        axg = _safe_float(result.get("away_xg"))
+        hs, aw, hxg, axg = _extract_scores_and_xg(m)
         if hs is None or aw is None:
             continue
         if hxg is None or axg is None:
@@ -530,13 +602,12 @@ def _compute_team_efficiency_dna(matches: list[dict]) -> dict:
     skipped_missing_team_ids = 0
 
     for m in matches:
-        result = m.get("result") or {}
-        hs = _safe_int(result.get("home_score"))
-        aw = _safe_int(result.get("away_score"))
-        hxg = _safe_float(result.get("home_xg"))
-        axg = _safe_float(result.get("away_xg"))
-        home_id = m.get("home_team_id")
-        away_id = m.get("away_team_id")
+        hs, aw, hxg, axg = _extract_scores_and_xg(m)
+        teams = m.get("teams") or {}
+        home = teams.get("home") or {}
+        away = teams.get("away") or {}
+        home_id = home.get("sm_id")
+        away_id = away.get("sm_id")
         if hs is None or aw is None or hxg is None or axg is None:
             continue
         if not home_id or not away_id:
@@ -545,13 +616,13 @@ def _compute_team_efficiency_dna(matches: list[dict]) -> dict:
         home_key = str(home_id)
         away_key = str(away_id)
         teams[home_key]["team_id"] = home_key
-        teams[home_key]["team_name"] = m.get("home_team")
+        teams[home_key]["team_name"] = home.get("name")
         teams[home_key]["matches"] += 1
         teams[home_key]["goals"] += hs
         teams[home_key]["xg"] += hxg
 
         teams[away_key]["team_id"] = away_key
-        teams[away_key]["team_name"] = m.get("away_team")
+        teams[away_key]["team_name"] = away.get("name")
         teams[away_key]["matches"] += 1
         teams[away_key]["goals"] += aw
         teams[away_key]["xg"] += axg
@@ -592,11 +663,12 @@ def _build_xp_table(matches: list[dict]) -> dict:
     })
     skipped_missing_team_ids = 0
     for m in matches:
-        result = m.get("result") or {}
-        hxg = _safe_float(result.get("home_xg"))
-        axg = _safe_float(result.get("away_xg"))
-        home_id = m.get("home_team_id")
-        away_id = m.get("away_team_id")
+        _, _, hxg, axg = _extract_scores_and_xg(m)
+        teams = m.get("teams") or {}
+        home = teams.get("home") or {}
+        away = teams.get("away") or {}
+        home_id = home.get("sm_id")
+        away_id = away.get("sm_id")
         if hxg is None or axg is None:
             continue
         if not home_id or not away_id:
@@ -609,14 +681,14 @@ def _build_xp_table(matches: list[dict]) -> dict:
         ak = str(away_id)
 
         teams[hk]["team_id"] = hk
-        teams[hk]["team_name"] = m.get("home_team")
+        teams[hk]["team_name"] = home.get("name")
         teams[hk]["played"] += 1
         teams[hk]["xp"] += home_xp
         teams[hk]["xg_for"] += hxg
         teams[hk]["xg_against"] += axg
 
         teams[ak]["team_id"] = ak
-        teams[ak]["team_name"] = m.get("away_team")
+        teams[ak]["team_name"] = away.get("name")
         teams[ak]["played"] += 1
         teams[ak]["xp"] += away_xp
         teams[ak]["xg_for"] += axg
@@ -676,21 +748,21 @@ async def _export_justice_table_to_mongo(
 
 async def _find_earliest_match(db, sport_key: str) -> datetime | None:
     """Find the earliest resolved match with odds for a league."""
-    earliest = await db.matches.find_one(
+    earliest = await db.matches_v3.find_one(
         {
             "sport_key": sport_key,
-            "status": "final",
+            "status": "FINISHED",
             "odds_meta.markets.h2h.current.1": {"$gt": 0},
             "odds_meta.markets.h2h.current.X": {"$gt": 0},
             "odds_meta.markets.h2h.current.2": {"$gt": 0},
-            "result.home_score": {"$exists": True},
+            "teams.home.score": {"$exists": True},
         },
-        {"match_date": 1},
-        sort=[("match_date", 1)],
+        {"start_at": 1},
+        sort=[("start_at", 1)],
     )
     if earliest:
         from app.utils import ensure_utc
-        return ensure_utc(earliest["match_date"])
+        return ensure_utc(earliest["start_at"])
     return None
 
 
@@ -742,6 +814,7 @@ async def _process_league_inner(
     with_market_beat: bool,
     with_xg_justice: bool,
     export_justice_table: bool,
+    with_data_delay_sim: bool,
     max_snapshots: int = 0,
 ) -> dict:
     """Process a single league through historical time steps."""
@@ -961,6 +1034,8 @@ async def _process_league_inner(
             statistical_integrity = None
             team_efficiency_dna = None
             prediction_map: dict[str, dict] = {}
+            window_matches: list[dict] = []
+            delay_meta = None
 
             if with_market_beat or with_xg_justice or export_justice_table:
                 window_matches = await _load_snapshot_matches(
@@ -969,6 +1044,13 @@ async def _process_league_inner(
                     step_date=step_date,
                     window_days=CALIBRATION_WINDOW_DAYS,
                 )
+                if with_data_delay_sim and window_matches:
+                    window_matches, delay_meta = _apply_data_delay_simulator(
+                        window_matches,
+                        seed=int(step_date.timestamp()),
+                        lineup_drop_pct=0.12,
+                        referee_drop_pct=0.06,
+                    )
                 if with_market_beat or with_xg_justice:
                     prediction_map = await _build_engine_predictions(
                         window_matches,
@@ -1008,11 +1090,23 @@ async def _process_league_inner(
                 extra_meta={
                     "landscape_range": result.get("landscape_range"),
                     "schema_version": "v3",
+                    "schema_version_worker": "v3.1",
                     "with_market_beat": with_market_beat,
                     "with_xg_justice": with_xg_justice,
                     "justice_exported": False,
+                    "temporal_integrity_field": "updated_at_utc",
+                    "lineup_density": round(
+                        sum(_lineup_density(m) for m in window_matches) / max(len(window_matches), 1),
+                        4,
+                    ) if (with_market_beat or with_xg_justice or export_justice_table) else None,
+                    "referee_density": round(
+                        sum(1 for m in window_matches if m.get("referee_id")) / max(len(window_matches), 1),
+                        4,
+                    ) if (with_market_beat or with_xg_justice or export_justice_table) else None,
                 },
             )
+            if delay_meta:
+                snapshot["meta"]["data_delay_simulator"] = delay_meta
             if market_performance is not None:
                 snapshot["market_performance"] = market_performance
             if statistical_integrity is not None:
@@ -1118,6 +1212,7 @@ def _process_league_sync(
     with_market_beat: bool,
     with_xg_justice: bool,
     export_justice_table: bool,
+    with_data_delay_sim: bool,
     max_snapshots: int,
 ) -> dict:
     """Sync wrapper for per-league time-machine run in a dedicated process."""
@@ -1137,6 +1232,7 @@ def _process_league_sync(
                     with_market_beat=with_market_beat,
                     with_xg_justice=with_xg_justice,
                     export_justice_table=export_justice_table,
+                    with_data_delay_sim=with_data_delay_sim,
                     max_snapshots=max_snapshots,
                 )
             )
@@ -1157,6 +1253,7 @@ async def run_time_machine(
     with_market_beat: bool,
     with_xg_justice: bool,
     export_justice_table: bool,
+    with_data_delay_sim: bool,
     concurrency: int,
     rerun: bool,
     max_snapshots: int,
@@ -1174,12 +1271,13 @@ async def run_time_machine(
         target_leagues = list(dict.fromkeys(target_leagues))
         assert len(target_leagues) == len(set(target_leagues)), "Duplicate leagues detected"
         log.info("=== ENGINE TIME MACHINE ===")
-        log.info("Leagues: %d | Interval: %dd | Mode: %s | Reliability: %s | MarketBeat: %s | xGJustice: %s | xPExport: %s | Rerun: %s%s",
+        log.info("Leagues: %d | Interval: %dd | Mode: %s | Reliability: %s | MarketBeat: %s | xGJustice: %s | xPExport: %s | DelaySim: %s | Rerun: %s%s",
                  len(target_leagues), interval_days, mode,
                  "ON" if with_reliability else "OFF",
                  "ON" if with_market_beat else "OFF",
                  "ON" if with_xg_justice else "OFF",
                  "ON" if export_justice_table else "OFF",
+                 "ON" if with_data_delay_sim else "OFF",
                  "ON" if rerun else "OFF",
                  " [DRY RUN]" if dry_run else "")
 
@@ -1205,6 +1303,7 @@ async def run_time_machine(
                         with_market_beat,
                         with_xg_justice,
                         export_justice_table,
+                        with_data_delay_sim,
                         max_snapshots,
                     )
                 except Exception as e:
@@ -1224,6 +1323,7 @@ async def run_time_machine(
                         with_market_beat,
                         with_xg_justice,
                         export_justice_table,
+                        with_data_delay_sim,
                         max_snapshots,
                     ): league
                     for league in target_leagues
@@ -1281,6 +1381,8 @@ def main():
                         help="Compute xG justice metrics and outlier detection per snapshot")
     parser.add_argument("--export-justice-table", action="store_true",
                         help="Export xP justice table to engine_time_machine_justice per snapshot")
+    parser.add_argument("--with-data-delay-sim", action="store_true",
+                        help="Simulate lineup/referee delays to train robust policies")
     parser.add_argument("--concurrency", type=int, default=8,
                         help="Max leagues to process in parallel (default: 8)")
     parser.add_argument("--max-snapshots", type=int, default=0,
@@ -1299,6 +1401,7 @@ def main():
         with_market_beat=args.with_market_beat,
         with_xg_justice=args.with_xg_justice,
         export_justice_table=args.export_justice_table,
+        with_data_delay_sim=args.with_data_delay_sim,
         concurrency=args.concurrency,
         rerun=args.rerun,
         max_snapshots=args.max_snapshots,

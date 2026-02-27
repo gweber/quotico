@@ -1,6 +1,7 @@
 import { defineStore } from "pinia";
 import { ref, computed, onUnmounted } from "vue";
 import { useApi, HttpError } from "@/composables/useApi";
+import { useAuthStore } from "./auth";
 import type { Match } from "./matches";
 import { oddsValueBySelection } from "@/composables/useMatchV3Adapter";
 import type { MatchV3, OddsButtonKey } from "@/types/MatchV3";
@@ -187,8 +188,11 @@ export const useBetSlipStore = defineStore("betslip", () => {
     persistItems();
     isOpen.value = true; // Auto-open on mobile
 
-    // Background server sync (fire-and-forget)
-    syncAddSelection(match.id, prediction, selectedOdds);
+    // Background server sync — only for authenticated users
+    const auth = useAuthStore();
+    if (auth.isLoggedIn) {
+      syncAddSelection(match.id, prediction, selectedOdds);
+    }
   }
 
   async function syncAddSelection(matchId: string, pick: string, displayedOdds: number) {
@@ -212,12 +216,11 @@ export const useBetSlipStore = defineStore("betslip", () => {
           await api.patch(`/betting-slips/${newId}/selections`, payload);
           return;
         } catch {
-          // Retry also failed
+          // Retry also failed — keep item locally, submitAll() will re-sync
         }
       }
-      // Unrecoverable — remove from local state
-      items.value = items.value.filter((i) => i.matchId !== matchId);
-      persistItems();
+      // Keep item in local state — submitAll() re-syncs all items before submission.
+      // Previously this removed the item, causing bets to vanish silently.
     } finally {
       syncing.value = false;
     }
@@ -227,8 +230,9 @@ export const useBetSlipStore = defineStore("betslip", () => {
     items.value = items.value.filter((i) => i.matchId !== matchId);
     persistItems();
 
-    // Background server sync
-    if (draftSlipId.value) {
+    // Background server sync — only for authenticated users with an active draft
+    const auth = useAuthStore();
+    if (auth.isLoggedIn && draftSlipId.value) {
       syncRemoveSelection(matchId);
     }
   }

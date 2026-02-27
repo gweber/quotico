@@ -45,3 +45,33 @@ export function scoreUnitLabel(sportKey: string): string {
 export function sportFlag(key: string): string {
   return SPORT_FLAGS[key] || "🏳️";
 }
+
+/** Country name → flag emoji mapping for league display. */
+const COUNTRY_FLAGS: Record<string, string> = {
+  Germany: "🇩🇪",
+  England: "🇬🇧",
+  Spain: "🇪🇸",
+  Italy: "🇮🇹",
+  France: "🇫🇷",
+  Netherlands: "🇳🇱",
+  Portugal: "🇵🇹",
+  Scotland: "🏴󠁧󠁢󠁳󠁣󠁴󠁿",
+  Austria: "🇦🇹",
+  Belgium: "🇧🇪",
+  Switzerland: "🇨🇭",
+  Turkey: "🇹🇷",
+  Denmark: "🇩🇰",
+  Norway: "🇳🇴",
+  Sweden: "🇸🇪",
+  Poland: "🇵🇱",
+  Croatia: "🇭🇷",
+  Russia: "🇷🇺",
+  Ukraine: "🇺🇦",
+  Europe: "🇪🇺",
+};
+
+/** Resolve a country name to its flag emoji, falling back to football. */
+export function countryFlag(country: string | undefined | null): string {
+  if (!country) return "⚽";
+  return COUNTRY_FLAGS[country] || "⚽";
+}

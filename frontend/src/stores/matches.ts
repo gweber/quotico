@@ -21,6 +21,9 @@ export interface MatchResult {
 export interface Match {
   id: string;
   sport_key: string;
+  league_id?: number;
+  league_name?: string;
+  league_country?: string;
   home_team: string;
   away_team: string;
   match_date: string;
@@ -97,8 +100,11 @@ export const useMatchesStore = defineStore("matches", () => {
     return {
       id,
       sport_key: "football",
-      home_team: `Team ${homeId || "?"}`,
-      away_team: `Team ${awayId || "?"}`,
+      league_id: typeof row?.league_id === "number" ? row.league_id : undefined,
+      league_name: typeof row?.league_name === "string" ? row.league_name : undefined,
+      league_country: typeof row?.league_country === "string" ? row.league_country : undefined,
+      home_team: String(row?.teams?.home?.name || `Team ${homeId || "?"}`),
+      away_team: String(row?.teams?.away?.name || `Team ${awayId || "?"}`),
       match_date: String(row?.start_at || ""),
       start_at: String(row?.start_at || ""),
       status: _statusFromV3(row?.status),

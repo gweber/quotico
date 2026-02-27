@@ -20,6 +20,8 @@ import {
 const props = defineProps<{
   homeTeam: string;
   awayTeam: string;
+  homeShortCode?: string | null;
+  awayShortCode?: string | null;
   homeSMId?: number;
   awaySMId?: number;
   context?: MatchContext | null;  // Pre-loaded data from parent (Matchday path)
@@ -174,9 +176,9 @@ function finishTypeLabel(ft: string | null | undefined): string | null {
       <template v-if="data?.h2h?.summary">
         <span>
           H2H:
-          <span class="text-text-secondary font-medium">{{ homeTeam }}</span>
+          <span class="text-text-secondary font-medium">{{ homeShortCode || homeTeam }}</span>
           {{ data.h2h.summary.home_wins }} – {{ data.h2h.summary.draws }} – {{ data.h2h.summary.away_wins }}
-          <span class="text-text-secondary font-medium">{{ awayTeam }}</span>
+          <span class="text-text-secondary font-medium">{{ awayShortCode || awayTeam }}</span>
         </span>
         <span class="ml-auto text-text-muted/60">
           {{ data.h2h.summary.total }} Spiele

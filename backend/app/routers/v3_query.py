@@ -47,6 +47,37 @@ _QUERY_CACHE: dict[str, tuple[Any, Any]] = {}
 _ANALYSIS_CACHE: dict[str, tuple[Any, Any]] = {}
 _JUSTICE_SERVICE = JusticeService()
 
+# In-memory league name cache: league_id → {name, country}
+_LEAGUE_NAME_CACHE: dict[int, dict[str, str]] = {}
+_LEAGUE_CACHE_TS: Any = None
+
+
+async def _get_league_names() -> dict[int, dict[str, str]]:
+    """Return cached league_id → {name, country} map, refreshing every 10 min."""
+    global _LEAGUE_NAME_CACHE, _LEAGUE_CACHE_TS
+    now = utcnow()
+    if _LEAGUE_CACHE_TS and (now - ensure_utc(_LEAGUE_CACHE_TS)).total_seconds() < 600:
+        return _LEAGUE_NAME_CACHE
+    rows = await _db.db.league_registry_v3.find(
+        {}, {"_id": 1, "name": 1, "country": 1}
+    ).to_list(length=500)
+    _LEAGUE_NAME_CACHE = {
+        int(r["_id"]): {"name": str(r.get("name") or ""), "country": str(r.get("country") or "")}
+        for r in rows if isinstance(r.get("_id"), int)
+    }
+    _LEAGUE_CACHE_TS = now
+    return _LEAGUE_NAME_CACHE
+
+
+def _enrich_with_league_names(rows: list[dict], league_map: dict[int, dict[str, str]]) -> list[dict]:
+    """Inject league_name and league_country into match documents."""
+    for row in rows:
+        lid = row.get("league_id")
+        if isinstance(lid, int) and lid in league_map:
+            row["league_name"] = league_map[lid]["name"]
+            row["league_country"] = league_map[lid]["country"]
+    return rows
+
 
 def _compute_justice(doc: dict) -> dict | None:
     """Compute justice metrics for a single match document.
@@ -141,6 +172,10 @@ def _base_query(
     return q
 
 
+_DEFAULT_LOOKBACK_DAYS = 7
+_DEFAULT_LOOKAHEAD_DAYS = 14
+
+
 @router.get("/matches", response_model=MatchesListResponse)
 async def list_matches_v3(
     status: str | None = Query(default=None),
@@ -151,14 +186,25 @@ async def list_matches_v3(
     offset: int = Query(default=0, ge=0),
 ) -> MatchesListResponse:
     statuses = [status] if status else []
+    # When no explicit filters: default to upcoming scheduled matches
+    # within a sensible window so the dashboard shows matches with odds.
+    has_explicit_filter = any(v is not None for v in (status, season_id, league_id, team_id))
+    if not has_explicit_filter and not statuses:
+        statuses = ["SCHEDULED"]
+    now = utcnow()
     q = _base_query(
         season_id=season_id,
         league_id=league_id,
         team_id=team_id,
         statuses=statuses,
+        date_from=now - timedelta(days=_DEFAULT_LOOKBACK_DAYS) if not has_explicit_filter else None,
+        date_to=now + timedelta(days=_DEFAULT_LOOKAHEAD_DAYS) if not has_explicit_filter else None,
     )
     total = await _db.db.matches_v3.count_documents(q)
-    rows = await _db.db.matches_v3.find(q).sort("start_at", -1).skip(offset).limit(limit).to_list(length=limit)
+    # Sort ascending (nearest kickoff first) so upcoming matches appear at top
+    rows = await _db.db.matches_v3.find(q).sort("start_at", 1).skip(offset).limit(limit).to_list(length=limit)
+    league_map = await _get_league_names()
+    _enrich_with_league_names(rows, league_map)
     items = [MatchV3Out.model_validate(row) for row in rows]
     return MatchesListResponse(items=items, meta=V3ListMeta(total=total, limit=limit, offset=offset))
 
@@ -168,6 +214,8 @@ async def get_match_v3(match_id: int) -> MatchV3Out:
     row = await _db.db.matches_v3.find_one({"_id": int(match_id)})
     if not isinstance(row, dict):
         raise HTTPException(status_code=404, detail="Match not found.")
+    league_map = await _get_league_names()
+    _enrich_with_league_names([row], league_map)
     return MatchV3Out.model_validate(row)
 
 

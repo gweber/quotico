@@ -1,12 +1,15 @@
 """
-Qbot Evolution Arena v2 — Genetic Algorithm for betting strategy optimization.
+tools/qbot_evolution_arena.py
 
-Evolves a population of strategy "bots" against ~45k backfilled tips to find
-optimal betting parameters (min_edge, confidence thresholds, signal weights,
-Kelly fraction, stake limits, venue bias, draw threshold, volatility buffer,
-H2H weight, Bayesian trust factor).
+Purpose:
+    Qbot Evolution Arena v3.2 for strategy DNA optimization on v3 data.
+    Extends legacy genes with justice/xG, referee, lineup, liquidity and
+    entropy-aware controls and evaluates bots via friction-adjusted fitness.
 
-Fitness = 0.5 * ROI + 0.3 * Weekly Sharpe - 0.2 * Max Drawdown%.
+Dependencies:
+    - backend/app/database.py (Mongo connection)
+    - backend/app/services/* (tip generation and reliability signals)
+    - numpy, pymongo
 
 Usage:
     python -m tools.qbot_evolution_arena                          # all leagues
@@ -60,6 +63,11 @@ DNA_GENES = [
     # New 6 (indices 7-12)
     "home_bias", "away_bias", "h2h_weight", "draw_threshold",
     "volatility_buffer", "bayes_trust_factor",
+    # v3.1 / v3.2 expansion
+    "xg_trust_factor", "luck_regression_weight", "ref_cards_sensitivity",
+    "var_buffer_pct", "rotation_penalty_weight", "early_signal_confidence",
+    "expected_roi_weight", "liquidity_priority_weight", "entropy_damping",
+    "complexity_penalty",
 ]
 
 # DNA_RANGES = {
@@ -94,6 +102,16 @@ DNA_RANGES = {
     "draw_threshold":     (0.1, 0.4),
     "volatility_buffer":  (0.02, 0.08),  # Kleinerer Puffer, damit er mutiger wird
     "bayes_trust_factor": (0.2, 1.0),
+    "xg_trust_factor": (0.0, 1.0),
+    "luck_regression_weight": (0.0, 1.5),
+    "ref_cards_sensitivity": (0.0, 1.5),
+    "var_buffer_pct": (0.0, 0.2),
+    "rotation_penalty_weight": (0.0, 1.5),
+    "early_signal_confidence": (0.5, 1.5),
+    "expected_roi_weight": (0.5, 2.0),
+    "liquidity_priority_weight": (0.0, 1.0),
+    "entropy_damping": (0.0, 2.0),
+    "complexity_penalty": (0.0, 0.5),
 }
 
 # GA parameters
@@ -101,9 +119,10 @@ MUTATION_RATE = 0.08       # 8% chance per gene
 MUTATION_SIGMA_PCT = 0.03  # Gaussian noise σ = 3% of gene range
 ELITE_FRACTION = 0.20      # Top 20% survive
 CROSSOVER_UNIFORM = True   # Uniform crossover
-FITNESS_WEIGHT_ROI = 0.5
-FITNESS_WEIGHT_SHARPE = 0.3
-FITNESS_WEIGHT_DRAWDOWN = 0.2  # penalty
+FITNESS_WEIGHT_FRICTION_ROI = 0.4
+FITNESS_WEIGHT_XROI = 0.3
+FITNESS_WEIGHT_CALIBRATION = 0.2
+FITNESS_WEIGHT_COMPLEXITY = 0.1
 MIN_BETS_FOR_FITNESS = 150  # was: 30, Minimum bets to evaluate a strategy
 MIN_TIPS_PER_LEAGUE = 200  # Minimum tips for per-league evolution
 DEFAULT_LOOKBACK_YEARS = 8
@@ -142,6 +161,12 @@ CHECKPOINT_INTERVAL = 5
 STAGNATION_THRESHOLD = 20
 RADIATION_MUTATION_RATE = 0.25
 WATCH_DEFAULT_INTERVAL = 6 * 3600  # 6 hours
+CALIBRATION_BINS = 10
+EPISTASIS_PAIRS = (
+    ("xg_trust_factor", "expected_roi_weight"),
+    ("rotation_penalty_weight", "early_signal_confidence"),
+    ("liquidity_priority_weight", "entropy_damping"),
+)
 
 # Shutdown flag for SIGINT
 _shutdown_requested = False
@@ -237,6 +262,16 @@ def vectorize_tips(
 
     # We need odds to compute Kelly stake and profit
     odds = np.zeros(n, dtype=np.float64)
+    # v3.1/v3.2 support arrays
+    xroi = np.zeros(n, dtype=np.float64)
+    luck_gap = np.zeros(n, dtype=np.float64)
+    ref_intensity = np.zeros(n, dtype=np.float64)
+    var_risk = np.zeros(n, dtype=np.float64)
+    lineup_delta = np.zeros(n, dtype=np.float64)
+    is_alpha = np.zeros(n, dtype=np.bool_)
+    liquidity_score = np.zeros(n, dtype=np.float64)
+    data_entropy = np.zeros(n, dtype=np.float64)
+    friction_bps = np.zeros(n, dtype=np.float64)
 
     for i, tip in enumerate(tips):
         edge_pct[i] = tip.get("edge_pct", 0.0)
@@ -304,6 +339,16 @@ def vectorize_tips(
         # Bayesian confidence from qbot_logic (nullable -> 0.333 prior)
         qbot = tip.get("qbot_logic") or {}
         bayes_conf[i] = qbot.get("bayesian_confidence", 0.333)
+        xroi[i] = float(qbot.get("xroi", qbot.get("expected_roi", edge_pct[i] / 100.0)) or 0.0)
+        luck_gap[i] = float(qbot.get("luck_factor", qbot.get("xp_gap", 0.0)) or 0.0)
+        ref_intensity[i] = float(qbot.get("ref_cards_index", 0.0) or 0.0)
+        var_risk[i] = float(qbot.get("var_risk", 0.0) or 0.0)
+        lineup_delta[i] = float(qbot.get("lineup_delta", 0.0) or 0.0)
+        stage = str(qbot.get("signal_stage", "")).lower()
+        is_alpha[i] = stage == "alpha"
+        liquidity_score[i] = float(qbot.get("liquidity_score", 0.5) or 0.5)
+        data_entropy[i] = float(qbot.get("data_entropy", qbot.get("market_entropy", 0.3)) or 0.3)
+        friction_bps[i] = float(qbot.get("friction_bps", 15.0) or 15.0)
 
     return {
         "edge_pct": edge_pct,
@@ -319,6 +364,15 @@ def vectorize_tips(
         "pick_type": pick_type,
         "h2h_weight": h2h_weight_tip,
         "bayes_conf": bayes_conf,
+        "xroi": xroi,
+        "luck_gap": luck_gap,
+        "ref_intensity": ref_intensity,
+        "var_risk": var_risk,
+        "lineup_delta": lineup_delta,
+        "is_alpha": is_alpha,
+        "liquidity_score": liquidity_score,
+        "data_entropy": data_entropy,
+        "friction_bps": friction_bps,
     }
 
 
@@ -337,7 +391,7 @@ def evaluate_population(
     """Evaluate fitness for all bots simultaneously.
 
     Args:
-        population: (P, 13) array of DNA parameters
+        population: (P, G) array of DNA parameters
         data: vectorized tip arrays of shape (N,)
 
     Returns:
@@ -360,6 +414,16 @@ def evaluate_population(
     draw_thresh = population[:, 10:11]
     vol_buffer  = population[:, 11:12]
     bayes_trust = population[:, 12:13]
+    xg_trust = population[:, 13:14]
+    luck_reg = population[:, 14:15]
+    ref_cards = population[:, 15:16]
+    var_buffer = population[:, 16:17]
+    rotation_penalty = population[:, 17:18]
+    early_signal_conf = population[:, 18:19]
+    xroi_weight = population[:, 19:20]
+    liquidity_priority = population[:, 20:21]
+    entropy_damping = population[:, 21:22]
+    complexity_gene = population[:, 22:23]
 
     # Tip arrays -> (1, N) for broadcasting
     edge    = data["edge_pct"][np.newaxis, :]
@@ -374,6 +438,15 @@ def evaluate_population(
     h2h_t   = data["h2h_weight"][np.newaxis, :]     # (1, N)
     bayes_c = data["bayes_conf"][np.newaxis, :]     # (1, N)
     t_weight = data["time_weight"][np.newaxis, :]   # (1, N)
+    xroi = data["xroi"][np.newaxis, :]
+    luck_gap = data["luck_gap"][np.newaxis, :]
+    ref_intensity = data["ref_intensity"][np.newaxis, :]
+    var_risk = data["var_risk"][np.newaxis, :]
+    lineup_delta = data["lineup_delta"][np.newaxis, :]
+    is_alpha = data["is_alpha"][np.newaxis, :]
+    liquidity = data["liquidity_score"][np.newaxis, :]
+    entropy = data["data_entropy"][np.newaxis, :]
+    friction_bps = data["friction_bps"][np.newaxis, :]
 
     # --- Confidence pipeline ---
     # 1. Base: signal-weighted boosts
@@ -393,6 +466,12 @@ def evaluate_population(
     blend_weight = np.clip(bayes_trust * 0.5, 0.0, 0.75)
     adj_conf = (1.0 - blend_weight) * adj_conf + blend_weight * bayes_c
 
+    # v3.1 adjustments
+    adj_conf = (1.0 - xg_trust) * adj_conf + xg_trust * np.clip(xroi + imp, 0.0, 0.99)
+    adj_conf = adj_conf + luck_reg * np.clip(luck_gap, -0.25, 0.25)
+    adj_conf = adj_conf - ref_cards * np.maximum(ref_intensity, 0.0) * 0.02
+    adj_conf = adj_conf - var_buffer * np.maximum(var_risk, 0.0)
+    adj_conf = np.where(is_alpha, adj_conf * early_signal_conf, adj_conf)
     adj_conf = np.clip(adj_conf, 0.0, 0.99)
 
     # --- Filter mask ---
@@ -402,6 +481,9 @@ def evaluate_population(
     # IMPORTANT: applied AFTER full confidence pipeline
     draw_gate = is_draw & (adj_conf < draw_thresh)
     mask = mask & ~draw_gate
+    # Rotation safety: higher lineup delta reduces activation.
+    rotation_gate = lineup_delta > np.maximum(0.1, 0.35 * np.maximum(rotation_penalty, 1e-6))
+    mask = mask & ~rotation_gate
 
     # --- Kelly with volatility buffer ---
     buffered_edge = adj_conf - imp - vol_buffer
@@ -412,58 +494,64 @@ def evaluate_population(
     safety_cap = MAX_STAKE_BANKROLL_FRACTION * 1000.0
     stake_cap = np.minimum(max_s, safety_cap)
     stake = np.minimum(kelly_raw, stake_cap)
+    # Liquidity-aware sizing: prioritize executable edges.
+    liquidity_scale = np.clip(liquidity + (1.0 - liquidity_priority), 0.20, 1.0)
+    stake = stake * liquidity_scale
+    # Entropy damping: Kelly decreases when uncertainty is high.
+    entropy_scale = 1.0 / (1.0 + np.maximum(entropy, 0.0) * np.maximum(entropy_damping, 0.0))
+    stake = stake * entropy_scale
 
     # Apply mask
     stake = stake * mask
 
     # Profit per bet
     profit = np.where(correct, stake * (odds - 1.0), -stake)
-    weighted_profit = profit * t_weight
+    friction_cost = stake * (friction_bps / 10_000.0)
+    profit_after_friction = profit - friction_cost
+    weighted_profit = profit_after_friction * t_weight
     weighted_stake = stake * t_weight
 
     # --- ROI per bot ---
     total_staked = weighted_stake.sum(axis=1)
     total_profit = weighted_profit.sum(axis=1)
-    roi = np.where(total_staked > 0, total_profit / total_staked, -1.0)
+    friction_roi = np.where(total_staked > 0, total_profit / total_staked, -1.0)
 
     # --- Bet count ---
     bet_count = mask.sum(axis=1)
 
-    # --- Max Drawdown per bot (vectorized) ---
-    cum_profit = np.cumsum(weighted_profit * mask, axis=1)
-    cum_max = np.maximum.accumulate(cum_profit, axis=1)
-    drawdown = cum_max - cum_profit
-    max_dd = drawdown.max(axis=1)
-    peak_equity = np.maximum(cum_max.max(axis=1), 1.0)
-    max_dd_pct = max_dd / peak_equity
+    # xROI quality on executed bets
+    weighted_xroi_num = (xroi * stake).sum(axis=1)
+    weighted_xroi_den = np.maximum(stake.sum(axis=1), 1e-9)
+    weighted_xroi = np.where(weighted_xroi_den > 0, weighted_xroi_num / weighted_xroi_den, -1.0)
 
-    # --- Weekly Sharpe Ratio ---
-    iso_weeks = data["iso_week"]
-    unique_weeks = np.unique(iso_weeks)
-    n_weeks = len(unique_weeks)
+    # Expected calibration error (ECE) on executed bets; lower is better.
+    ece = np.zeros(P, dtype=np.float64)
+    conf_flat = adj_conf
+    for b in range(CALIBRATION_BINS):
+        lo = b / CALIBRATION_BINS
+        hi = (b + 1) / CALIBRATION_BINS
+        in_bin = (conf_flat >= lo) & (conf_flat < hi) & mask
+        n_bin = in_bin.sum(axis=1).astype(np.float64)
+        conf_sum = (conf_flat * in_bin).sum(axis=1)
+        acc_sum = (correct.astype(np.float64) * in_bin).sum(axis=1)
+        avg_conf = np.where(n_bin > 0, conf_sum / np.maximum(n_bin, 1e-9), 0.0)
+        avg_acc = np.where(n_bin > 0, acc_sum / np.maximum(n_bin, 1e-9), 0.0)
+        weight = n_bin / np.maximum(mask.sum(axis=1), 1.0)
+        ece += weight * np.abs(avg_acc - avg_conf)
+    calibration_score = 1.0 - np.clip(ece, 0.0, 1.0)
 
-    sharpe = np.zeros(P, dtype=np.float64)
+    # DNA complexity penalty
+    dna_mean = population.mean(axis=1)
+    dna_std = population.std(axis=1)
+    dna_complexity = np.clip((dna_std / np.maximum(np.abs(dna_mean), 1e-6)) * 0.1 + complexity_gene[:, 0], 0.0, 2.0)
 
-    if n_weeks >= 4:
-        weekly_pnl = np.zeros((P, n_weeks), dtype=np.float64)
-        for w_idx, week in enumerate(unique_weeks):
-            week_mask = iso_weeks == week
-            weekly_pnl[:, w_idx] = weighted_profit[:, week_mask].sum(axis=1)
-
-        weekly_mean = weekly_pnl.mean(axis=1)
-        weekly_std = weekly_pnl.std(axis=1, ddof=1)
-
-        valid_std = weekly_std > 1e-6
-        sharpe = np.where(
-            valid_std,
-            weekly_mean / weekly_std * np.sqrt(52),
-            0.0,
-        )
-
-    # --- Combined fitness ---
-    fitness = (FITNESS_WEIGHT_ROI * roi
-               + FITNESS_WEIGHT_SHARPE * sharpe
-               - FITNESS_WEIGHT_DRAWDOWN * max_dd_pct)
+    # --- Combined fitness (v3.2) ---
+    fitness = (
+        FITNESS_WEIGHT_FRICTION_ROI * friction_roi
+        + FITNESS_WEIGHT_XROI * (weighted_xroi * xroi_weight[:, 0])
+        + FITNESS_WEIGHT_CALIBRATION * calibration_score
+        - FITNESS_WEIGHT_COMPLEXITY * dna_complexity
+    )
 
     # Soft penalty on sample size: discourage low bet count without hard-killing candidates
     sigmoid = 1.0 / (1.0 + np.exp(-penalty_k * (bet_count - min_bets_for_fitness)))
@@ -505,7 +593,18 @@ def crossover(parents: np.ndarray, n_children: int, rng: np.random.Generator) ->
         p1, p2 = rng.choice(n_parents, size=2, replace=False)
         # Uniform: each gene comes from either parent with 50% chance
         mask = rng.random(n_genes) < 0.5
-        children[i] = np.where(mask, parents[p1], parents[p2])
+        child = np.where(mask, parents[p1], parents[p2])
+        # Epistasis preservation: keep high-value gene pairs from one parent.
+        for left, right in EPISTASIS_PAIRS:
+            if left not in DNA_GENES or right not in DNA_GENES:
+                continue
+            if rng.random() < 0.35:
+                li = DNA_GENES.index(left)
+                ri = DNA_GENES.index(right)
+                src = p1 if rng.random() < 0.5 else p2
+                child[li] = parents[src, li]
+                child[ri] = parents[src, ri]
+        children[i] = child
 
     return children
 
@@ -514,18 +613,20 @@ def mutate(
     population: np.ndarray,
     rng: np.random.Generator,
     mutation_rate: float = MUTATION_RATE,
+    reliability_score: float = 0.5,
     dna_ranges: dict[str, tuple[float, float]] = DNA_RANGES,
 ) -> np.ndarray:
     """Gaussian mutation with clip to DNA_RANGES."""
     P, G = population.shape
     mutated = population.copy()
 
+    adaptive_rate = float(np.clip(mutation_rate * (1.25 - np.clip(reliability_score, 0.0, 1.0)), 0.02, 0.35))
     for j, gene in enumerate(DNA_GENES):
         lo, hi = dna_ranges[gene]
         gene_range = hi - lo
         sigma = MUTATION_SIGMA_PCT * gene_range
 
-        should_mutate = rng.random(P) < mutation_rate
+        should_mutate = rng.random(P) < adaptive_rate
         noise = rng.normal(0, sigma, size=P)
         mutated[:, j] = np.where(
             should_mutate,
@@ -1459,7 +1560,7 @@ async def run_evolution(
             for c in final_stage["pareto_top"]
         ],
         "optimization_notes": {
-            "schema_version": "v1",
+            "schema_version": "v3.1",
             "fitness_version": "soft_penalty_v1",
             "stress_version": "stress_rescue_v1",
             "stage_info": {
@@ -1545,6 +1646,14 @@ def _single_bot_pipeline(
     draw_thresh = dna[10] if len(dna) > 10 else 0.0
     vol_buffer = dna[11] if len(dna) > 11 else 0.0
     bayes_trust = dna[12] if len(dna) > 12 else 0.0
+    xg_trust = dna[13] if len(dna) > 13 else 0.0
+    luck_reg = dna[14] if len(dna) > 14 else 0.0
+    ref_cards = dna[15] if len(dna) > 15 else 0.0
+    var_buffer = dna[16] if len(dna) > 16 else 0.0
+    rotation_penalty = dna[17] if len(dna) > 17 else 0.0
+    early_signal_conf = dna[18] if len(dna) > 18 else 1.0
+    liquidity_priority = dna[20] if len(dna) > 20 else 0.5
+    entropy_damping = dna[21] if len(dna) > 21 else 0.0
 
     edge = data["edge_pct"]
     conf = data["confidence"]
@@ -1554,6 +1663,14 @@ def _single_bot_pipeline(
     pick = data["pick_type"]
     h2h_t = data["h2h_weight"]
     bayes_c = data["bayes_conf"]
+    xroi = data.get("xroi", np.zeros_like(conf))
+    luck_gap = data.get("luck_gap", np.zeros_like(conf))
+    ref_intensity = data.get("ref_intensity", np.zeros_like(conf))
+    var_risk = data.get("var_risk", np.zeros_like(conf))
+    lineup_delta = data.get("lineup_delta", np.zeros_like(conf))
+    is_alpha = data.get("is_alpha", np.zeros_like(conf, dtype=np.bool_))
+    liquidity = data.get("liquidity_score", np.full_like(conf, 0.5))
+    entropy = data.get("data_entropy", np.zeros_like(conf))
 
     adj_conf = conf + sharp_w * data["sharp_boost"] + momentum_w * data["momentum_boost"] + rest_w * data["rest_boost"]
 
@@ -1566,15 +1683,25 @@ def _single_bot_pipeline(
     adj_conf = adj_conf + h2h_w * h2h_t * 0.10
     blend_weight = np.clip(bayes_trust * 0.5, 0.0, 0.75)
     adj_conf = (1.0 - blend_weight) * adj_conf + blend_weight * bayes_c
+    adj_conf = (1.0 - xg_trust) * adj_conf + xg_trust * np.clip(xroi + imp, 0.0, 0.99)
+    adj_conf = adj_conf + luck_reg * np.clip(luck_gap, -0.25, 0.25)
+    adj_conf = adj_conf - ref_cards * np.maximum(ref_intensity, 0.0) * 0.02
+    adj_conf = adj_conf - var_buffer * np.maximum(var_risk, 0.0)
+    adj_conf = np.where(is_alpha, adj_conf * early_signal_conf, adj_conf)
     adj_conf = np.clip(adj_conf, 0.0, 0.99)
 
     mask = (edge >= min_edge) & (conf >= min_conf)
     draw_gate = is_draw & (adj_conf < draw_thresh)
     mask = mask & ~draw_gate
+    rotation_gate = lineup_delta > np.maximum(0.1, 0.35 * max(rotation_penalty, 1e-6))
+    mask = mask & ~rotation_gate
 
     buffered_edge = np.maximum(adj_conf - imp - vol_buffer, 0.0)
     denom = np.maximum(odds - 1.0, 0.01)
     kelly_frac = np.maximum(kelly_f * buffered_edge / denom, 0.0)
+    liquidity_scale = np.clip(liquidity + (1.0 - liquidity_priority), 0.20, 1.0)
+    entropy_scale = 1.0 / (1.0 + np.maximum(entropy, 0.0) * max(entropy_damping, 0.0))
+    kelly_frac = kelly_frac * liquidity_scale * entropy_scale
 
     stake = np.zeros_like(odds, dtype=np.float64)
     profit = np.zeros_like(odds, dtype=np.float64)
@@ -1613,6 +1740,23 @@ def _compute_detailed_metrics(dna: np.ndarray, data: dict[str, np.ndarray]) -> d
     wins = int((active & correct).sum())
 
     roi = total_profit / total_staked if total_staked > 0 else 0.0
+    xroi_vec = data.get("xroi", np.zeros_like(stake))
+    weighted_xroi = float((xroi_vec * stake).sum() / max(stake.sum(), 1e-9)) if stake.sum() > 0 else 0.0
+
+    conf_vec = np.clip(data["confidence"], 0.0, 0.999)
+    ece = 0.0
+    if total_bets > 0:
+        idx = active
+        for b in range(CALIBRATION_BINS):
+            lo = b / CALIBRATION_BINS
+            hi = (b + 1) / CALIBRATION_BINS
+            bmask = idx & (conf_vec >= lo) & (conf_vec < hi)
+            n_b = int(bmask.sum())
+            if n_b <= 0:
+                continue
+            acc = float(correct[bmask].mean())
+            cavg = float(conf_vec[bmask].mean())
+            ece += (n_b / max(total_bets, 1)) * abs(acc - cavg)
     win_rate = wins / total_bets if total_bets > 0 else 0.0
 
     bet_pnl = weighted_profit[active]
@@ -1637,6 +1781,9 @@ def _compute_detailed_metrics(dna: np.ndarray, data: dict[str, np.ndarray]) -> d
 
     return {
         "roi": float(roi),
+        "xroi": float(weighted_xroi),
+        "ece": float(ece),
+        "calibration_score": float(1.0 - min(max(ece, 0.0), 1.0)),
         "sharpe": float(sharpe),
         "win_rate": float(win_rate),
         "total_bets": total_bets,
@@ -1771,6 +1918,14 @@ def monte_carlo_bankroll(
     draw_thresh = bot_dna[10] if len(bot_dna) > 10 else 0.0
     vol_buffer = bot_dna[11] if len(bot_dna) > 11 else 0.0
     bayes_trust = bot_dna[12] if len(bot_dna) > 12 else 0.0
+    xg_trust = bot_dna[13] if len(bot_dna) > 13 else 0.0
+    luck_reg = bot_dna[14] if len(bot_dna) > 14 else 0.0
+    ref_cards = bot_dna[15] if len(bot_dna) > 15 else 0.0
+    var_buffer = bot_dna[16] if len(bot_dna) > 16 else 0.0
+    rotation_penalty = bot_dna[17] if len(bot_dna) > 17 else 0.0
+    early_signal_conf = bot_dna[18] if len(bot_dna) > 18 else 1.0
+    liquidity_priority = bot_dna[20] if len(bot_dna) > 20 else 0.5
+    entropy_damping = bot_dna[21] if len(bot_dna) > 21 else 0.0
 
     edge = tip_data["edge_pct"]
     conf = tip_data["confidence"]
@@ -1780,6 +1935,14 @@ def monte_carlo_bankroll(
     pick = tip_data["pick_type"]
     h2h_t = tip_data["h2h_weight"]
     bayes_c = tip_data["bayes_conf"]
+    xroi = tip_data.get("xroi", np.zeros_like(conf))
+    luck_gap = tip_data.get("luck_gap", np.zeros_like(conf))
+    ref_intensity = tip_data.get("ref_intensity", np.zeros_like(conf))
+    var_risk = tip_data.get("var_risk", np.zeros_like(conf))
+    lineup_delta = tip_data.get("lineup_delta", np.zeros_like(conf))
+    is_alpha = tip_data.get("is_alpha", np.zeros_like(conf, dtype=np.bool_))
+    liquidity = tip_data.get("liquidity_score", np.full_like(conf, 0.5))
+    entropy = tip_data.get("data_entropy", np.zeros_like(conf))
 
     adj_conf = conf + sharp_w * tip_data["sharp_boost"] + momentum_w * tip_data["momentum_boost"] + rest_w * tip_data["rest_boost"]
     is_home = pick == 0
@@ -1790,15 +1953,25 @@ def monte_carlo_bankroll(
     adj_conf = adj_conf + h2h_w * h2h_t * 0.10
     blend_weight = np.clip(bayes_trust * 0.5, 0.0, 0.75)
     adj_conf = (1.0 - blend_weight) * adj_conf + blend_weight * bayes_c
+    adj_conf = (1.0 - xg_trust) * adj_conf + xg_trust * np.clip(xroi + imp, 0.0, 0.99)
+    adj_conf = adj_conf + luck_reg * np.clip(luck_gap, -0.25, 0.25)
+    adj_conf = adj_conf - ref_cards * np.maximum(ref_intensity, 0.0) * 0.02
+    adj_conf = adj_conf - var_buffer * np.maximum(var_risk, 0.0)
+    adj_conf = np.where(is_alpha, adj_conf * early_signal_conf, adj_conf)
     adj_conf = np.clip(adj_conf, 0.0, 0.99)
 
     mask = (edge >= min_edge) & (conf >= min_conf)
     draw_gate = is_draw & (adj_conf < draw_thresh)
     mask = mask & ~draw_gate
+    rotation_gate = lineup_delta > np.maximum(0.1, 0.35 * max(rotation_penalty, 1e-6))
+    mask = mask & ~rotation_gate
 
     buffered_edge = np.maximum(adj_conf - imp - vol_buffer, 0.0)
     denom = np.maximum(odds - 1.0, 0.01)
     kelly_frac = np.maximum(kelly_f * buffered_edge / denom, 0.0)
+    liquidity_scale = np.clip(liquidity + (1.0 - liquidity_priority), 0.20, 1.0)
+    entropy_scale = 1.0 / (1.0 + np.maximum(entropy, 0.0) * max(entropy_damping, 0.0))
+    kelly_frac = kelly_frac * liquidity_scale * entropy_scale
 
     active_idx = np.where(mask)[0]
     n_bets = int(active_idx.size)
@@ -2356,7 +2529,7 @@ async def run_evolution_deep(
     }
 
     strategy_doc = {
-        "version": "v2",
+        "version": "v3",
         "mode": "deep",
         "sport_key": sport_key or "all",
         "generation": generations,
@@ -2397,6 +2570,7 @@ async def run_evolution_deep(
                 "start_date": _ensure_utc(final_val_tips[0]["match_date"]).isoformat() if final_val_tips else None,
                 "end_date": _ensure_utc(final_val_tips[-1]["match_date"]).isoformat() if final_val_tips else None,
             },
+            "schema_version": "v3.1",
         },
     }
 
