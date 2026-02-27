@@ -142,7 +142,7 @@ class OddsRepository:
             "$set": set_fields,
             "$inc": {"odds_meta.version": 1},
         }
-        result = await _db.db.matches.update_one(query, update_doc)
+        result = await _db.db.matches_v3.update_one(query, update_doc)
         if expected_version is not None and result.modified_count == 0:
             raise OddsMetaVersionConflict(f"CAS conflict for match_id={match_id}")
 
@@ -153,7 +153,7 @@ class OddsRepository:
         closing: dict[str, Any],
         updated_at: datetime,
     ) -> bool:
-        result = await _db.db.matches.update_one(
+        result = await _db.db.matches_v3.update_one(
             {
                 "_id": match_id,
                 f"odds_meta.markets.{market}.closing": {"$exists": False},

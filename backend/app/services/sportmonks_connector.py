@@ -9,6 +9,7 @@ Dependencies:
     - app.database
     - app.providers.sportmonks
     - app.config
+    - app.services.league_service
     - app.utils.utcnow
 """
 
@@ -16,10 +17,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import re
 import traceback
 from collections import defaultdict
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import Any
 
 from bson import ObjectId
@@ -28,6 +28,9 @@ from pymongo import UpdateOne
 import app.database as _db
 from app.config import settings
 from app.providers.sportmonks import sportmonks_provider
+from app.services.event_bus import event_bus
+from app.services.event_models import OddsRawIngestedEvent
+from app.services.league_service import _default_features, invalidate_navigation_cache
 from app.services.matchday_v3_cache_service import invalidate_matchday_list_cache_for_season
 from app.services.team_alias_normalizer import normalize_team_alias
 from app.utils import ensure_utc, parse_utc, utcnow
@@ -50,6 +53,8 @@ class SportmonksConnector:
         self._db = database
         self._remaining: int | None = None
         self._reset_at: int | None = None
+        self._last_logged_remaining: int | None = None
+        self._current_context_season_id: int | None = None
         self._request_windows: dict[str, dict[str, list[Any]]] = {}
 
     @property
@@ -82,31 +87,58 @@ class SportmonksConnector:
             return default
 
     @staticmethod
-    def _to_slug(value: Any) -> str:
-        raw = str(value or "").strip().lower()
-        slug = re.sub(r"[^a-z0-9]+", "_", raw).strip("_")
-        return slug
-
-    @staticmethod
     def _stamp_updated_fields(target: dict[str, Any], now=None) -> dict[str, Any]:
         ts = now or utcnow()
         target["updated_at"] = ts
         target["updated_at_utc"] = ts
         return target
 
-    def _extract_sport_key(self, row: dict[str, Any]) -> str | None:
-        sport = (row or {}).get("sport")
-        sport_name = self._first_non_empty((sport or {}).get("name"))
-        country_name = self._first_non_empty(((row or {}).get("country") or {}).get("name"))
-        league_name = self._first_non_empty((row or {}).get("name"))
-        if not sport_name or not country_name or not league_name:
-            return None
-        sport_slug = self._to_slug(sport_name)
-        country_slug = self._to_slug(country_name)
-        league_slug = self._to_slug(league_name)
-        if not sport_slug or not country_slug or not league_slug:
-            return None
-        return f"{sport_slug}_{country_slug}_{league_slug}"
+    async def _cache_raw_odds(
+        self,
+        *,
+        fixture_id: int,
+        raw_response: dict[str, Any],
+        source: str,
+    ) -> None:
+        """Write raw API odds response to odds_raw_v3 collection."""
+        if not settings.ODDS_V3_RAW_CACHE_ENABLED:
+            return
+        await self.db.odds_raw_v3.insert_one({
+            "fixture_id": int(fixture_id),
+            "fetched_at": utcnow(),
+            "source": str(source),
+            "raw_response": raw_response,
+            "transformed_at": None,
+        })
+
+    async def _publish_raw_odds_ingested(
+        self,
+        *,
+        fixture_ids: list[int],
+        source_method: str,
+    ) -> None:
+        """Publish odds.raw_ingested event after caching raw responses."""
+        if not settings.EVENT_BUS_ENABLED or not settings.ODDS_V3_RAW_CACHE_ENABLED:
+            return
+        ids = sorted({int(fid) for fid in (fixture_ids or [])})
+        if not ids:
+            return
+        try:
+            await event_bus.publish(
+                OddsRawIngestedEvent(
+                    source="sportmonks_connector",
+                    provider="sportmonks",
+                    fixture_ids=ids,
+                    source_method=str(source_method or ""),
+                    cached_count=len(ids),
+                )
+            )
+        except Exception:
+            logger.warning(
+                "Failed to publish odds.raw_ingested event for fixture_ids=%s",
+                ids,
+                exc_info=True,
+            )
 
     def _recompute_manual_check_fields(self, reasons: list[str] | None) -> dict[str, Any]:
         """Normalize reasons and derive manual_check_required from critical reasons."""
@@ -224,6 +256,7 @@ class SportmonksConnector:
         response = await sportmonks_provider.get_leagues_with_seasons_country()
         self._remaining = self._to_int(response.get("remaining"))
         self._reset_at = self._to_int(response.get("reset_at"))
+        await self._persist_rate_limit(source="get_available_leagues")
         rows = (response.get("payload") or {}).get("data") or []
         items: list[dict[str, Any]] = []
         for row in rows:
@@ -248,7 +281,7 @@ class SportmonksConnector:
             items.append(
                 {
                     "_id": league_id,
-                    "sport_key": self._extract_sport_key(row) or "",
+                    "league_id": league_id,
                     "name": self._norm_name((row or {}).get("name")),
                     "country": self._norm_name(country_node.get("name")),
                     "is_cup": bool((row or {}).get("is_cup", False)),
@@ -283,14 +316,34 @@ class SportmonksConnector:
                 continue
             existing = await self.db.league_registry_v3.find_one(
                 {"_id": lid},
-                {"available_seasons": 1, "sport_key": 1, "is_active": 1, "features": 1, "ui_order": 1},
+                {"available_seasons": 1, "league_id": 1, "is_active": 1, "features": 1, "ui_order": 1},
             )
             if not isinstance(existing, dict):
-                logger.warning("Discovery league rejected: missing runtime fields for _id=%s (not pre-provisioned).", lid)
-                rejected += 1
-                continue
-            if not isinstance(existing.get("sport_key"), str) or not str(existing.get("sport_key")).strip():
-                logger.warning("Discovery league rejected: missing sport_key for _id=%s.", lid)
+                # Auto-provision as inactive review document
+                new_doc: dict[str, Any] = {
+                    "_id": lid,
+                    "league_id": lid,
+                    "name": self._norm_name(item.get("name")) or f"Unknown League {lid}",
+                    "country": self._norm_name(item.get("country")),
+                    "is_cup": bool(item.get("is_cup", False)),
+                    "is_active": False,
+                    "features": _default_features(),
+                    "ui_order": 999,
+                    "available_seasons": [],
+                    "created_at": now,
+                    "updated_at": now,
+                    "updated_at_utc": now,
+                }
+                await self.db.league_registry_v3.insert_one(new_doc)
+                existing = new_doc
+                inserted += 1
+                logger.info("Discovery: auto-created review league _id=%s name=%r.", lid, new_doc["name"])
+            if not isinstance(existing.get("league_id"), int):
+                logger.warning(
+                    "Discovery league rejected: non-int league_id=%r for _id=%s.",
+                    existing.get("league_id"),
+                    lid,
+                )
                 rejected += 1
                 continue
             # Auto-provision missing runtime fields with safe defaults
@@ -327,6 +380,9 @@ class SportmonksConnector:
                 inserted += 1
             else:
                 updated += 1
+        if updated > 0 or inserted > 0:
+            # Keep public league navigation cache coherent for any caller of this service.
+            await invalidate_navigation_cache()
         return {"inserted": inserted, "updated": updated, "rejected": rejected}
 
     def _merge_seasons(self, existing: dict[str, Any] | None, incoming: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -345,6 +401,13 @@ class SportmonksConnector:
         return sorted(merged.values(), key=lambda x: int(x["id"]), reverse=True)
 
     async def ingest_season(self, season_id: int, *, job_id: ObjectId | None = None) -> dict[str, Any]:
+        self._current_context_season_id = int(season_id)
+        try:
+            return await self._ingest_season_inner(season_id, job_id=job_id)
+        finally:
+            self._current_context_season_id = None
+
+    async def _ingest_season_inner(self, season_id: int, *, job_id: ObjectId | None = None) -> dict[str, Any]:
         sync_odds = bool(settings.SPORTMONKS_DEEP_INGEST_SYNC_ODDS)
         max_runtime_minutes = int(settings.SPORTMONKS_MAX_RUNTIME_DEEP_MINUTES)
         timeout_at = utcnow() + timedelta(minutes=max_runtime_minutes)
@@ -365,6 +428,7 @@ class SportmonksConnector:
         rounds_response = await sportmonks_provider.get_season_rounds(int(season_id))
         self._remaining = self._to_int(rounds_response.get("remaining"))
         self._reset_at = self._to_int(rounds_response.get("reset_at"))
+        await self._persist_rate_limit(source="sync_season_deep")
         rounds = (rounds_response.get("payload") or {}).get("data") or []
         total_rounds = len(rounds)
         processed_rounds = 0
@@ -406,6 +470,7 @@ class SportmonksConnector:
                 )
                 self._remaining = self._to_int(fixtures_response.get("remaining"))
                 self._reset_at = self._to_int(fixtures_response.get("reset_at"))
+                await self._persist_rate_limit(source="sync_season_deep")
                 fixtures = (fixtures_response.get("payload") or {}).get("data") or []
                 for fixture in fixtures:
                     fixture_id = self._to_int((fixture or {}).get("id"))
@@ -498,6 +563,13 @@ class SportmonksConnector:
 
     async def run_metrics_sync(self, season_id: int, *, job_id: ObjectId | None = None) -> dict[str, int]:
         """Run dedicated metrics sync (bulk odds -> repair -> paginated xG) for a season."""
+        self._current_context_season_id = int(season_id)
+        try:
+            return await self._run_metrics_sync_inner(season_id, job_id=job_id)
+        finally:
+            self._current_context_season_id = None
+
+    async def _run_metrics_sync_inner(self, season_id: int, *, job_id: ObjectId | None = None) -> dict[str, int]:
         max_runtime_minutes = int(settings.SPORTMONKS_MAX_RUNTIME_METRICS_MINUTES)
         timeout_at = utcnow() + timedelta(minutes=max_runtime_minutes)
         await self._job_update(
@@ -522,6 +594,7 @@ class SportmonksConnector:
         rounds_response = await sportmonks_provider.get_season_rounds(int(season_id))
         self._remaining = self._to_int(rounds_response.get("remaining"))
         self._reset_at = self._to_int(rounds_response.get("reset_at"))
+        await self._persist_rate_limit(source="repair_broken_rounds")
         rounds = (rounds_response.get("payload") or {}).get("data") or []
         total_rounds = len(rounds)
 
@@ -648,7 +721,7 @@ class SportmonksConnector:
         season_id: int,
         job_id: ObjectId | None = None,
     ) -> dict[str, Any]:
-        """Bulk-sync odds summaries for one round from fixtures.odds include."""
+        """Bulk-fetch round fixtures and cache raw odds per fixture in odds_raw_v3."""
         await self._guard_before_external_call(
             job_id=job_id,
             phase="metrics_bulk_odds",
@@ -657,74 +730,45 @@ class SportmonksConnector:
         response = await sportmonks_provider.get_round_fixtures(int(round_id))
         self._remaining = self._to_int(response.get("remaining"))
         self._reset_at = self._to_int(response.get("reset_at"))
+        await self._persist_rate_limit(source="repair_broken_round_fixtures")
         fixtures = (response.get("payload") or {}).get("data") or []
-        repair_candidates: list[int] = []
         fixture_ids: list[int] = []
-        processed = 0
+        cached_count = 0
         for fixture in fixtures:
             fixture_id = self._to_int((fixture or {}).get("id"))
             if fixture_id is None:
                 continue
             fixture_ids.append(int(fixture_id))
+            odds_rows = (fixture or {}).get("odds") or []
             try:
-                odds_rows = (fixture or {}).get("odds") or []
-                summary, has_market_1 = self._build_1x2_summary_from_rows(odds_rows)
-                del odds_rows
-                now = utcnow()
-                update_fields: dict[str, Any] = self._stamp_updated_fields({}, now=now)
-                push_fields: dict[str, Any] = {}
-                if summary:
-                    update_fields["odds_meta.summary_1x2"] = summary
-                    update_fields["odds_meta.source"] = "sportmonks_round_bulk"
-                    update_fields["odds_meta.updated_at"] = now
-                    update_fields["odds_meta.updated_at_utc"] = now
-                    existing = await self.db.matches_v3.find_one(
-                        {"_id": int(fixture_id)},
-                        {"odds_timeline": 1, "start_at": 1, "odds_meta.fixed_snapshots": 1},
-                    )
-                    entropy = self._compute_market_entropy(summary, (existing or {}).get("odds_timeline"), now)
-                    update_fields["odds_meta.market_entropy"] = entropy
-                    if self._should_append_odds_timeline(existing, summary, now):
-                        push_fields["odds_timeline"] = {
-                            "$each": [self._build_timeline_entry(summary=summary, source="sportmonks_round_bulk", ts=now)],
-                        }
-                else:
-                    repair_candidates.append(int(fixture_id))
-                update_doc: dict[str, Any] = {"$set": update_fields}
-                if push_fields:
-                    update_doc["$push"] = push_fields
-                await self.db.matches_v3.update_one(
-                    {"_id": int(fixture_id), "season_id": int(season_id)},
-                    update_doc,
+                await self._cache_raw_odds(
+                    fixture_id=int(fixture_id),
+                    raw_response={"data": odds_rows},
+                    source="sportmonks_round_bulk",
                 )
-                # v3.2: try to lock fixed snapshot anchors
-                if summary:
-                    _start_at = (existing or {}).get("start_at")
-                    await self._try_set_fixed_snapshots(
-                        int(fixture_id), summary, now,
-                        start_at=ensure_utc(_start_at) if _start_at else None,
-                        existing_snapshots=((existing or {}).get("odds_meta") or {}).get("fixed_snapshots"),
-                    )
-                if not has_market_1:
-                    repair_candidates.append(int(fixture_id))
-                processed += 1
+                cached_count += 1
             except Exception as exc:
-                repair_candidates.append(int(fixture_id))
                 await self._append_job_error(
                     job_id=job_id,
                     round_id=int(round_id),
-                    message=f"bulk odds parse failed fixture={fixture_id}: {exc}",
+                    message=f"raw cache failed fixture={fixture_id}: {exc}",
                     trace=self._safe_trace(),
                 )
             try:
                 del fixture["odds"]
             except Exception:
                 pass
+        if fixture_ids:
+            await self._publish_raw_odds_ingested(
+                fixture_ids=fixture_ids,
+                source_method="sync_round",
+            )
         return {
             "bulk_calls": 1,
-            "fixtures_processed": processed,
-            "repair_candidates": sorted(set(repair_candidates)),
+            "fixtures_processed": len(fixture_ids),
+            "repair_candidates": [],
             "fixture_ids": fixture_ids,
+            "cached_count": cached_count,
         }
 
     async def sync_season_xg(self, season_id: int, *, job_id: ObjectId | None = None) -> dict[str, int]:
@@ -762,6 +806,7 @@ class SportmonksConnector:
             )
             self._remaining = self._to_int(page.get("remaining"))
             self._reset_at = self._to_int(page.get("reset_at"))
+            await self._persist_rate_limit(source="sync_expected_fixtures")
             payload = page.get("payload") or {}
             rows = payload.get("data") or []
             if not isinstance(rows, list) or not rows:
@@ -852,6 +897,121 @@ class SportmonksConnector:
             "watermark_row_id": high_water,
         }
 
+    async def preview_season_xg_resolve(self, season_id: int) -> dict[str, int]:
+        """Dry-run: full xG picture for a season — already resolved + what cache can still fill."""
+        finished_total = await self.db.matches_v3.count_documents(
+            {"season_id": int(season_id), "status": "FINISHED"},
+        )
+        already_resolved = await self.db.matches_v3.count_documents(
+            {"season_id": int(season_id), "status": "FINISHED", "has_advanced_stats": True},
+        )
+
+        # Check remaining unresolved matches against xg_raw cache
+        season_fixtures: dict[int, dict[str, int | None]] = {}
+        async for doc in self.db.matches_v3.find(
+            {"season_id": int(season_id), "has_advanced_stats": {"$ne": True}, "status": "FINISHED"},
+            {"_id": 1, "teams.home.sm_id": 1, "teams.away.sm_id": 1},
+        ):
+            fid = self._to_int((doc or {}).get("_id"))
+            if fid is None:
+                continue
+            teams = (doc.get("teams") or {}) if isinstance(doc.get("teams"), dict) else {}
+            season_fixtures[int(fid)] = {
+                "home_sm_id": self._to_int(((teams.get("home") or {}).get("sm_id")) if isinstance(teams.get("home"), dict) else None),
+                "away_sm_id": self._to_int(((teams.get("away") or {}).get("sm_id")) if isinstance(teams.get("away"), dict) else None),
+            }
+
+        resolvable = 0
+        partial = 0
+        no_cache = 0
+        for fid, team_lookup in season_fixtures.items():
+            xg_rows = await self.db.xg_raw.find(
+                {"fixture_id": int(fid), "type_id": 5304},
+            ).to_list(length=10)
+            if not xg_rows:
+                no_cache += 1
+                continue
+            home_id = team_lookup.get("home_sm_id")
+            away_id = team_lookup.get("away_sm_id")
+            home_xg: float | None = None
+            away_xg: float | None = None
+            for row in xg_rows:
+                location = str((row or {}).get("location") or "").strip().lower()
+                participant_id = self._to_int((row or {}).get("participant_id"))
+                value_raw = (row or {}).get("value")
+                if value_raw is None:
+                    value_raw = ((row or {}).get("data") or {}).get("value") if isinstance((row or {}).get("data"), dict) else None
+                try:
+                    value = float(value_raw)
+                except (TypeError, ValueError):
+                    continue
+                if location == "home":
+                    home_xg = value
+                elif location == "away":
+                    away_xg = value
+                elif participant_id is not None and participant_id == home_id:
+                    home_xg = value
+                elif participant_id is not None and participant_id == away_id:
+                    away_xg = value
+            if home_xg is not None and away_xg is not None:
+                resolvable += 1
+            elif home_xg is not None or away_xg is not None:
+                partial += 1
+            else:
+                no_cache += 1
+
+        return {
+            "season_id": int(season_id),
+            "finished_total": int(finished_total),
+            "already_resolved": int(already_resolved),
+            "missing": len(season_fixtures),
+            "resolvable": resolvable,
+            "partial": partial,
+            "no_cache": no_cache,
+        }
+
+    async def resolve_season_xg_from_cache(
+        self, season_id: int, *, job_id: ObjectId | None = None,
+    ) -> dict[str, int]:
+        """Resolve xg_raw cache → matches_v3 for a season (no API calls)."""
+        season_fixtures: dict[int, dict[str, int | None]] = {}
+        async for doc in self.db.matches_v3.find(
+            {"season_id": int(season_id), "has_advanced_stats": {"$ne": True}, "status": "FINISHED"},
+            {"_id": 1, "teams.home.sm_id": 1, "teams.away.sm_id": 1},
+        ):
+            fid = self._to_int((doc or {}).get("_id"))
+            if fid is None:
+                continue
+            teams = (doc.get("teams") or {}) if isinstance(doc.get("teams"), dict) else {}
+            season_fixtures[int(fid)] = {
+                "home_sm_id": self._to_int(((teams.get("home") or {}).get("sm_id")) if isinstance(teams.get("home"), dict) else None),
+                "away_sm_id": self._to_int(((teams.get("away") or {}).get("sm_id")) if isinstance(teams.get("away"), dict) else None),
+            }
+
+        matches_synced = 0
+        partial_warnings = 0
+        for fid, team_lookup in season_fixtures.items():
+            xg_rows = await self.db.xg_raw.find(
+                {"fixture_id": int(fid), "type_id": 5304},
+            ).to_list(length=10)
+            if not xg_rows:
+                continue
+            synced, partial = await self._write_fixture_xg(
+                fixture_id=fid,
+                xg_rows=xg_rows,
+                team_lookup=team_lookup,
+                job_id=job_id,
+                season_id=season_id,
+            )
+            matches_synced += synced
+            partial_warnings += partial
+
+        return {
+            "fixtures_seen": len(season_fixtures),
+            "matches_synced": matches_synced,
+            "partial_warnings": partial_warnings,
+        }
+
     async def _write_fixture_xg(
         self,
         *,
@@ -925,7 +1085,7 @@ class SportmonksConnector:
         job_id: ObjectId | None = None,
         phase: str = "metrics_repair",
     ) -> bool:
-        """Store compact 1X2 odds snapshot in matches_v3.odds_meta."""
+        """Fetch fixture odds from Sportmonks and cache raw response in odds_raw_v3."""
         await self._guard_before_external_call(
             job_id=job_id,
             phase=phase,
@@ -934,231 +1094,21 @@ class SportmonksConnector:
         response = await sportmonks_provider.get_prematch_odds_by_fixture(int(fixture_id))
         self._remaining = self._to_int(response.get("remaining"))
         self._reset_at = self._to_int(response.get("reset_at"))
-        rows = (response.get("payload") or {}).get("data") or []
+        await self._persist_rate_limit(source="sync_prematch_odds")
+        payload = response.get("payload") or {}
+        rows = payload.get("data") or []
         if not isinstance(rows, list) or not rows:
             return False
-
-        summary, _ = self._build_1x2_summary_from_rows(rows)
-        del rows
-        if not summary:
-            return False
-
-        now = utcnow()
-        existing = await self.db.matches_v3.find_one(
-            {"_id": int(fixture_id)},
-            {"odds_timeline": 1, "start_at": 1, "odds_meta.fixed_snapshots": 1},
+        await self._cache_raw_odds(
+            fixture_id=int(fixture_id),
+            raw_response=payload,
+            source=str(source or "sportmonks_pre_match"),
         )
-        entropy = self._compute_market_entropy(summary, (existing or {}).get("odds_timeline"), now)
-        update_doc: dict[str, Any] = {
-            "$set": {
-                "odds_meta.summary_1x2": summary,
-                "odds_meta.source": source,
-                "odds_meta.updated_at": now,
-                "odds_meta.updated_at_utc": now,
-                "odds_meta.market_entropy": entropy,
-                "updated_at": now,
-                "updated_at_utc": now,
-            }
-        }
-        timeline_entry = None
-        if self._should_append_odds_timeline(existing, summary, now):
-            timeline_entry = self._build_timeline_entry(summary=summary, source=source, ts=now)
-        clear_reasons: list[str] = []
-        if self._summary_has_valid_odds(summary):
-            clear_reasons.append("finished_without_odds")
-        await self._apply_match_manual_check_update(
-            int(fixture_id),
-            set_fields=update_doc["$set"],
-            clear_reasons=clear_reasons,
-            timeline_entry=timeline_entry,
-        )
-        # v3.2: try to lock fixed snapshot anchors
-        _start_at = (existing or {}).get("start_at")
-        await self._try_set_fixed_snapshots(
-            int(fixture_id), summary, now,
-            start_at=ensure_utc(_start_at) if _start_at else None,
-            existing_snapshots=((existing or {}).get("odds_meta") or {}).get("fixed_snapshots"),
+        await self._publish_raw_odds_ingested(
+            fixture_ids=[int(fixture_id)],
+            source_method="sync_fixture",
         )
         return True
-
-    def _build_timeline_entry(
-        self,
-        *,
-        summary: dict[str, dict[str, float | int]],
-        source: str,
-        ts,
-    ) -> dict[str, Any]:
-        return {
-            "timestamp": ts,
-            "home": float(((summary.get("home") or {}).get("avg"))),
-            "draw": float(((summary.get("draw") or {}).get("avg"))),
-            "away": float(((summary.get("away") or {}).get("avg"))),
-            "source": str(source or ""),
-        }
-
-    # ------------------------------------------------------------------
-    # v3.2: Fixed snapshots & market entropy
-    # ------------------------------------------------------------------
-
-    def _build_fixed_snapshot(
-        self,
-        summary: dict[str, dict[str, float | int]],
-        ts,
-    ) -> dict[str, Any] | None:
-        """Build a compact {h, d, a, ts_utc} snapshot from a 1x2 summary."""
-        try:
-            return {
-                "h": float(((summary.get("home") or {}).get("avg"))),
-                "d": float(((summary.get("draw") or {}).get("avg"))),
-                "a": float(((summary.get("away") or {}).get("avg"))),
-                "ts_utc": ts,
-            }
-        except (TypeError, ValueError):
-            return None
-
-    def _compute_market_entropy(
-        self,
-        summary: dict[str, dict[str, float | int]],
-        timeline: list[dict[str, Any]] | None,
-        now,
-    ) -> dict[str, float]:
-        """Compute mutable market-entropy metrics from summary + timeline."""
-        # --- current_spread_pct: avg of per-outcome (max-min)/avg ---
-        spreads: list[float] = []
-        for label in ("home", "draw", "away"):
-            node = summary.get(label)
-            if not isinstance(node, dict):
-                continue
-            mn = self._to_float(node.get("min"))
-            mx = self._to_float(node.get("max"))
-            avg = self._to_float(node.get("avg"))
-            if mn is not None and mx is not None and avg is not None:
-                spreads.append((mx - mn) / max(avg, 0.01))
-        current_spread_pct = round(sum(spreads) / max(len(spreads), 1), 6)
-
-        # --- drift_velocity_3h: max abs change / hour across outcomes ---
-        drift_velocity_3h = 0.0
-        if isinstance(timeline, list) and len(timeline) >= 2:
-            cutoff = now - timedelta(hours=3)
-            recent = [
-                e for e in timeline
-                if isinstance(e, dict) and e.get("timestamp") is not None
-                and ensure_utc(e["timestamp"]) >= cutoff
-            ]
-            if len(recent) >= 2:
-                first, last = recent[0], recent[-1]
-                try:
-                    hours_elapsed = max(
-                        (ensure_utc(last["timestamp"]) - ensure_utc(first["timestamp"])).total_seconds() / 3600.0,
-                        0.083,  # floor ~5 min to prevent velocity explosion
-                    )
-                    max_delta = max(
-                        abs(float(last.get("home", 0)) - float(first.get("home", 0))),
-                        abs(float(last.get("draw", 0)) - float(first.get("draw", 0))),
-                        abs(float(last.get("away", 0)) - float(first.get("away", 0))),
-                    )
-                    drift_velocity_3h = round(max_delta / hours_elapsed, 6)
-                except (TypeError, ValueError, KeyError):
-                    pass
-
-        return {
-            "current_spread_pct": current_spread_pct,
-            "drift_velocity_3h": drift_velocity_3h,
-        }
-
-    _FIXED_SNAPSHOT_WINDOWS: list[tuple[str, float, float]] = [
-        # (slot_name, hours_min, hours_max)
-        ("alpha_24h", 23.0, 25.0),
-        ("beta_6h", 5.0, 7.0),
-        ("omega_1h", 0.75, 1.25),
-    ]
-
-    async def _try_set_fixed_snapshots(
-        self,
-        fixture_id: int,
-        summary: dict[str, dict[str, float | int]],
-        now,
-        start_at,
-        existing_snapshots: dict[str, Any] | None,
-    ) -> None:
-        """Atomically write immutable fixed_snapshot slots + schema_version (write-once)."""
-        snap = self._build_fixed_snapshot(summary, now)
-        if snap is None:
-            return
-        existing = existing_snapshots or {}
-
-        # Collect slots to write
-        slots: dict[str, dict[str, Any]] = {}
-
-        # Opening: first time we ever get valid odds
-        if not existing.get("opening"):
-            slots["opening"] = snap
-
-        # Time-window anchors (only if start_at is known)
-        if start_at is not None:
-            try:
-                hours_until = (ensure_utc(start_at) - now).total_seconds() / 3600.0
-            except Exception:
-                hours_until = None
-            if hours_until is not None:
-                for slot_name, h_min, h_max in self._FIXED_SNAPSHOT_WINDOWS:
-                    if h_min <= hours_until <= h_max and not existing.get(slot_name):
-                        slots[slot_name] = snap
-
-        if not slots:
-            return
-
-        # Write each slot atomically (write-once via $exists filter)
-        for slot_name, slot_snap in slots.items():
-            try:
-                await self.db.matches_v3.update_one(
-                    {
-                        "_id": int(fixture_id),
-                        f"odds_meta.fixed_snapshots.{slot_name}": {"$exists": False},
-                    },
-                    {"$set": {
-                        f"odds_meta.fixed_snapshots.{slot_name}": slot_snap,
-                        "schema_version": "v3.2.0",
-                    }},
-                )
-            except Exception:
-                logger.debug("Fixed snapshot write-once failed for %s on fixture %d", slot_name, fixture_id)
-
-    def _should_append_odds_timeline(
-        self,
-        existing: dict[str, Any] | None,
-        summary: dict[str, dict[str, float | int]],
-        now,
-    ) -> bool:
-        try:
-            home = float(((summary.get("home") or {}).get("avg")))
-            draw = float(((summary.get("draw") or {}).get("avg")))
-            away = float(((summary.get("away") or {}).get("avg")))
-        except (TypeError, ValueError):
-            return False
-        timeline = (existing or {}).get("odds_timeline") if isinstance(existing, dict) else None
-        if not isinstance(timeline, list) or not timeline:
-            return True
-        last = timeline[-1] if isinstance(timeline[-1], dict) else {}
-        last_ts = last.get("timestamp")
-        last_home = self._to_float(last.get("home"))
-        last_draw = self._to_float(last.get("draw"))
-        last_away = self._to_float(last.get("away"))
-        min_delta = float(settings.SPORTMONKS_ODDS_TIMELINE_MIN_DELTA)
-        time_gate = timedelta(minutes=int(settings.SPORTMONKS_ODDS_TIMELINE_MINUTES))
-        if last_ts is not None:
-            try:
-                if now - ensure_utc(last_ts) >= time_gate:
-                    return True
-            except Exception:
-                return True
-        if last_home is None or last_draw is None or last_away is None:
-            return True
-        return (
-            abs(home - last_home) >= min_delta
-            or abs(draw - last_draw) >= min_delta
-            or abs(away - last_away) >= min_delta
-        )
 
     @staticmethod
     def _to_float(value: Any) -> float | None:
@@ -1169,61 +1119,9 @@ class SportmonksConnector:
         except (TypeError, ValueError):
             return None
 
-
-    def _build_1x2_summary_from_rows(
-        self,
-        rows: list[dict[str, Any]] | Any,
-    ) -> tuple[dict[str, dict[str, float | int]], bool]:
-        buckets: dict[str, list[tuple[float, float | None]]] = {"home": [], "draw": [], "away": []}
-        has_market_1 = False
-        for row in rows if isinstance(rows, list) else []:
-            if self._to_int((row or {}).get("market_id")) != 1:
-                continue
-            has_market_1 = True
-            label = str((row or {}).get("label") or "").strip().lower()
-            if label not in buckets:
-                continue
-            try:
-                odd = float((row or {}).get("value"))
-            except (TypeError, ValueError):
-                continue
-            probability_raw = str((row or {}).get("probability") or "").replace("%", "").strip()
-            try:
-                prob = float(probability_raw) / 100.0
-            except (TypeError, ValueError):
-                prob = None
-            buckets[label].append((odd, prob))
-
-        summary: dict[str, dict[str, float | int]] = {}
-        for label in ("home", "draw", "away"):
-            values = buckets[label]
-            if not values:
-                continue
-            odds_only = [v[0] for v in values]
-            prob_sum = sum(v[1] for v in values if isinstance(v[1], float) and v[1] > 0)
-            if prob_sum > 0:
-                weighted_avg = sum(v[0] * (v[1] or 0.0) for v in values if isinstance(v[1], float) and v[1] > 0) / prob_sum
-            else:
-                weighted_avg = sum(odds_only) / float(len(odds_only))
-            summary[label] = {
-                "min": round(min(odds_only), 4),
-                "max": round(max(odds_only), 4),
-                "avg": round(weighted_avg, 4),
-                "count": len(values),
-            }
-        return summary, has_market_1
-
-    def _summary_has_valid_odds(self, summary: dict[str, dict[str, float | int]]) -> bool:
-        for label in ("home", "draw", "away"):
-            node = summary.get(label)
-            if not isinstance(node, dict):
-                return False
-            value = self._to_float(node.get("avg"))
-            if value is None or value <= 1.0:
-                return False
-        return True
-
     def needs_odds_repair(self, match_doc: dict[str, Any], *, force_missing_market: bool = False) -> bool:
+        # FIXME: ODDS_V3_BREAK — reads legacy odds_meta.updated_at_utc which is
+        # no longer written by the connector. Phase 2 should check odds_raw_v3 directly.
         if force_missing_market:
             return True
         odds_meta = (match_doc.get("odds_meta") or {}) if isinstance(match_doc.get("odds_meta"), dict) else {}
@@ -1702,7 +1600,7 @@ class SportmonksConnector:
                     "name": str(name or "").strip(),
                     "normalized": normalized,
                     "source": "provider_unknown",
-                    "sport_key": None,
+                    "league_id": None,
                     "alias_key": f"{normalized}|*|provider_unknown",
                     "is_default": True,
                     "created_at": utcnow(),
@@ -1894,8 +1792,12 @@ class SportmonksConnector:
             reasons_set = {str(value).strip() for value in reasons if str(value).strip()}
             changed = False
             has_valid_xg = bool((doc or {}).get("has_advanced_stats") is True)
+            # FIXME: ODDS_V3_BREAK — reads legacy odds_meta.summary_1x2 (stale data)
             odds_summary = (((doc or {}).get("odds_meta") or {}).get("summary_1x2") or {})
-            has_valid_odds = self._summary_has_valid_odds(odds_summary if isinstance(odds_summary, dict) else {})
+            has_valid_odds = all(
+                isinstance(odds_summary.get(lbl), dict) and (self._to_float((odds_summary.get(lbl) or {}).get("avg")) or 0) > 1.0
+                for lbl in ("home", "draw", "away")
+            )
             if "finished_without_xg" in reasons_set and has_valid_xg:
                 reasons_set.discard("finished_without_xg")
                 healed_xg += 1
@@ -1964,6 +1866,39 @@ class SportmonksConnector:
         payload["updated_at"] = now
         payload["updated_at_utc"] = now
         await self.db.admin_import_jobs.update_one({"_id": job_id}, {"$set": payload})
+
+    async def _persist_rate_limit(self, *, source: str = "") -> None:
+        """Write current rate-limit state to global meta document and log consumption."""
+        if self._remaining is None:
+            return
+        now = utcnow()
+        payload: dict[str, Any] = {
+            "remaining": self._remaining,
+            "reset_at": self._reset_at,
+            "updated_at": now,
+            "updated_at_utc": now,
+        }
+        if source:
+            payload["last_request_type"] = source
+        await self.db.meta.update_one(
+            {"_id": "sportmonks_rate_limit_state"},
+            {"$set": payload},
+            upsert=True,
+        )
+        # Delta-tracking: only log when credits were actually consumed
+        prev = self._last_logged_remaining
+        curr = self._remaining
+        if prev is not None and curr is not None and curr < prev:
+            doc: dict[str, Any] = {
+                "ts": now,
+                "module": source or "unknown",
+                "credits_consumed": prev - curr,
+                "remaining_after": curr,
+            }
+            if self._current_context_season_id is not None:
+                doc["season_id"] = self._current_context_season_id
+            await self.db.stats_api_usage.insert_one(doc)
+        self._last_logged_remaining = curr
 
     async def _append_job_error(
         self,

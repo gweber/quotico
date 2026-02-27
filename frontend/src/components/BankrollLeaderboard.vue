@@ -4,7 +4,7 @@ import { useApi } from "@/composables/useApi";
 
 const props = defineProps<{
   squadId: string;
-  sportKey: string;
+  leagueId: number;
   season?: number;
 }>();
 
@@ -27,7 +27,7 @@ onMounted(async () => {
   try {
     // Use matchday leaderboard endpoint with bankroll context
     const params: Record<string, string> = {
-      sport: props.sportKey,
+      league_id: String(props.leagueId),
       mode: "bankroll",
     };
     if (props.season) params.season = String(props.season);

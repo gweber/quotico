@@ -27,8 +27,7 @@ logger = logging.getLogger("quotico.qbot_intelligence")
 PRIOR_WIN_RATE = 0.333   # 3-way baseline (same as reliability_service)
 PRIOR_STRENGTH = 10      # Lower than reliability's 20 — clusters have less data
 
-# Cluster dimensions: each tip is binned along these axes
-# Results in keys like "soccer_epl|sharp|high|strong"
+# Cluster dimensions: each tip is binned along these axes.
 
 EDGE_BAND_HIGH = 10.0
 EDGE_BAND_MID = 5.0
@@ -54,18 +53,6 @@ _DNA_GENES = [
     "home_bias", "away_bias", "h2h_weight", "draw_threshold",
     "volatility_buffer", "bayes_trust_factor",
 ]
-
-# League display names for reasoning params
-LEAGUE_DISPLAY = {
-    "soccer_germany_bundesliga": "Bundesliga",
-    "soccer_germany_bundesliga2": "2. Bundesliga",
-    "soccer_epl": "Premier League",
-    "soccer_spain_la_liga": "La Liga",
-    "soccer_italy_serie_a": "Serie A",
-    "soccer_france_ligue_one": "Ligue 1",
-    "soccer_netherlands_eredivisie": "Eredivisie",
-    "soccer_portugal_primeira_liga": "Primeira Liga",
-}
 
 # Qbot Intelligence 2.0 constants
 CLUSTER_VERSION = 2
@@ -310,9 +297,9 @@ def _extract_market_context(match: dict | None, pick: str) -> dict:
 def compute_cluster_key(tip: dict, market_ctx: dict | None = None) -> str:
     """Compute the signal cluster key for a tip document.
     
-    v3 format: {sport_key}|{sharp_dim}|{edge_dim}|{momentum_dim}|{volatility_dim}|{temporal_dim}
+    v3 format: {league_id}|{sharp_dim}|{edge_dim}|{momentum_dim}|{volatility_dim}|{temporal_dim}
     """
-    sport_key = tip.get("sport_key", "unknown")
+    league_id = tip.get("league_id", "unknown")
     signals = tip.get("tier_signals", {})
 
     # Sharp dimension
@@ -343,7 +330,7 @@ def compute_cluster_key(tip: dict, market_ctx: dict | None = None) -> str:
     if market_ctx:
         temporal_dim = market_ctx.get("temporal_dim", "day")
 
-    return f"{sport_key}|{sharp_dim}|{edge_dim}|{momentum_dim}|{volatility_dim}|{temporal_dim}"
+    return f"{league_id}|{sharp_dim}|{edge_dim}|{momentum_dim}|{volatility_dim}|{temporal_dim}"
 
 
 def _lookup_cluster_with_fallback(
@@ -351,7 +338,7 @@ def _lookup_cluster_with_fallback(
 ) -> tuple[float, int, str]:
     """Look up Bayesian confidence with hierarchical fallback.
     
-    v3 cluster key format: {sport}|{sharp}|{edge}|{momentum}|{volatility}|{temporal}
+    v3 cluster key format: {league_id}|{sharp}|{edge}|{momentum}|{volatility}|{temporal}
     
     Fallback hierarchy:
     1. Try full 6-dim key
@@ -411,7 +398,7 @@ def _lookup_cluster_with_fallback(
 # Strategy + cluster cache (in-memory, 1h TTL)
 # ---------------------------------------------------------------------------
 
-_strategy_cache: dict[str, dict] = {}   # keyed by sport_key
+_strategy_cache: dict[str, dict] = {}   # keyed by league_id token (int-as-string or "none")
 _strategy_expires: float = 0.0
 
 _cluster_cache: dict[str, dict] = {}
@@ -420,8 +407,8 @@ _cluster_expires: float = 0.0
 _CACHE_TTL = 3600  # 1 hour
 
 
-async def _get_active_strategy(sport_key: str = "all") -> dict | None:
-    """Load the active evolved strategy from DB (cached per sport_key)."""
+async def _get_active_strategy(league_id: int | None = None) -> dict | None:
+    """Load the active evolved strategy from DB (cached per league_id)."""
     global _strategy_cache, _strategy_expires
 
     now = _time.time()
@@ -432,15 +419,17 @@ async def _get_active_strategy(sport_key: str = "all") -> dict | None:
             ).sort("created_at", -1).to_list(100)
             _strategy_cache = {}
             for doc in docs:
-                sk = doc.get("sport_key", "all")
-                if sk not in _strategy_cache:  # first = most recent
-                    _strategy_cache[sk] = doc
+                doc_league_id = doc.get("league_id")
+                key = str(doc_league_id) if isinstance(doc_league_id, int) else "none"
+                if key not in _strategy_cache:  # first = most recent
+                    _strategy_cache[key] = doc
         except Exception:
             logger.warning("Failed to load qbot_strategies", exc_info=True)
         _strategy_expires = now + _CACHE_TTL
 
-    # Sport-specific first, fallback to "all"
-    return _strategy_cache.get(sport_key) or _strategy_cache.get("all")
+    # League-specific first, fallback to global strategy.
+    league_key = str(league_id) if isinstance(league_id, int) else "none"
+    return _strategy_cache.get(league_key) or _strategy_cache.get("none")
 
 
 async def _get_cluster_stats() -> dict[str, dict]:
@@ -945,8 +934,8 @@ def _build_decision_trace(
 
     strategy_id = strategy.get("_id")
     strategy_id_str = str(strategy_id) if strategy_id is not None else None
-    strategy_sport = strategy.get("sport_key", "all")
-    source = "sport_key" if strategy_sport == tip.get("sport_key") else "fallback_all"
+    strategy_league_id = strategy.get("league_id")
+    source = "league_id" if strategy_league_id == tip.get("league_id") else "fallback_global"
 
     return {
         "version": 1,
@@ -962,10 +951,10 @@ def _build_decision_trace(
         "stage_2_dna_match": {
             "matched": True,
             "strategy_id": strategy_id_str,
-            "strategy_label": f"{strategy_sport} {strategy.get('version', 'v1')} - {stage_label}",
+            "strategy_label": f"{strategy_league_id} {strategy.get('version', 'v1')} - {stage_label}",
             "strategy_version": strategy.get("version", "v1"),
             "strategy_generation": strategy.get("generation", 0),
-            "strategy_sport_key": strategy_sport,
+            "strategy_league_id": strategy_league_id,
             "strategy_state": "active" if strategy.get("is_active", False) else ("shadow" if strategy.get("is_shadow", False) else "inactive"),
             "source": source,
             "stage_used": stage_used,
@@ -1036,8 +1025,8 @@ async def enrich_tip(tip: dict, match: dict | None = None) -> dict:
         match_id_str = tip.get("match_id")
         if match_id_str:
             try:
-                match = await _db.db.matches.find_one(
-                    {"_id": ObjectId(match_id_str)},
+                match = await _db.db.matches_v3.find_one(
+                    {"_id": int(match_id_str)},
                     {"odds_meta": 1, "stats": 1, "result": 1},
                 )
                 logger.warning(
@@ -1047,7 +1036,8 @@ async def enrich_tip(tip: dict, match: dict | None = None) -> dict:
             except Exception:
                 logger.warning("Failed to lazy-load match %s", match_id_str, exc_info=True)
 
-    strategy = await _get_active_strategy(tip.get("sport_key", "all"))
+    tip_league_id = tip.get("league_id")
+    strategy = await _get_active_strategy(tip_league_id if isinstance(tip_league_id, int) else None)
     if not strategy:
         # Still consume transient field
         tip.pop("player_prediction", None)
@@ -1055,9 +1045,7 @@ async def enrich_tip(tip: dict, match: dict | None = None) -> dict:
         return tip
 
     is_no_signal = tip.get("status") == "no_signal"
-    league_display = LEAGUE_DISPLAY.get(
-        tip.get("sport_key", ""), tip.get("sport_key", "")
-    )
+    league_display = str(tip.get("league_id", ""))
 
     # Extract market context (null-safe)
     pick = tip.get("recommended_selection", "-")
@@ -1176,17 +1164,17 @@ async def update_cluster_stats() -> dict:
 
     query = {"status": "resolved", "was_correct": {"$ne": None}}
     projection = {
-        "match_id": 1, "sport_key": 1, "edge_pct": 1, "was_correct": 1, "tier_signals": 1,
+        "match_id": 1, "league_id": 1, "edge_pct": 1, "was_correct": 1, "tier_signals": 1,
     }
 
     tips = await _db.db.quotico_tips.find(query, projection).to_list(length=100_000)
     logger.info("Computing cluster stats from %d resolved tips", len(tips))
 
     # Batch pre-fetch matches for market context (match_id -> match)
-    match_ids = [ObjectId(t["match_id"]) for t in tips if t.get("match_id")]
+    match_ids = [int(t["match_id"]) for t in tips if t.get("match_id")]
     matches_by_id: dict[str, dict] = {}
     if match_ids:
-        matches = await _db.db.matches.find(
+        matches = await _db.db.matches_v3.find(
             {"_id": {"$in": match_ids}},
             {"odds_meta": 1, "stats": 1},
         ).to_list(length=len(match_ids))
@@ -1200,7 +1188,12 @@ async def update_cluster_stats() -> dict:
         market_ctx = _extract_market_context(match, pick)
         key = compute_cluster_key(tip, market_ctx)
         if key not in clusters:
-            clusters[key] = {"wins": 0, "total": 0, "sport_key": tip.get("sport_key")}
+            tip_league_id = tip.get("league_id")
+            clusters[key] = {
+                "wins": 0,
+                "total": 0,
+                "league_id": tip_league_id if isinstance(tip_league_id, int) else None,
+            }
         clusters[key]["total"] += 1
         if tip.get("was_correct"):
             clusters[key]["wins"] += 1
@@ -1216,7 +1209,7 @@ async def update_cluster_stats() -> dict:
                 "wins": stats["wins"],
                 "total": stats["total"],
                 "bayesian_win_rate": round(bwr, 4),
-                "sport_key": stats["sport_key"],
+                "league_id": stats["league_id"],
                 "last_updated": now,
             }},
             upsert=True,
@@ -1242,7 +1235,7 @@ async def update_cluster_stats() -> dict:
 # ---------------------------------------------------------------------------
 
 async def backfill_enrich_tips(
-    sport_key: str | None = None,
+    league_id: int | None = None,
     *,
     limit: int | None = None,
     dry_run: bool = False,
@@ -1262,18 +1255,18 @@ async def backfill_enrich_tips(
         return {"error": "no_strategy"}
 
     query: dict = {"status": "resolved", "was_correct": {"$ne": None}}
-    if sport_key:
-        query["sport_key"] = sport_key
+    if league_id is not None:
+        query["league_id"] = league_id
 
     projection = {
-        "match_id": 1, "sport_key": 1, "edge_pct": 1, "confidence": 1,
+        "match_id": 1, "league_id": 1, "edge_pct": 1, "confidence": 1,
         "implied_probability": 1, "recommended_selection": 1,
-        "was_correct": 1, "tier_signals": 1, "status": 1, "match_date": 1,
+        "was_correct": 1, "tier_signals": 1, "status": 1, "start_at": 1,
     }
 
     tips = await _db.db.quotico_tips.find(
         query, projection,
-    ).sort("match_date", 1).to_list(length=limit or 100_000)
+    ).sort("start_at", 1).to_list(length=limit or 100_000)
 
     logger.info("Backfill enriching %d tips (temporal-safe running tally)", len(tips))
 
@@ -1281,10 +1274,10 @@ async def backfill_enrich_tips(
     running_tally: dict[str, dict] = {}
 
     # Batch pre-fetch matches for market context (match_id -> match)
-    match_ids = [ObjectId(t["match_id"]) for t in tips if t.get("match_id")]
+    match_ids = [int(t["match_id"]) for t in tips if t.get("match_id")]
     matches_by_id: dict[str, dict] = {}
     if match_ids:
-        matches = await _db.db.matches.find(
+        matches = await _db.db.matches_v3.find(
             {"_id": {"$in": match_ids}},
             {"odds_meta": 1, "stats": 1},
         ).to_list(length=len(match_ids))
@@ -1305,7 +1298,7 @@ async def backfill_enrich_tips(
         stake_units, kelly_raw = _compute_kelly_stake(tip, strategy)
 
         league_display = LEAGUE_DISPLAY.get(
-            tip.get("sport_key", ""), tip.get("sport_key", "")
+            tip.get("league_id", ""), tip.get("league_id", "")
         )
         signal_name = {
             "value_oracle": "Edge", "sharp_hunter": "Sharp Money",

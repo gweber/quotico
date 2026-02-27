@@ -210,6 +210,14 @@ async def get_current_user(request: Request, db=Depends(get_db)) -> dict:
     return user
 
 
+async def get_optional_user(request: Request, db=Depends(get_db)) -> dict | None:
+    """Best-effort auth dependency: return user or ``None`` without raising."""
+    try:
+        return await get_current_user(request, db)
+    except HTTPException:
+        return None
+
+
 async def get_admin_user(request: Request, db=Depends(get_db)) -> dict:
     """FastAPI dependency: requires an authenticated admin user."""
     user = await get_current_user(request, db)

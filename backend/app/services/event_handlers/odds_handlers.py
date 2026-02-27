@@ -28,3 +28,15 @@ async def handle_odds_ingested(event: BaseEvent) -> None:
         markets_updated,
     )
 
+
+async def handle_odds_raw_ingested(event: BaseEvent) -> None:
+    fixture_ids = list(getattr(event, "fixture_ids", []) or [])
+    cached = int(getattr(event, "cached_count", 0) or 0)
+    source_method = str(getattr(event, "source_method", "") or "")
+    logger.info(
+        "odds.raw_ingested fixtures=%d cached=%d method=%s",
+        len(fixture_ids),
+        cached,
+        source_method,
+    )
+

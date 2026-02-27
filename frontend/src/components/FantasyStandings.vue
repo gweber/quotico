@@ -4,14 +4,14 @@ import { useFantasyStore } from "@/stores/fantasy";
 
 const props = defineProps<{
   squadId: string;
-  sportKey: string;
+  leagueId: number;
   season?: number;
 }>();
 
 const fantasy = useFantasyStore();
 
 onMounted(() => {
-  fantasy.fetchStandings(props.squadId, props.sportKey, props.season);
+  fantasy.fetchStandings(props.squadId, props.leagueId, props.season);
 });
 </script>
 

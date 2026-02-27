@@ -17,7 +17,6 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from tools.engine_time_machine import (
-    _build_xp_table,
     _compute_market_performance,
     _compute_statistical_integrity,
     _export_justice_table_to_mongo,
@@ -28,9 +27,9 @@ from tools.engine_time_machine import (
 
 def test_snapshot_match_query_is_strictly_temporal_safe() -> None:
     step = datetime(2026, 2, 1, tzinfo=timezone.utc)
-    q = _snapshot_match_query("soccer_germany_bundesliga", step, 365)
-    assert q["match_date"]["$lt"] == step
-    assert q["match_date"]["$gte"] == step - timedelta(days=365)
+    q = _snapshot_match_query(82, step, 365)
+    assert q["start_at"]["$lt"] == step
+    assert q["start_at"]["$gte"] == step - timedelta(days=365)
     assert "odds_meta.markets.h2h.current.1" in q
 
 
@@ -41,12 +40,12 @@ async def test_find_earliest_match_uses_odds_meta_paths() -> None:
     class _Matches:
         async def find_one(self, query, *_args, **_kwargs):
             captured.update(query)
-            return {"match_date": datetime(2024, 1, 1, tzinfo=timezone.utc)}
+            return {"start_at": datetime(2024, 1, 1, tzinfo=timezone.utc)}
 
     class _DB:
-        matches = _Matches()
+        matches_v3 = _Matches()
 
-    dt = await _find_earliest_match(_DB(), "soccer_epl")
+    dt = await _find_earliest_match(_DB(), 8)
     assert dt is not None
     assert "odds_meta.markets.h2h.current.1" in captured
     assert "odds.h2h.1" not in captured
@@ -101,28 +100,6 @@ def test_statistical_integrity_handles_missing_xg() -> None:
     assert s["xg_brier_score"] is not None
 
 
-def test_xp_table_skips_missing_team_ids() -> None:
-    matches = [
-        {
-            "home_team_id": "h1",
-            "away_team_id": "a1",
-            "home_team": "Home",
-            "away_team": "Away",
-            "result": {"home_xg": 1.4, "away_xg": 0.9},
-        },
-        {
-            "home_team_id": None,
-            "away_team_id": "a2",
-            "home_team": "Missing",
-            "away_team": "Away2",
-            "result": {"home_xg": 1.0, "away_xg": 1.0},
-        },
-    ]
-    out = _build_xp_table(matches)
-    assert len(out["table"]) == 2
-    assert out["skipped_missing_team_ids"] == 1
-
-
 @pytest.mark.asyncio
 async def test_export_justice_uses_upsert() -> None:
     calls = []
@@ -136,16 +113,15 @@ async def test_export_justice_uses_upsert() -> None:
 
     matches = [
         {
-            "home_team_id": "h1",
-            "away_team_id": "a1",
-            "home_team": "Home",
-            "away_team": "Away",
-            "result": {"home_xg": 1.1, "away_xg": 1.0},
+            "teams": {
+                "home": {"sm_id": 11, "name": "Home", "score": 1, "xg": 1.1},
+                "away": {"sm_id": 22, "name": "Away", "score": 1, "xg": 1.0},
+            },
         }
     ]
     exported = await _export_justice_table_to_mongo(
         _DB(),
-        sport_key="soccer_epl",
+        league_id=8,
         step_date=datetime(2026, 1, 1, tzinfo=timezone.utc),
         window_days=365,
         matches=matches,

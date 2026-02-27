@@ -64,7 +64,7 @@ async def test_admin_backfill_rejects_oversize_scope(monkeypatch):
 
     with pytest.raises(HTTPException) as exc:
         await router.backfill_quotico_tips(
-            sport_key="soccer_germany_bundesliga",
+            league_id=82,
             batch_size=10,
             skip=0,
             dry_run=True,
@@ -78,7 +78,7 @@ async def test_admin_backfill_returns_new_metrics(monkeypatch):
     matches = [
         {
             "_id": "m1",
-            "sport_key": "soccer_germany_bundesliga",
+            "league_id": 82,
             "home_team": "A",
             "away_team": "B",
             "match_date": "2025-02-01T00:00:00",
@@ -87,7 +87,7 @@ async def test_admin_backfill_returns_new_metrics(monkeypatch):
         },
         {
             "_id": "m2",
-            "sport_key": "soccer_germany_bundesliga",
+            "league_id": 82,
             "home_team": "C",
             "away_team": "D",
             "match_date": "2025-02-02T00:00:00",
@@ -124,7 +124,7 @@ async def test_admin_backfill_returns_new_metrics(monkeypatch):
     monkeypatch.setattr(router, "resolve_tip", _fake_resolve)
 
     result = await router.backfill_quotico_tips(
-        sport_key="soccer_germany_bundesliga",
+        league_id=82,
         batch_size=10,
         skip=0,
         dry_run=True,

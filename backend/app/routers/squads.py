@@ -532,7 +532,7 @@ async def update_game_mode(
 # ---------- League Configuration (Multi-League, Multi-Mode) ----------
 
 class LeagueConfigUpdate(BaseModel):
-    sport_key: str
+    league_id: int
     game_mode: GameMode
     config: dict = {}
 
@@ -545,7 +545,7 @@ async def upsert_league_config(
 ):
     """Add or update a league config for a squad (admin only).
 
-    Each sport_key can only appear once (active) per squad.
+    Each league_id can only appear once (active) per squad.
     """
     user_id = str(user["_id"])
     squad = await _db.db.squads.find_one({"_id": ObjectId(squad_id)})
@@ -561,10 +561,12 @@ async def upsert_league_config(
 
     league_configs = squad.get("league_configs", [])
 
-    # Check if sport_key already exists (active or deactivated)
+    # Check if league_id already exists (active or deactivated)
     existing_idx = None
     for i, lc in enumerate(league_configs):
-        if lc["sport_key"] == body.sport_key:
+        if not isinstance(lc.get("league_id"), int):
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "Invalid league config: league_id must be int.")
+        if lc["league_id"] == body.league_id:
             existing_idx = i
             break
 
@@ -579,7 +581,7 @@ async def upsert_league_config(
             )
         # Reactivate a deactivated config (fresh start, new mode allowed)
         league_configs[existing_idx] = {
-            "sport_key": body.sport_key,
+            "league_id": body.league_id,
             "game_mode": mode,
             "config": config,
             "activated_at": now,
@@ -588,7 +590,7 @@ async def upsert_league_config(
     else:
         # Add new config
         league_configs.append({
-            "sport_key": body.sport_key,
+            "league_id": body.league_id,
             "game_mode": mode,
             "config": config,
             "activated_at": now,
@@ -603,10 +605,10 @@ async def upsert_league_config(
     return {"league_configs": league_configs}
 
 
-@router.delete("/{squad_id}/league-config/{sport_key}")
+@router.delete("/{squad_id}/league-config/{league_id}")
 async def deactivate_league_config(
     squad_id: str,
-    sport_key: str,
+    league_id: int,
     user=Depends(get_current_user),
 ):
     """Soft-deactivate a league from a squad (admin only).
@@ -622,7 +624,7 @@ async def deactivate_league_config(
 
     now = utcnow()
     result = await _db.db.squads.update_one(
-        {"_id": ObjectId(squad_id), "league_configs.sport_key": sport_key},
+        {"_id": ObjectId(squad_id), "league_configs.league_id": league_id},
         {"$set": {
             "league_configs.$.deactivated_at": now,
             "updated_at": now,
@@ -632,7 +634,7 @@ async def deactivate_league_config(
     if result.modified_count == 0:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "League configuration not found.")
 
-    return {"status": "deactivated", "sport_key": sport_key}
+    return {"status": "deactivated", "league_id": league_id}
 
 
 @router.get("/{squad_id}/league-configs")
@@ -650,9 +652,12 @@ async def get_league_configs(
         raise HTTPException(status.HTTP_403_FORBIDDEN, "You are not a member of this squad.")
 
     raw_configs = squad.get("league_configs", [])
+    for lc in raw_configs:
+        if not isinstance(lc.get("league_id"), int):
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "Invalid league config: league_id must be int.")
     return [
         LeagueConfigResponse(
-            sport_key=lc["sport_key"],
+            league_id=lc["league_id"],
             game_mode=lc["game_mode"],
             config=lc.get("config", {}),
             activated_at=ensure_utc(lc["activated_at"]),
@@ -667,9 +672,12 @@ async def get_league_configs(
 def _squad_response(squad: dict, is_admin: bool = False) -> SquadResponse:
     # Build league_configs from raw dicts
     raw_configs = squad.get("league_configs", [])
+    for lc in raw_configs:
+        if not isinstance(lc.get("league_id"), int):
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "Invalid league config: league_id must be int.")
     league_configs = [
         LeagueConfigResponse(
-            sport_key=lc["sport_key"],
+            league_id=lc["league_id"],
             game_mode=lc["game_mode"],
             config=lc.get("config", {}),
             activated_at=ensure_utc(lc["activated_at"]),

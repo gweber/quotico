@@ -61,34 +61,40 @@ class _FakeLeagues:
 
 @pytest.mark.asyncio
 async def test_odds_ingested_ws_handler_single_batch_broadcast(monkeypatch):
-    league_id = ObjectId()
-    m1 = ObjectId()
-    m2 = ObjectId()
-    fake_db = SimpleNamespace(
-        matches=_FakeMatches(
-            [
-                {"_id": m1, "league_id": league_id, "sport_key": "soccer_epl", "odds_meta": {"updated_at": None}},
-                {"_id": m2, "league_id": league_id, "sport_key": "soccer_epl", "odds_meta": {"updated_at": None}},
-            ]
-        ),
-        leagues=_FakeLeagues([{"_id": league_id, "external_ids": {"openligadb": "bl1"}}]),
-    )
-    monkeypatch.setattr(websocket_handlers._db, "db", fake_db, raising=False)
+    m1 = "19433656"
+    m2 = "19433657"
     monkeypatch.setattr(websocket_handlers.settings, "WS_EVENTS_ENABLED", True, raising=False)
 
     calls = []
+    live_calls = []
 
     async def _broadcast(**kwargs):
         calls.append(kwargs)
         return 1
 
-    monkeypatch.setattr(websocket_handlers.websocket_manager, "broadcast", _broadcast)
+    async def _broadcast_odds_updated(*, league_id: int, odds_changed: int, match_ids: list[str] | None = None):
+        live_calls.append(
+            {
+                "league_id": league_id,
+                "odds_changed": odds_changed,
+                "match_ids": list(match_ids or []),
+            }
+        )
 
+    monkeypatch.setattr(websocket_handlers.websocket_manager, "broadcast", _broadcast)
+    monkeypatch.setattr(
+        "app.routers.ws.live_manager",
+        SimpleNamespace(broadcast_odds_updated=_broadcast_odds_updated),
+        raising=False,
+    )
+
+    # FIXME: ODDS_V3_BREAK — tests OddsIngestedEvent which is no longer published by connector
     event = OddsIngestedEvent(
         source="football_data",
         correlation_id="corr-odds-1",
         provider="theoddsapi",
-        match_ids=[str(m1), str(m1), str(m2)],
+        league_id=8,
+        match_ids=[m1, m1, m2],
         inserted=2,
         deduplicated=1,
         markets_updated=3,
@@ -96,12 +102,16 @@ async def test_odds_ingested_ws_handler_single_batch_broadcast(monkeypatch):
     await websocket_handlers.handle_odds_ingested_ws(event)
     assert len(calls) == 1
     selectors = calls[0]["selectors"]
-    assert sorted(selectors["match_ids"]) == sorted([str(m1), str(m2)])
+    assert sorted(selectors["match_ids"]) == sorted([m1, m2])
+    assert calls[0]["data"]["match_ids"] == sorted([m1, m2])
+    assert calls[0]["data"]["league_id"] == 8
+    assert len(live_calls) == 1
+    assert live_calls[0]["match_ids"] == sorted([m1, m2])
 
 
 @pytest.mark.asyncio
 async def test_match_event_ws_handlers_broadcast(monkeypatch):
-    league_id = ObjectId()
+    league_id = 8
     match_id = ObjectId()
     fake_db = SimpleNamespace(
         matches=_FakeMatches(
@@ -109,7 +119,6 @@ async def test_match_event_ws_handlers_broadcast(monkeypatch):
                 {
                     "_id": match_id,
                     "league_id": league_id,
-                    "sport_key": "soccer_epl",
                     "status": "final",
                     "score": {"full_time": {"home": 2, "away": 0}},
                     "result": {"outcome": "1"},
@@ -132,8 +141,7 @@ async def test_match_event_ws_handlers_broadcast(monkeypatch):
         source="openligadb",
         correlation_id="corr-u",
         match_id=str(match_id),
-        league_id=str(league_id),
-        sport_key="soccer_epl",
+        league_id=league_id,
         season=2025,
         previous_status="live",
         new_status="final",
@@ -145,8 +153,7 @@ async def test_match_event_ws_handlers_broadcast(monkeypatch):
         source="openligadb",
         correlation_id="corr-f",
         match_id=str(match_id),
-        league_id=str(league_id),
-        sport_key="soccer_epl",
+        league_id=league_id,
         season=2025,
         final_score={"home": 2, "away": 0},
     )

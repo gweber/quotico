@@ -8,7 +8,6 @@ Purpose:
 
 Dependencies:
     - app.database
-    - app.services.league_service.LeagueService
     - app.services.team_registry_service
 """
 
@@ -16,7 +15,6 @@ import logging
 import traceback
 
 import app.database as _db
-from app.services.league_service import LeagueService
 from app.services.team_registry_service import TeamRegistry
 
 logger = logging.getLogger("quotico.tower_check")
@@ -31,7 +29,6 @@ class TowerHealthCheck:
             "status": "UNKNOWN",
             "steps": {
                 "database": "PENDING",
-                "leagues_seeded": "PENDING",
                 "team_registry": "PENDING",
                 "resolution_test": "PENDING",
             },
@@ -47,10 +44,6 @@ class TowerHealthCheck:
             report["steps"]["database"] = "OK"
             report["details"]["collections_count"] = len(collections)
 
-            seed_result = await LeagueService.seed_core_leagues()
-            report["steps"]["leagues_seeded"] = "OK"
-            report["details"]["seed_result"] = seed_result
-
             registry = TeamRegistry.get()
             await registry.initialize()
             stats = registry.stats()
@@ -59,8 +52,8 @@ class TowerHealthCheck:
             report["details"]["global_entries"] = stats.get("global_entries", 0)
 
             test_name = "Bayern Munich"
-            test_sport_key = "soccer_germany_bundesliga"
-            team_id = await registry.resolve(test_name, test_sport_key)
+            test_league_id = 82
+            team_id = await registry.resolve(test_name, test_league_id)
 
             if team_id:
                 team_doc = await _db.db.teams.find_one(

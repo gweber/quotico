@@ -37,13 +37,13 @@ async def get_war_room(
         )
 
     # 2. Fetch match
-    match = await _db.db.matches.find_one({"_id": ObjectId(match_id)})
+    match = await _db.db.matches_v3.find_one({"_id": int(match_id)})
     if not match:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Match not found.")
 
     member_ids = squad["members"]
     now = utcnow()
-    commence = ensure_utc(match["match_date"])
+    commence = ensure_utc(match["start_at"])
     is_post_kickoff = now >= commence
 
     # 3. Bulk alias lookup
@@ -83,10 +83,10 @@ async def get_war_room(
     # 6. Build match payload
     match_payload = {
         "id": str(match["_id"]),
-        "sport_key": match["sport_key"],
+        "league_id": match["league_id"],
         "home_team": match["home_team"],
         "away_team": match["away_team"],
-        "match_date": match["match_date"],
+        "start_at": match["start_at"],
         "status": match["status"],
         "odds": build_legacy_like_odds(match),
         "result": match.get("result", {}),

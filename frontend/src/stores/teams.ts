@@ -1,9 +1,15 @@
+/**
+ * frontend/src/stores/teams.ts
+ *
+ * Purpose:
+ * Team search store for public team discovery views.
+ */
 import { defineStore } from "pinia";
 import { ref } from "vue";
 import { useApi } from "@/composables/useApi";
 
 export interface TeamSearchResult {
-  team_key: string;
+  team_id: string;
   display_name: string;
   slug: string;
   sport_keys: string[];
@@ -24,7 +30,7 @@ export const useTeamsStore = defineStore("teams", () => {
     searchLoading.value = true;
     try {
       const params: Record<string, string> = { q: query };
-      if (sportKey) params.sport_key = sportKey;
+      if (sportKey) params.league_id = sportKey;
       searchResults.value = await api.get<TeamSearchResult[]>("/teams/search", params);
     } catch {
       searchResults.value = [];

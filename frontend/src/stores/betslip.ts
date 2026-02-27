@@ -1,10 +1,21 @@
+/**
+ * frontend/src/stores/betslip.ts
+ *
+ * Purpose:
+ * Client-side bet slip state with draft-sync, odds drift confirmation, and
+ * automatic odds synchronization from the matches store.
+ */
+
 import { defineStore } from "pinia";
-import { ref, computed, onUnmounted } from "vue";
+import { ref, computed, onUnmounted, watch } from "vue";
 import { useApi, HttpError } from "@/composables/useApi";
 import { useAuthStore } from "./auth";
-import type { Match } from "./matches";
+import { useMatchesStore, type Match } from "./matches";
 import { oddsValueBySelection } from "@/composables/useMatchV3Adapter";
 import type { MatchV3, OddsButtonKey } from "@/types/MatchV3";
+
+type BetSlipItemState = "valid" | "expired" | "invalid_missing";
+type InvalidReason = "match_missing" | "match_not_scheduled" | "match_locked";
 
 export interface BetSlipItem {
   matchId: string;
@@ -13,9 +24,12 @@ export interface BetSlipItem {
   prediction: string; // "1", "X", or "2"
   predictionLabel: string; // "Bayern München" or "Unentschieden"
   odds: number;
-  sportKey: string;
+  sportKey: number;
   matchDate: string; // ISO date string for expiry check
   addedAt: number; // Timestamp when added (for staleness warning)
+  state: BetSlipItemState;
+  invalidReason?: InvalidReason | null;
+  invalidAt?: number | null;
 }
 
 export interface OddsChange {
@@ -45,6 +59,8 @@ interface SlipSelection {
   locked_odds?: number;
   points_earned?: number | null;
   status: string;
+  invalid_reason?: InvalidReason | null;
+  invalid_at?: string | null;
 }
 
 interface SlipResponse {
@@ -61,10 +77,10 @@ interface SlipResponse {
 
 const DRAFT_KEY = "quotico-draft-id";
 const ITEMS_KEY = "quotico-betslip";
-const STALE_THRESHOLD_MS = 10 * 60 * 1000; // 10 minutes → show warning
 
 export const useBetSlipStore = defineStore("betslip", () => {
   const api = useApi();
+  const matchesStore = useMatchesStore();
 
   // Local display state (optimistic mirror of server draft)
   const items = ref<BetSlipItem[]>(loadItemsFromStorage());
@@ -76,30 +92,41 @@ export const useBetSlipStore = defineStore("betslip", () => {
   // Pre-submit odds change confirmation
   const pendingOddsChanges = ref<OddsChange[]>([]);
   const showOddsChangeDialog = ref(false);
+  const lastOddsSyncAt = ref<number | null>(null);
+  const recentlyUpdatedItemIds = ref<Set<string>>(new Set());
+  const totalOddsRecentlyUpdated = ref(false);
+  const lastReconcileFailedAt = ref<number | null>(null);
 
   // Tick every 10s to detect expired items
   const now = ref(Date.now());
   const _ticker = setInterval(() => { now.value = Date.now(); }, 10_000);
   onUnmounted(() => clearInterval(_ticker));
 
-  const validItems = computed(() =>
-    items.value.filter((i) => i.matchDate && new Date(i.matchDate).getTime() > now.value)
+  const activeItems = computed(() =>
+    items.value.filter((i) => i.state === "valid" && i.matchDate && new Date(i.matchDate).getTime() > now.value)
   );
+
+  const validItems = computed(() => activeItems.value);
 
   const expiredItems = computed(() =>
-    items.value.filter((i) => !i.matchDate || new Date(i.matchDate).getTime() <= now.value)
+    items.value.filter((i) =>
+      i.state === "expired" || (i.state === "valid" && (!i.matchDate || new Date(i.matchDate).getTime() <= now.value))
+    )
   );
 
-  /** Items added more than 10 minutes ago (odds may be stale). */
-  const staleItems = computed(() =>
-    validItems.value.filter((i) => i.addedAt && (now.value - i.addedAt) > STALE_THRESHOLD_MS)
+  const invalidItems = computed(() =>
+    items.value.filter((i) => i.state === "invalid_missing")
   );
 
   const totalOdds = computed(() =>
-    validItems.value.reduce((sum, item) => sum + item.odds, 0)
+    activeItems.value.reduce((sum, item) => sum + item.odds, 0)
   );
 
   const itemCount = computed(() => items.value.length);
+  let _recentlyUpdatedClearTimer: ReturnType<typeof setTimeout> | null = null;
+  let _totalPulseTimer: ReturnType<typeof setTimeout> | null = null;
+  let _draftSyncTimer: ReturnType<typeof setTimeout> | null = null;
+  const _pendingDraftUpdates = new Map<string, { prediction: string; odds: number }>();
 
   function toMatchCompat(row: any): Match {
     if (row && typeof row.home_team === "string" && typeof row.away_team === "string") {
@@ -107,6 +134,7 @@ export const useBetSlipStore = defineStore("betslip", () => {
     }
     const homeId = Number(row?.teams?.home?.sm_id || 0);
     const awayId = Number(row?.teams?.away?.sm_id || 0);
+    // FIXME: ODDS_V3_BREAK — reads odds_meta.summary_1x2 for bet placement odds which is no longer produced by connector
     const summary = row?.odds_meta?.summary_1x2 || {};
     const h2h: Record<string, number> = {};
     const homeAvg = Number(summary?.home?.avg);
@@ -117,7 +145,7 @@ export const useBetSlipStore = defineStore("betslip", () => {
     if (Number.isFinite(awayAvg)) h2h["2"] = awayAvg;
     return {
       id: String(row?._id ?? row?.id ?? ""),
-      sport_key: "football",
+      league_id: typeof row?.league_id === "number" ? row.league_id : 0,
       home_team: `Team ${homeId || "?"}`,
       away_team: `Team ${awayId || "?"}`,
       match_date: String(row?.start_at || ""),
@@ -130,6 +158,107 @@ export const useBetSlipStore = defineStore("betslip", () => {
       referee_id: row?.referee_id ?? null,
       teams: row?.teams,
     } as Match;
+  }
+
+  function _isLockedMatch(match: Match): boolean {
+    const kickoff = new Date(match.match_date || match.start_at || "").getTime();
+    return Number.isFinite(kickoff) && kickoff <= Date.now();
+  }
+
+  async function _voidDraftSelection(matchId: string, reason: InvalidReason): Promise<void> {
+    if (!draftSlipId.value) return;
+    const auth = useAuthStore();
+    if (!auth.isLoggedIn) return;
+    try {
+      await api.patch(`/betting-slips/${draftSlipId.value}/selections`, {
+        action: "invalidate",
+        match_id: matchId,
+        reason,
+      });
+    } catch {
+      // Best effort: draft reconciliation retries later.
+    }
+  }
+
+  async function reconcileOnLifecycle(): Promise<boolean> {
+    const uniqueIds = [...new Set(items.value.map((item) => Number(item.matchId)).filter((id) => Number.isFinite(id)))];
+    if (uniqueIds.length === 0) return true;
+    try {
+      const query = await api.post<{ items: Match[] }>("/v3/matches/query", {
+        ids: uniqueIds,
+        statuses: ["SCHEDULED"],
+        limit: Math.min(200, Math.max(1, uniqueIds.length)),
+      });
+      const freshMatches = (query.items || []).map(toMatchCompat);
+      const freshMap = new Map(freshMatches.map((m) => [m.id, m]));
+      const toInvalidate: Array<{ matchId: string; reason: InvalidReason }> = [];
+      let changed = false;
+      items.value = items.value.map((item) => {
+        const fresh = freshMap.get(item.matchId);
+        if (!fresh) {
+          if (item.state !== "invalid_missing" || item.invalidReason !== "match_missing") {
+            changed = true;
+            toInvalidate.push({ matchId: item.matchId, reason: "match_missing" });
+          }
+          return {
+            ...item,
+            state: "invalid_missing",
+            invalidReason: "match_missing",
+            invalidAt: item.invalidAt ?? Date.now(),
+          };
+        }
+
+        const status = String(fresh.status || "").toLowerCase();
+        const reason: InvalidReason | null = status !== "scheduled"
+          ? "match_not_scheduled"
+          : _isLockedMatch(fresh)
+            ? "match_locked"
+            : null;
+        if (reason) {
+          if (item.state !== "invalid_missing" || item.invalidReason !== reason) {
+            changed = true;
+            toInvalidate.push({ matchId: item.matchId, reason });
+          }
+          return {
+            ...item,
+            homeTeam: fresh.home_team,
+            awayTeam: fresh.away_team,
+            sportKey: fresh.league_id,
+            matchDate: fresh.match_date,
+            state: "invalid_missing",
+            invalidReason: reason,
+            invalidAt: item.invalidAt ?? Date.now(),
+          };
+        }
+
+        const nextState: BetSlipItemState = _isLockedMatch(fresh) ? "expired" : "valid";
+        if (item.state !== nextState || item.homeTeam !== fresh.home_team || item.awayTeam !== fresh.away_team || item.sportKey !== fresh.league_id || item.matchDate !== fresh.match_date) {
+          changed = true;
+        }
+        return {
+          ...item,
+          homeTeam: fresh.home_team,
+          awayTeam: fresh.away_team,
+          sportKey: fresh.league_id,
+          matchDate: fresh.match_date,
+          state: nextState,
+          invalidReason: null,
+          invalidAt: null,
+        };
+      });
+      if (changed) persistItems();
+      if (toInvalidate.length > 0) {
+        for (const row of toInvalidate) {
+          await _voidDraftSelection(row.matchId, row.reason);
+        }
+      }
+      lastReconcileFailedAt.value = null;
+      return true;
+    } catch {
+      // Fail-safe: never mutate leg state on query failures.
+      lastReconcileFailedAt.value = Date.now();
+      return false;
+    }
   }
 
   // ---- Server draft helpers ----
@@ -156,6 +285,76 @@ export const useBetSlipStore = defineStore("betslip", () => {
     localStorage.setItem(ITEMS_KEY, JSON.stringify(items.value));
   }
 
+  function _queueDraftOddsUpdate(item: BetSlipItem) {
+    if (!draftSlipId.value) return;
+    const auth = useAuthStore();
+    if (!auth.isLoggedIn) return;
+    _pendingDraftUpdates.set(item.matchId, { prediction: item.prediction, odds: item.odds });
+    if (_draftSyncTimer) return;
+    _draftSyncTimer = setTimeout(async () => {
+      _draftSyncTimer = null;
+      if (!draftSlipId.value || _pendingDraftUpdates.size === 0) return;
+      const updates = [..._pendingDraftUpdates.entries()];
+      _pendingDraftUpdates.clear();
+      for (const [matchId, payload] of updates) {
+        try {
+          await api.patch(`/betting-slips/${draftSlipId.value}/selections`, {
+            action: "update",
+            match_id: matchId,
+            market: "h2h",
+            pick: payload.prediction,
+            displayed_odds: payload.odds,
+          });
+        } catch {
+          // Best effort — submit flow revalidates odds again.
+        }
+      }
+    }, 300);
+  }
+
+  function syncOddsFromMatchMap(matchMap: Map<string, Match>): number {
+    if (items.value.length === 0) return 0;
+    const changedIds: string[] = [];
+    for (const item of validItems.value) {
+      const match = matchMap.get(item.matchId);
+      if (!match) continue;
+      const currentOdds = oddsValueBySelection(
+        match as unknown as MatchV3,
+        item.prediction as OddsButtonKey,
+      );
+      if (currentOdds == null || currentOdds === item.odds) continue;
+      item.odds = currentOdds;
+      item.addedAt = Date.now();
+      changedIds.push(item.matchId);
+      _queueDraftOddsUpdate(item);
+    }
+    if (changedIds.length === 0) return 0;
+    persistItems();
+    lastOddsSyncAt.value = Date.now();
+    const nextSet = new Set(recentlyUpdatedItemIds.value);
+    for (const id of changedIds) nextSet.add(id);
+    recentlyUpdatedItemIds.value = nextSet;
+    totalOddsRecentlyUpdated.value = true;
+    if (_recentlyUpdatedClearTimer) clearTimeout(_recentlyUpdatedClearTimer);
+    _recentlyUpdatedClearTimer = setTimeout(() => {
+      recentlyUpdatedItemIds.value = new Set();
+    }, 3000);
+    if (_totalPulseTimer) clearTimeout(_totalPulseTimer);
+    _totalPulseTimer = setTimeout(() => {
+      totalOddsRecentlyUpdated.value = false;
+    }, 1200);
+    return changedIds.length;
+  }
+
+  watch(
+    () => matchesStore.matches,
+    (rows) => {
+      if (!rows || rows.length === 0) return;
+      syncOddsFromMatchMap(new Map(rows.map((m) => [m.id, m])));
+    },
+    { deep: false },
+  );
+
   // ---- Public actions ----
 
   function addItem(match: Match, prediction: string) {
@@ -181,9 +380,12 @@ export const useBetSlipStore = defineStore("betslip", () => {
       prediction,
       predictionLabel: labels[prediction] || prediction,
       odds: selectedOdds,
-      sportKey: match.sport_key,
+      sportKey: match.league_id,
       matchDate: match.match_date,
       addedAt: Date.now(),
+      state: _isLockedMatch(match) ? "expired" : "valid",
+      invalidReason: null,
+      invalidAt: null,
     });
     persistItems();
     isOpen.value = true; // Auto-open on mobile
@@ -290,6 +492,24 @@ export const useBetSlipStore = defineStore("betslip", () => {
     return removed;
   }
 
+  function removeInvalid() {
+    const removed = invalidItems.value.length;
+    if (removed > 0) {
+      const removedIds = invalidItems.value.map((i) => i.matchId);
+      items.value = items.value.filter((i) => i.state !== "invalid_missing");
+      persistItems();
+      for (const matchId of removedIds) {
+        if (draftSlipId.value) {
+          api.patch(`/betting-slips/${draftSlipId.value}/selections`, {
+            action: "remove",
+            match_id: matchId,
+          }).catch(() => {});
+        }
+      }
+    }
+    return removed;
+  }
+
   /** Update betslip item odds to current server values and clear the dialog. */
   function acceptOddsChanges() {
     for (const change of pendingOddsChanges.value) {
@@ -325,13 +545,15 @@ export const useBetSlipStore = defineStore("betslip", () => {
     const errors: string[] = [];
     const bets: BetResponseData[] = [];
 
+    await reconcileOnLifecycle();
+
     // Drop expired items before submitting
     const expired = removeExpired();
     if (expired > 0) {
       errors.push(`${expired} expired bet${expired > 1 ? "s" : ""} removed.`);
     }
 
-    if (validItems.value.length === 0) {
+    if (activeItems.value.length === 0) {
       submitting.value = false;
       return { success, errors, bets };
     }
@@ -339,11 +561,16 @@ export const useBetSlipStore = defineStore("betslip", () => {
     // Pre-submit: fetch fresh match data and check for odds drift
     const oddsChanges: OddsChange[] = [];
     try {
-      const query = await api.post<{ items: Match[] }>("/v3/matches/query", { statuses: ["SCHEDULED"], limit: 200 });
+      const queryIds = [...new Set(activeItems.value.map((item) => Number(item.matchId)).filter((id) => Number.isFinite(id)))];
+      const query = await api.post<{ items: Match[] }>("/v3/matches/query", {
+        ids: queryIds,
+        statuses: ["SCHEDULED"],
+        limit: Math.min(200, Math.max(1, queryIds.length)),
+      });
       const freshMatches = (query.items || []).map(toMatchCompat);
       const freshMap = new Map(freshMatches.map((m) => [m.id, m]));
 
-      for (const item of validItems.value) {
+      for (const item of activeItems.value) {
         const fresh = freshMap.get(item.matchId);
         if (!fresh) continue;
         const currentOdds = oddsValueBySelection(
@@ -377,7 +604,7 @@ export const useBetSlipStore = defineStore("betslip", () => {
       let slipId = await ensureDraft();
 
       // Sync any items that might not be on the server yet
-      for (const item of validItems.value) {
+      for (const item of activeItems.value) {
         try {
           await api.patch(`/betting-slips/${slipId}/selections`, {
             action: "add",
@@ -408,7 +635,7 @@ export const useBetSlipStore = defineStore("betslip", () => {
 
       // Map response to flat BetResponseData for cacheUserBet compatibility
       for (const sel of slip.selections) {
-        const item = validItems.value.find((i) => i.matchId === sel.match_id);
+        const item = activeItems.value.find((i) => i.matchId === sel.match_id);
         if (item) success.push(`${item.homeTeam} vs ${item.awayTeam}`);
         bets.push({
           id: slip.id,
@@ -474,9 +701,14 @@ export const useBetSlipStore = defineStore("betslip", () => {
               prediction: sel.pick,
               predictionLabel: labels[sel.pick] ?? sel.pick,
               odds: sel.displayed_odds ?? sel.locked_odds ?? 0,
-              sportKey: match?.sport_key ?? "",
+              sportKey: match?.league_id ?? 0,
               matchDate: match?.match_date ?? "",
               addedAt: Date.now(),
+              state: sel.status === "void"
+                ? "invalid_missing"
+                : ((match && _isLockedMatch(match)) ? "expired" : "valid"),
+              invalidReason: sel.invalid_reason ?? (sel.status === "void" ? "match_missing" : null),
+              invalidAt: sel.invalid_at ? new Date(sel.invalid_at).getTime() : null,
             };
           });
           persistItems();
@@ -486,17 +718,34 @@ export const useBetSlipStore = defineStore("betslip", () => {
       }
     } catch {
       // Not logged in or no draft — use local state as-is
+    } finally {
+      if (items.value.length > 0) {
+        await reconcileOnLifecycle();
+      }
     }
   }
 
   function loadItemsFromStorage(): BetSlipItem[] {
     try {
       const stored = localStorage.getItem(ITEMS_KEY);
-      return stored ? JSON.parse(stored) : [];
+      const rows = stored ? JSON.parse(stored) : [];
+      if (!Array.isArray(rows)) return [];
+      return rows.map((row: any) => ({
+        ...row,
+        state: row?.state === "invalid_missing" ? "invalid_missing" : (row?.state === "expired" ? "expired" : "valid"),
+        invalidReason: row?.invalidReason ?? null,
+        invalidAt: typeof row?.invalidAt === "number" ? row.invalidAt : null,
+      }));
     } catch {
       return [];
     }
   }
+
+  onUnmounted(() => {
+    if (_recentlyUpdatedClearTimer) clearTimeout(_recentlyUpdatedClearTimer);
+    if (_totalPulseTimer) clearTimeout(_totalPulseTimer);
+    if (_draftSyncTimer) clearTimeout(_draftSyncTimer);
+  });
 
   return {
     items,
@@ -506,18 +755,25 @@ export const useBetSlipStore = defineStore("betslip", () => {
     totalOdds,
     itemCount,
     validItems,
+    invalidItems,
     expiredItems,
-    staleItems,
+    lastOddsSyncAt,
+    recentlyUpdatedItemIds,
+    totalOddsRecentlyUpdated,
+    lastReconcileFailedAt,
     pendingOddsChanges,
     showOddsChangeDialog,
     draftSlipId,
     addItem,
     removeItem,
     removeExpired,
+    removeInvalid,
     acceptOddsChanges,
     dismissOddsChanges,
     clear,
     submitAll,
     loadDraft,
+    reconcileOnLifecycle,
+    syncOddsFromMatchMap,
   };
 });

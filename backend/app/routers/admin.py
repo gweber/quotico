@@ -8,7 +8,6 @@ Purpose:
 Dependencies:
     - app.services.auth_service
     - app.services.audit_service
-    - app.services.admin_service
     - app.services.league_service
 """
 
@@ -30,42 +29,30 @@ from pymongo.errors import DuplicateKeyError
 import app.database as _db
 from app.services.alias_service import generate_default_alias
 from app.services.admin_view_catalog_service import list_view_catalog
-from app.services.admin_service import (
-    cleanup_same_day_duplicate_matches,
-    list_same_day_duplicate_matches,
-    merge_teams,
-)
 from app.services.auth_service import get_admin_user, invalidate_user_tokens
 from app.services.audit_service import log_audit
 from app.services.league_service import (
     LeagueRegistry,
-    default_current_season_for_sport,
-    default_season_start_month_for_sport,
+    default_current_season_for_league,
+    default_season_start_month_for_league,
     invalidate_navigation_cache,
-    seed_core_leagues,
     update_league_order,
 )
 from app.services.qbot_backtest_service import simulate_strategy_backtest
-from app.services.football_data_service import import_football_data_stats
-from app.services.football_data_org_service import import_season as import_football_data_org_season
-from app.services.openligadb_service import import_season as import_openligadb_season
-from app.services.xg_enrichment_service import (
-    enrich_matches as enrich_xg_matches,
-    list_xg_target_sport_keys,
-    parse_season_spec as parse_xg_season_spec,
-)
 from app.services.event_bus import event_bus
 from app.services.event_bus_monitor import event_bus_monitor
 from app.services.provider_settings_service import provider_settings_service
-from app.services.team_registry_service import TeamRegistry, normalize_team_name
-from app.providers.odds_api import odds_provider
+from app.services.persona_policy_service import get_persona_policy_service
+from app.services.referee_dna_service import build_referee_profiles
+from app.services.sportmonks_connector import sportmonks_connector
+from app.providers.sportmonks import sportmonks_provider
 from app.config import settings
 from app.utils import ensure_utc, utcnow
 from app.workers._state import get_synced_at, get_worker_state
 
 logger = logging.getLogger("quotico.admin")
 router = APIRouter(prefix="/api/admin", tags=["admin"])
-FOOTBALL_DATA_IMPORT_RATE_LIMIT_SECONDS = 10
+SPORTMONKS_IMPORT_RATE_LIMIT_SECONDS = 10
 ADMIN_MATCHES_CACHE_TTL_SECONDS = 30
 _ADMIN_MATCHES_CACHE: dict[str, tuple[datetime, dict[str, Any]]] = {}
 
@@ -78,11 +65,11 @@ def _admin_matches_cache_key(
     *,
     page: int,
     page_size: int,
-    league_id: str | None,
+    league_id: int | None,
     status_filter: str | None,
     date_from: datetime | None,
     date_to: datetime | None,
-    needs_review: bool | None,
+    manual_check: bool | None,
     odds_available: bool | None,
     search: str | None,
 ) -> str:
@@ -90,15 +77,72 @@ def _admin_matches_cache_key(
         [
             f"p={page}",
             f"ps={page_size}",
-            f"l={league_id or ''}",
+            f"l={league_id if league_id is not None else ''}",
             f"s={status_filter or ''}",
             f"df={ensure_utc(date_from).isoformat() if date_from else ''}",
             f"dt={ensure_utc(date_to).isoformat() if date_to else ''}",
-            f"nr={needs_review if needs_review is not None else ''}",
+            f"mc={manual_check if manual_check is not None else ''}",
             f"oa={odds_available if odds_available is not None else ''}",
             f"q={(search or '').strip().lower()}",
         ]
     )
+
+
+# --- V3 league name cache (for admin match views) ---
+
+_V3_LEAGUE_MAP: dict[int, str] = {}
+_V3_LEAGUE_MAP_TS: datetime | None = None
+
+
+async def _get_v3_league_map() -> dict[int, str]:
+    """Return cached league_id → display name map from league_registry_v3, refreshing every 10 min."""
+    global _V3_LEAGUE_MAP, _V3_LEAGUE_MAP_TS
+    now = utcnow()
+    if _V3_LEAGUE_MAP_TS and (now - ensure_utc(_V3_LEAGUE_MAP_TS)).total_seconds() < 600:
+        return _V3_LEAGUE_MAP
+    rows = await _db.db.league_registry_v3.find({}, {"_id": 1, "name": 1}).to_list(length=500)
+    _V3_LEAGUE_MAP = {
+        int(r["_id"]): str(r.get("name") or "")
+        for r in rows
+        if isinstance(r.get("_id"), int)
+    }
+    _V3_LEAGUE_MAP_TS = now
+    return _V3_LEAGUE_MAP
+
+
+def _referee_payload(
+    *,
+    profile: dict[str, Any] | None,
+    referee_id: int | None,
+    referee_name: str | None,
+    include_detail: bool = False,
+) -> dict[str, Any] | None:
+    if referee_id is None and not profile:
+        return None
+    if profile:
+        payload: dict[str, Any] = {
+            "id": int(profile.get("id") or (referee_id or 0)),
+            "name": str(profile.get("name") or referee_name or ""),
+            "strictness_index": float(profile.get("strictness_index") or 100.0),
+            "strictness_band": str(profile.get("strictness_band") or "normal"),
+            "avg_yellow": float(profile.get("avg_yellow") or 0.0),
+            "avg_red": float(profile.get("avg_red") or 0.0),
+            "penalty_pct": float(profile.get("penalty_pct") or 0.0),
+        }
+        if include_detail:
+            payload["season_avg"] = profile.get("season_avg") or None
+            payload["career_avg"] = profile.get("career_avg") or None
+            payload["trend"] = str(profile.get("trend") or "flat")
+        return payload
+    return {
+        "id": int(referee_id or 0),
+        "name": str(referee_name or ""),
+        "strictness_index": 100.0,
+        "strictness_band": "normal",
+        "avg_yellow": 0.0,
+        "avg_red": 0.0,
+        "penalty_pct": 0.0,
+    }
 
 
 # --- Request models ---
@@ -106,6 +150,24 @@ def _admin_matches_cache_key(
 class PointsAdjust(BaseModel):
     delta: float
     reason: str
+
+
+class AdminTipPersonaBody(BaseModel):
+    tip_persona: str
+
+
+class AdminTipOverrideBody(BaseModel):
+    tip_override_persona: str | None = None
+
+
+class TipPolicyRuleBody(BaseModel):
+    when: dict[str, Any] = {}
+    set_output_level: str
+
+
+class TipPolicyPatchBody(BaseModel):
+    rules: list[TipPolicyRuleBody]
+    note: str | None = None
 
 
 class ResultOverride(BaseModel):
@@ -133,9 +195,9 @@ async def admin_stats(admin=Depends(get_admin_user)):
         "submitted_at": {"$gte": now.replace(hour=0, minute=0, second=0)},
     })
     total_bets = await _db.db.betting_slips.count_documents({})
-    total_matches = await _db.db.matches.count_documents({})
-    pending_matches = await _db.db.matches.count_documents({"status": {"$in": ["scheduled", "live"]}})
-    completed_matches = await _db.db.matches.count_documents({"status": "final"})
+    total_matches = await _db.db.matches_v3.count_documents({})
+    pending_matches = await _db.db.matches_v3.count_documents({"status": {"$in": ["SCHEDULED", "LIVE"]}})
+    completed_matches = await _db.db.matches_v3.count_documents({"status": "FINISHED"})
     squad_count = await _db.db.squads.count_documents({})
     battle_count = await _db.db.battles.count_documents({})
     banned_count = await _db.db.users.count_documents({"is_banned": True})
@@ -156,8 +218,6 @@ async def admin_stats(admin=Depends(get_admin_user)):
         },
         "squads": squad_count,
         "battles": battle_count,
-        "api_usage": await odds_provider.load_usage(),
-        "circuit_open": odds_provider.circuit_open,
     }
 
 
@@ -193,12 +253,12 @@ _TRIGGERABLE_WORKERS = {
 }
 
 _SUPPORTED_PROVIDER_SETTINGS = {
-    "theoddsapi",
-    "football_data",
-    "openligadb",
-    "football_data_uk",
+    "sportmonks",
     "understat",
 }
+
+_TIP_PERSONA_VALUES = {"casual", "pro", "silent", "experimental"}
+_OUTPUT_LEVEL_VALUES = {"none", "summary", "full", "experimental"}
 
 
 @router.get("/provider-status")
@@ -207,17 +267,8 @@ async def provider_status(admin=Depends(get_admin_user)):
     from app.main import scheduler, automation_enabled, automated_job_count
 
     # Provider health
-    usage = await odds_provider.load_usage()
     providers = {
-        "odds_api": {
-            "label": "TheOddsAPI",
-            "status": "circuit_open" if odds_provider.circuit_open else "ok",
-            "requests_used": usage.get("requests_used"),
-            "requests_remaining": usage.get("requests_remaining"),
-        },
-        "football_data": {"label": "football-data.org", "status": "ok"},
-        "openligadb": {"label": "OpenLigaDB", "status": "ok"},
-        "espn": {"label": "ESPN", "status": "ok"},
+        "sportmonks": {"label": "Sportmonks", "status": "ok"},
     }
 
 
@@ -283,18 +334,17 @@ class ProviderSettingsPatchBody(BaseModel):
 
 class ProviderSecretSetBody(BaseModel):
     scope: str = "global"
-    league_id: Optional[str] = None
+    league_id: Optional[int] = None
     api_key: str
 
 
 class ProviderSecretClearBody(BaseModel):
     scope: str = "global"
-    league_id: Optional[str] = None
+    league_id: Optional[int] = None
 
 
 class ProviderProbeBody(BaseModel):
-    sport_key: Optional[str] = None
-    league_id: Optional[str] = None
+    league_id: Optional[int] = None
 
 
 def _ensure_supported_provider(provider: str) -> str:
@@ -314,8 +364,7 @@ def _mask_effective(payload: dict[str, Any]) -> dict[str, Any]:
 
 @router.get("/provider-settings")
 async def list_provider_settings(
-    league_id: Optional[str] = None,
-    sport_key: Optional[str] = None,
+    league_id: Optional[int] = None,
     admin=Depends(get_admin_user),
 ):
     """List effective runtime provider settings."""
@@ -324,22 +373,19 @@ async def list_provider_settings(
         resolved = await provider_settings_service.get_effective(
             provider,
             league_id=league_id,
-            sport_key=sport_key,
             include_secret=True,
         )
         items.append(_mask_effective(resolved))
     return {
         "items": items,
-        "league_id": league_id,
-        "sport_key": sport_key,
+        "league_id": int(league_id) if isinstance(league_id, int) else None,
     }
 
 
 @router.get("/provider-settings/{provider}")
 async def get_provider_settings(
     provider: str,
-    league_id: Optional[str] = None,
-    sport_key: Optional[str] = None,
+    league_id: Optional[int] = None,
     admin=Depends(get_admin_user),
 ):
     """Get effective runtime settings for one provider."""
@@ -347,7 +393,6 @@ async def get_provider_settings(
     resolved = await provider_settings_service.get_effective(
         normalized,
         league_id=league_id,
-        sport_key=sport_key,
         include_secret=True,
     )
     return _mask_effective(resolved)
@@ -388,7 +433,7 @@ async def patch_provider_settings_global(
 @router.patch("/provider-settings/{provider}/leagues/{league_id}")
 async def patch_provider_settings_league(
     provider: str,
-    league_id: str,
+    league_id: int,
     body: ProviderSettingsPatchBody,
     request: Request,
     admin=Depends(get_admin_user),
@@ -411,7 +456,7 @@ async def patch_provider_settings_league(
         metadata={
             "provider": normalized,
             "scope": "league",
-            "league_id": league_id,
+            "league_id": int(league_id) if isinstance(league_id, int) else None,
             "changed_fields": result.get("updated_fields", []),
         },
         request=request,
@@ -493,7 +538,7 @@ async def clear_provider_secret(
 async def provider_secret_status(
     provider: str,
     scope: str = Query("global"),
-    league_id: Optional[str] = None,
+    league_id: Optional[int] = None,
     admin=Depends(get_admin_user),
 ):
     """Return masked secret status for one provider scope."""
@@ -520,7 +565,6 @@ async def probe_provider_config(
     admin_id = str(admin["_id"])
     resolved = await provider_settings_service.get_effective(
         normalized,
-        sport_key=body.sport_key,
         league_id=body.league_id,
         include_secret=True,
     )
@@ -532,7 +576,7 @@ async def probe_provider_config(
     if not enabled:
         status_text = "warn"
         message = "Provider disabled."
-    elif normalized in {"theoddsapi", "football_data"} and not api_key:
+    elif normalized in {"sportmonks", "sportmonks"} and not api_key:
         status_text = "warn"
         message = "Missing API key."
     elif not base_url.startswith("http"):
@@ -548,7 +592,6 @@ async def probe_provider_config(
         action="PROVIDER_CONFIG_PROBE",
         metadata={
             "provider": normalized,
-            "sport_key": body.sport_key,
             "league_id": body.league_id,
             "status": status_text,
         },
@@ -619,21 +662,20 @@ async def event_bus_handlers(
 
 @router.get("/time-machine/justice")
 async def list_time_machine_justice(
-    sport_key: str | None = Query(default=None),
+    league_id: int | None = Query(default=None),
     limit: int = Query(default=50, ge=1, le=500),
     days: int = Query(default=0, ge=0, le=3650),
     admin=Depends(get_admin_user),
 ):
     """List Engine Time Machine justice snapshots for admin analytics UI."""
     query: dict[str, Any] = {}
-    normalized_sport_key = (sport_key or "").strip()
-    if normalized_sport_key:
-        query["sport_key"] = normalized_sport_key
+    if league_id is not None:
+        query["league_id"] = league_id
     if days > 0:
         query["snapshot_date"] = {"$gte": utcnow() - timedelta(days=days)}
 
     projection = {
-        "sport_key": 1,
+        "league_id": 1,
         "snapshot_date": 1,
         "window_start": 1,
         "window_end": 1,
@@ -652,7 +694,7 @@ async def list_time_machine_justice(
         items.append(
             {
                 "id": str(row.get("_id")),
-                "sport_key": str(row.get("sport_key") or ""),
+                "league_id": row.get("league_id") if isinstance(row.get("league_id"), int) else None,
                 "snapshot_date": ensure_utc(row.get("snapshot_date")).isoformat()
                 if row.get("snapshot_date")
                 else None,
@@ -669,13 +711,13 @@ async def list_time_machine_justice(
             }
         )
 
-    available_sports = await _db.db.engine_time_machine_justice.distinct("sport_key")
+    available_sports = await _db.db.engine_time_machine_justice.distinct("league_id")
     return {
         "items": items,
         "count": len(items),
-        "available_sports": sorted(str(x) for x in available_sports if x),
+        "available_sports": sorted(int(x) for x in available_sports if isinstance(x, int)),
         "filters": {
-            "sport_key": normalized_sport_key or None,
+            "league_id": int(league_id) if isinstance(league_id, int) else None,
             "limit": int(limit),
             "days": int(days),
         },
@@ -724,6 +766,10 @@ class HeartbeatConfigPatch(BaseModel):
 
 class HeartbeatOddsTickRequest(BaseModel):
     reason: str | None = "manual_provider_overview"
+
+
+class OddsModelExcludeBody(BaseModel):
+    reason: str | None = None
 
 
 @router.get("/heartbeat/config")
@@ -811,6 +857,36 @@ async def trigger_heartbeat_odds_tick(
 
 # --- User Management ---
 
+
+async def _log_admin_persona_change(
+    *,
+    admin_id: str,
+    target_user_id: str,
+    field: str,
+    old_value: str | None,
+    new_value: str | None,
+    request: Request,
+) -> None:
+    now = utcnow()
+    await _db.db.admin_audit_logs.insert_one(
+        {
+            "admin_id": str(admin_id),
+            "target_user_id": str(target_user_id),
+            "field": str(field),
+            "old_value": old_value,
+            "new_value": new_value,
+            "timestamp": now,
+            "created_at": now,
+        }
+    )
+    await log_audit(
+        actor_id=str(admin_id),
+        target_id=str(target_user_id),
+        action="ADMIN_PERSONA_UPDATED",
+        metadata={"field": field, "old_value": old_value, "new_value": new_value},
+        request=request,
+    )
+
 @router.get("/users")
 async def list_users(
     request: Request,
@@ -839,21 +915,34 @@ async def list_users(
             request=request,
         )
 
-    return [
-        {
-            "id": str(u["_id"]),
-            "email": u["email"],
-            "alias": u.get("alias", ""),
-            "has_custom_alias": u.get("has_custom_alias", False),
-            "points": u.get("points", 0),
-            "is_admin": u.get("is_admin", False),
-            "is_banned": u.get("is_banned", False),
-            "is_2fa_enabled": u.get("is_2fa_enabled", False),
-            "created_at": ensure_utc(u["created_at"]).isoformat(),
-            "bet_count": await _db.db.betting_slips.count_documents({"user_id": str(u["_id"])}),
-        }
-        for u in users
-    ]
+    policy = get_persona_policy_service()
+    items: list[dict[str, Any]] = []
+    for u in users:
+        effective, source = await policy.resolve_effective_persona(u)
+        items.append(
+            {
+                "id": str(u["_id"]),
+                "email": u["email"],
+                "alias": u.get("alias", ""),
+                "has_custom_alias": u.get("has_custom_alias", False),
+                "points": u.get("points", 0),
+                "is_admin": u.get("is_admin", False),
+                "is_banned": u.get("is_banned", False),
+                "is_2fa_enabled": u.get("is_2fa_enabled", False),
+                "created_at": ensure_utc(u["created_at"]).isoformat(),
+                "bet_count": await _db.db.betting_slips.count_documents({"user_id": str(u["_id"])}),
+                "tip_persona": str(u.get("tip_persona") or "casual"),
+                "tip_override_persona": u.get("tip_override_persona"),
+                "tip_persona_effective": effective,
+                "tip_persona_source": source,
+                "tip_persona_updated_at": (
+                    ensure_utc(u.get("tip_persona_updated_at")).isoformat()
+                    if u.get("tip_persona_updated_at")
+                    else None
+                ),
+            }
+        )
+    return items
 
 
 @router.post("/users/{user_id}/points")
@@ -922,6 +1011,226 @@ async def unban_user(user_id: str, request: Request, admin=Depends(get_admin_use
     return {"message": "Ban lifted."}
 
 
+@router.patch("/users/{user_id}/tip-persona")
+async def admin_update_user_tip_persona(
+    user_id: str,
+    body: AdminTipPersonaBody,
+    request: Request,
+    admin=Depends(get_admin_user),
+):
+    persona = str(body.tip_persona or "").strip().lower()
+    if persona not in _TIP_PERSONA_VALUES:
+        raise HTTPException(status_code=422, detail="Invalid tip_persona.")
+    user = await _db.db.users.find_one({"_id": ObjectId(user_id), "is_deleted": False})
+    if not isinstance(user, dict):
+        raise HTTPException(status_code=404, detail="User not found.")
+    now = utcnow()
+    old_value = str(user.get("tip_persona") or "casual")
+    await _db.db.users.update_one(
+        {"_id": ObjectId(user_id)},
+        {
+            "$set": {
+                "tip_persona": persona,
+                "tip_persona_updated_at": now,
+                "updated_at": now,
+            }
+        },
+    )
+    await _log_admin_persona_change(
+        admin_id=str(admin["_id"]),
+        target_user_id=user_id,
+        field="tip_persona",
+        old_value=old_value,
+        new_value=persona,
+        request=request,
+    )
+    return {"ok": True, "user_id": user_id, "tip_persona": persona}
+
+
+@router.patch("/users/{user_id}/tip-override")
+async def admin_update_user_tip_override(
+    user_id: str,
+    body: AdminTipOverrideBody,
+    request: Request,
+    admin=Depends(get_admin_user),
+):
+    override = body.tip_override_persona
+    if override is not None:
+        override = str(override).strip().lower()
+        if override not in _TIP_PERSONA_VALUES:
+            raise HTTPException(status_code=422, detail="Invalid tip_override_persona.")
+    user = await _db.db.users.find_one({"_id": ObjectId(user_id), "is_deleted": False})
+    if not isinstance(user, dict):
+        raise HTTPException(status_code=404, detail="User not found.")
+    now = utcnow()
+    old_value = user.get("tip_override_persona")
+    await _db.db.users.update_one(
+        {"_id": ObjectId(user_id)},
+        {
+            "$set": {
+                "tip_override_persona": override,
+                "tip_override_updated_at": now,
+                "updated_at": now,
+            }
+        },
+    )
+    await _log_admin_persona_change(
+        admin_id=str(admin["_id"]),
+        target_user_id=user_id,
+        field="tip_override_persona",
+        old_value=str(old_value) if old_value is not None else None,
+        new_value=str(override) if override is not None else None,
+        request=request,
+    )
+    return {"ok": True, "user_id": user_id, "tip_override_persona": override}
+
+
+def _validate_tip_policy_rules(rules: list[TipPolicyRuleBody]) -> list[dict[str, Any]]:
+    normalized: list[dict[str, Any]] = []
+    for idx, rule in enumerate(rules):
+        level = str(rule.set_output_level or "").strip().lower()
+        if level not in _OUTPUT_LEVEL_VALUES:
+            raise HTTPException(status_code=422, detail=f"Invalid set_output_level at rules[{idx}].")
+        when_raw = rule.when if isinstance(rule.when, dict) else {}
+        when: dict[str, Any] = {}
+        if "persona" in when_raw and when_raw["persona"] is not None:
+            persona = str(when_raw["persona"]).strip().lower()
+            if persona not in _TIP_PERSONA_VALUES:
+                raise HTTPException(status_code=422, detail=f"Invalid persona in rules[{idx}].when.")
+            when["persona"] = persona
+        for key in ("is_authenticated", "is_admin", "league_tipping_enabled"):
+            if key in when_raw and when_raw[key] is not None:
+                when[key] = bool(when_raw[key])
+        normalized.append({"when": when, "set_output_level": level})
+    return normalized
+
+
+@router.get("/tip-policy")
+async def get_tip_policy(admin=Depends(get_admin_user)):
+    _ = admin
+    doc = await _db.db.tip_persona_policy.find_one({"is_active": True}, sort=[("version", -1)])
+    if not isinstance(doc, dict):
+        return {
+            "version": 1,
+            "is_active": True,
+            "rules": [],
+            "note": None,
+            "updated_by": "system",
+            "updated_at": ensure_utc(utcnow()).isoformat(),
+        }
+    return {
+        "version": int(doc.get("version") or 1),
+        "is_active": bool(doc.get("is_active", True)),
+        "rules": doc.get("rules") if isinstance(doc.get("rules"), list) else [],
+        "note": doc.get("note"),
+        "updated_by": str(doc.get("updated_by") or ""),
+        "updated_at": ensure_utc(doc.get("updated_at")).isoformat() if doc.get("updated_at") else None,
+    }
+
+
+@router.patch("/tip-policy")
+async def patch_tip_policy(
+    body: TipPolicyPatchBody,
+    request: Request,
+    admin=Depends(get_admin_user),
+):
+    rules = _validate_tip_policy_rules(body.rules)
+    previous = await _db.db.tip_persona_policy.find_one({"is_active": True}, sort=[("version", -1)])
+    old_version = int(previous.get("version") or 1) if isinstance(previous, dict) else 1
+    now = utcnow()
+    if isinstance(previous, dict):
+        await _db.db.tip_persona_policy.update_one({"_id": previous["_id"]}, {"$set": {"is_active": False}})
+    next_doc = {
+        "version": old_version + 1,
+        "is_active": True,
+        "rules": rules,
+        "note": str(body.note or "").strip() or None,
+        "updated_by": str(admin["_id"]),
+        "updated_at": now,
+        "created_at": now,
+    }
+    await _db.db.tip_persona_policy.insert_one(next_doc)
+    await get_persona_policy_service().invalidate()
+    await _db.db.admin_audit_logs.insert_one(
+        {
+            "admin_id": str(admin["_id"]),
+            "target_user_id": None,
+            "field": "tip_persona_policy",
+            "old_value": f"v{old_version}",
+            "new_value": f"v{old_version + 1}",
+            "timestamp": now,
+            "created_at": now,
+        }
+    )
+    await log_audit(
+        actor_id=str(admin["_id"]),
+        target_id="tip_persona_policy",
+        action="TIP_POLICY_UPDATED",
+        metadata={"old_version": old_version, "new_version": old_version + 1},
+        request=request,
+    )
+    return {"ok": True, "old_version": old_version, "new_version": old_version + 1}
+
+
+@router.post("/tip-policy/simulate")
+async def simulate_tip_policy(
+    body: TipPolicyPatchBody,
+    admin=Depends(get_admin_user),
+):
+    _ = admin
+    proposed_rules = _validate_tip_policy_rules(body.rules)
+    users = await _db.db.users.find({"is_deleted": False}, {"tip_persona": 1, "tip_override_persona": 1, "is_admin": 1}).to_list(length=100_000)
+    active = await _db.db.tip_persona_policy.find_one({"is_active": True}, sort=[("version", -1)])
+    current_rules = active.get("rules") if isinstance(active, dict) and isinstance(active.get("rules"), list) else []
+
+    def _resolve_base_persona(user_doc: dict[str, Any]) -> str:
+        if user_doc.get("tip_override_persona") in _TIP_PERSONA_VALUES:
+            return str(user_doc.get("tip_override_persona"))
+        if user_doc.get("tip_persona") in _TIP_PERSONA_VALUES:
+            return str(user_doc.get("tip_persona"))
+        return "casual"
+
+    def _apply_rules(base_level: str, persona: str, is_admin: bool, ruleset: list[dict[str, Any]]) -> str:
+        current = str(base_level)
+        for rule in ruleset:
+            when = rule.get("when") if isinstance(rule.get("when"), dict) else {}
+            if "persona" in when and str(when["persona"]) != persona:
+                continue
+            if "is_admin" in when and bool(when["is_admin"]) != bool(is_admin):
+                continue
+            if "is_authenticated" in when and bool(when["is_authenticated"]) is not True:
+                continue
+            if "league_tipping_enabled" in when and bool(when["league_tipping_enabled"]) is not True:
+                continue
+            target = str(rule.get("set_output_level") or "none")
+            rank = {"none": 0, "summary": 1, "full": 2, "experimental": 3}
+            if rank.get(target, 0) <= rank.get(current, 0):
+                current = target
+        return current
+
+    affected = 0
+    delta_counts: dict[str, int] = {}
+    base_map = {"casual": "summary", "pro": "full", "silent": "none", "experimental": "experimental"}
+    for user_doc in users:
+        persona = _resolve_base_persona(user_doc)
+        is_admin = bool(user_doc.get("is_admin", False))
+        base = base_map.get(persona, "summary")
+        old_level = _apply_rules(base, persona, is_admin, current_rules)
+        new_level = _apply_rules(base, persona, is_admin, proposed_rules)
+        if old_level != new_level:
+            affected += 1
+            key = f"{old_level}->{new_level}"
+            delta_counts[key] = delta_counts.get(key, 0) + 1
+
+    return {
+        "ok": True,
+        "affected_users": int(affected),
+        "delta": delta_counts,
+        "proposed_rules": proposed_rules,
+        "current_version": int(active.get("version") or 1) if isinstance(active, dict) else 1,
+    }
+
+
 @router.post("/users/{user_id}/reset-alias")
 async def reset_alias(user_id: str, request: Request, admin=Depends(get_admin_user)):
     """Reset a user's alias back to a default User#XXXXXX tag."""
@@ -954,33 +1263,27 @@ async def reset_alias(user_id: str, request: Request, admin=Depends(get_admin_us
     return {"message": f"Alias reset: {old_alias} -> {alias}"}
 
 
-# --- Match Management ---
+# --- Match Management (v3 — queries matches_v3 collection) ---
 
 class MatchSyncBody(BaseModel):
-    league_id: str
+    league_id: int
 
-
-class MatchDuplicateCleanupBody(BaseModel):
-    league_id: Optional[str] = None
-    sport_key: Optional[str] = None
-    limit_groups: int = 500
-    dry_run: bool = False
 
 @router.get("/matches")
 async def list_all_matches(
     response: Response,
-    league_id: Optional[str] = Query(None),
+    league_id: Optional[int] = Query(None),
     status_filter: Optional[str] = Query(None, alias="status"),
     date_from: Optional[datetime] = Query(None),
     date_to: Optional[datetime] = Query(None),
-    needs_review: Optional[bool] = Query(None),
+    manual_check: Optional[bool] = Query(None),
     odds_available: Optional[bool] = Query(None),
     search: Optional[str] = Query(None),
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=1, le=200),
     admin=Depends(get_admin_user),
 ):
-    """List matches with league/status/date/review filters (admin view)."""
+    """List matches from matches_v3 with filters (admin view)."""
     if search and len(search.strip()) > 64:
         raise HTTPException(status_code=400, detail="search must be at most 64 chars.")
 
@@ -991,7 +1294,7 @@ async def list_all_matches(
         status_filter=status_filter,
         date_from=date_from,
         date_to=date_to,
-        needs_review=needs_review,
+        manual_check=manual_check,
         odds_available=odds_available,
         search=search,
     )
@@ -1005,25 +1308,26 @@ async def list_all_matches(
         _ADMIN_MATCHES_CACHE.pop(cache_key, None)
 
     and_filters: list[dict[str, Any]] = []
-    if league_id:
-        and_filters.append({"league_id": _parse_object_id(league_id, "league_id")})
+    if league_id is not None:
+        and_filters.append({"league_id": league_id})
     if status_filter:
-        and_filters.append({"status": status_filter})
+        and_filters.append({"status": status_filter.upper()})
     if date_from or date_to:
-        date_filter: dict[str, datetime] = {}
+        date_q: dict[str, datetime] = {}
         if date_from:
-            date_filter["$gte"] = ensure_utc(date_from)
+            date_q["$gte"] = ensure_utc(date_from)
         if date_to:
-            date_filter["$lte"] = ensure_utc(date_to)
-        and_filters.append({"match_date": date_filter})
+            date_q["$lte"] = ensure_utc(date_to)
+        and_filters.append({"start_at": date_q})
+    # FIXME: ODDS_V3_BREAK — odds_available filter reads odds_meta.summary_1x2 which is no longer written by connector
     if odds_available is True:
-        and_filters.append({"odds_meta.updated_at": {"$ne": None}})
+        and_filters.append({"odds_meta.summary_1x2.home.avg": {"$exists": True}})
     elif odds_available is False:
         and_filters.append(
             {
                 "$or": [
-                    {"odds_meta.updated_at": None},
-                    {"odds_meta.updated_at": {"$exists": False}},
+                    {"odds_meta.summary_1x2.home.avg": {"$exists": False}},
+                    {"odds_meta.summary_1x2": {"$exists": False}},
                 ]
             }
         )
@@ -1032,89 +1336,91 @@ async def list_all_matches(
         and_filters.append(
             {
                 "$or": [
-                    {"home_team": {"$regex": escaped, "$options": "i"}},
-                    {"away_team": {"$regex": escaped, "$options": "i"}},
+                    {"teams.home.name": {"$regex": escaped, "$options": "i"}},
+                    {"teams.away.name": {"$regex": escaped, "$options": "i"}},
                 ]
             }
         )
-    if needs_review is True:
-        review_team_ids = await _db.db.teams.distinct("_id", {"needs_review": True})
-        if not review_team_ids:
-            empty_payload = {"items": [], "page": page, "page_size": page_size, "total": 0}
-            _ADMIN_MATCHES_CACHE[cache_key] = (cache_now, empty_payload)
-            response.headers["X-Admin-Cache"] = "MISS"
-            return empty_payload
+    if manual_check is True:
+        and_filters.append({"manual_check_required": True})
+    elif manual_check is False:
         and_filters.append(
-            {
-                "$or": [
-                    {"home_team_id": {"$in": review_team_ids}},
-                    {"away_team_id": {"$in": review_team_ids}},
-                ]
-            }
+            {"$or": [{"manual_check_required": False}, {"manual_check_required": {"$exists": False}}]}
         )
 
     query: dict[str, Any] = {"$and": and_filters} if and_filters else {}
 
-    total = await _db.db.matches.count_documents(query)
+    projection = {
+        "_id": 1, "league_id": 1, "start_at": 1, "status": 1,
+        "teams.home.name": 1, "teams.home.image_path": 1,
+        "teams.away.name": 1, "teams.away.image_path": 1,
+        "scores": 1, "round_id": 1,
+        "season_id": 1, "referee_id": 1, "referee_name": 1,
+        # FIXME: ODDS_V3_BREAK — projection reads odds_meta.summary_1x2 no longer produced by connector
+        "odds_meta.summary_1x2.home.avg": 1, "odds_meta.updated_at": 1,
+        "has_advanced_stats": 1, "manual_check_required": 1,
+    }
+
+    total = await _db.db.matches_v3.count_documents(query)
     skip = (page - 1) * page_size
-    matches = await _db.db.matches.find(query).sort("match_date", -1).skip(skip).limit(page_size).to_list(length=page_size)
+    matches = (
+        await _db.db.matches_v3.find(query, projection)
+        .sort("start_at", -1)
+        .skip(skip)
+        .limit(page_size)
+        .to_list(length=page_size)
+    )
 
-    league_ids = [m.get("league_id") for m in matches if m.get("league_id")]
-    leagues_by_id: dict[ObjectId, str] = {}
-    if league_ids:
-        league_docs = await _db.db.leagues.find(
-            {"_id": {"$in": league_ids}},
-            {"display_name": 1, "name": 1},
-        ).to_list(length=500)
-        leagues_by_id = {
-            d["_id"]: str(d.get("display_name") or d.get("name") or "")
-            for d in league_docs
-        }
-
-    match_ids = [str(m["_id"]) for m in matches]
-    bet_count_map: dict[str, int] = {}
-    if match_ids:
-        bet_counts = await _db.db.betting_slips.aggregate(
-            [
-                {"$match": {"selections.match_id": {"$in": match_ids}}},
-                {"$unwind": "$selections"},
-                {"$match": {"selections.match_id": {"$in": match_ids}}},
-                {"$group": {"_id": "$selections.match_id", "count": {"$sum": 1}}},
-            ]
-        ).to_list(length=10_000)
-        bet_count_map = {str(doc["_id"]): int(doc.get("count", 0)) for doc in bet_counts}
+    league_map = await _get_v3_league_map()
+    referee_profiles_by_key: dict[tuple[int, int], dict[str, Any]] = {}
+    referee_ids_by_league: dict[int, set[int]] = {}
+    for row in matches:
+        lid = row.get("league_id")
+        rid = row.get("referee_id")
+        if isinstance(lid, int) and isinstance(rid, int):
+            referee_ids_by_league.setdefault(int(lid), set()).add(int(rid))
+    for lid, ids in referee_ids_by_league.items():
+        profiles = await build_referee_profiles(sorted(ids), league_id=int(lid))
+        for rid, profile in profiles.items():
+            referee_profiles_by_key[(int(lid), int(rid))] = profile
 
     items = []
     for m in matches:
+        teams = m.get("teams") or {}
+        home = teams.get("home") or {}
+        away = teams.get("away") or {}
         odds_meta = m.get("odds_meta") if isinstance(m.get("odds_meta"), dict) else {}
-        odds_updated_at = odds_meta.get("updated_at") if isinstance(odds_meta, dict) else None
-        raw_matchday = m.get("matchday")
-        matchday = None
-        if isinstance(raw_matchday, (int, float)):
-            matchday = int(raw_matchday)
-        elif isinstance(raw_matchday, str):
-            text = raw_matchday.strip()
-            if text.isdigit():
-                matchday = int(text)
+        om_updated = odds_meta.get("updated_at") if isinstance(odds_meta, dict) else None
+        has_odds = bool(((odds_meta.get("summary_1x2") or {}).get("home") or {}).get("avg"))
+        league_id_value = int(m.get("league_id") or 0)
+        referee_id_value = m.get("referee_id") if isinstance(m.get("referee_id"), int) else None
+        referee_profile = (
+            referee_profiles_by_key.get((league_id_value, int(referee_id_value)))
+            if referee_id_value is not None
+            else None
+        )
         items.append(
             {
-                "id": str(m["_id"]),
-                "league_id": str(m["league_id"]) if m.get("league_id") else None,
-                "league_name": leagues_by_id.get(m.get("league_id"), ""),
-                "sport_key": m["sport_key"],
-                "home_team": m.get("home_team", ""),
-                "away_team": m.get("away_team", ""),
-                "home_team_id": str(m.get("home_team_id")) if m.get("home_team_id") else None,
-                "away_team_id": str(m.get("away_team_id")) if m.get("away_team_id") else None,
-                "match_date": ensure_utc(m["match_date"]).isoformat(),
+                "id": int(m["_id"]),
+                "league_id": league_id_value,
+                "league_name": league_map.get(league_id_value, ""),
+                "home_team": home.get("name", ""),
+                "away_team": away.get("name", ""),
+                "home_image": home.get("image_path"),
+                "away_image": away.get("image_path"),
+                "start_at": ensure_utc(m["start_at"]).isoformat(),
                 "status": m["status"],
-                "score": m.get("score", {}),
-                "result": m.get("result", {}),
-                "matchday": matchday,
-                "external_ids": m.get("external_ids", {}),
-                "has_odds": bool(odds_updated_at),
-                "odds_updated_at": (ensure_utc(odds_updated_at).isoformat() if odds_updated_at else None),
-                "bet_count": int(bet_count_map.get(str(m["_id"]), 0)),
+                "scores": m.get("scores", {}),
+                "round_id": m.get("round_id"),
+                "has_odds": has_odds,
+                "odds_updated_at": (ensure_utc(om_updated).isoformat() if om_updated else None),
+                "has_advanced_stats": bool(m.get("has_advanced_stats")),
+                "manual_check_required": bool(m.get("manual_check_required")),
+                "referee": _referee_payload(
+                    profile=referee_profile,
+                    referee_id=referee_id_value,
+                    referee_name=str(m.get("referee_name") or "") or None,
+                ),
             }
         )
 
@@ -1130,123 +1436,84 @@ async def list_all_matches(
 
 
 @router.get("/matches/{match_id}")
-async def get_admin_match_detail(match_id: str, admin=Depends(get_admin_user)):
-    oid = _parse_object_id(match_id, "match_id")
-    match = await _db.db.matches.find_one({"_id": oid})
-    if not match:
+async def get_admin_match_detail(match_id: int, admin=Depends(get_admin_user)):
+    """Return full v3 match detail including odds_timeline (admin view)."""
+    doc = await _db.db.matches_v3.find_one({"_id": match_id})
+    if not doc:
         raise HTTPException(status_code=404, detail="Match not found.")
 
-    league_name = ""
-    if match.get("league_id"):
-        league = await _db.db.leagues.find_one({"_id": match["league_id"]}, {"display_name": 1, "name": 1})
-        if league:
-            league_name = str(league.get("display_name") or league.get("name") or "")
+    league_map = await _get_v3_league_map()
+    teams = doc.get("teams") or {}
+    home = teams.get("home") or {}
+    away = teams.get("away") or {}
+    referee_id_value = doc.get("referee_id") if isinstance(doc.get("referee_id"), int) else None
+    season_id_value = doc.get("season_id") if isinstance(doc.get("season_id"), int) else None
+    league_id_value = doc.get("league_id") if isinstance(doc.get("league_id"), int) else None
+    referee_profile: dict[str, Any] | None = None
+    if referee_id_value is not None:
+        profiles = await build_referee_profiles(
+            [int(referee_id_value)],
+            season_id=season_id_value,
+            league_id=league_id_value,
+        )
+        referee_profile = profiles.get(int(referee_id_value))
 
-    odds_meta = match.get("odds_meta") if isinstance(match.get("odds_meta"), dict) else {}
-    odds_updated_at = odds_meta.get("updated_at") if isinstance(odds_meta, dict) else None
-    raw_matchday = match.get("matchday")
-    matchday = None
-    if isinstance(raw_matchday, (int, float)):
-        matchday = int(raw_matchday)
-    elif isinstance(raw_matchday, str):
-        text = raw_matchday.strip()
-        if text.isdigit():
-            matchday = int(text)
+    def _team_out(t: dict) -> dict:
+        return {
+            "sm_id": t.get("sm_id"),
+            "name": t.get("name", ""),
+            "short_code": t.get("short_code"),
+            "image_path": t.get("image_path"),
+            "score": t.get("score"),
+            "xg": t.get("xg"),
+        }
+
     return {
-        "id": str(match["_id"]),
-        "league_id": str(match.get("league_id")) if match.get("league_id") else None,
-        "league_name": league_name,
-        "sport_key": match.get("sport_key"),
-        "home_team": match.get("home_team", ""),
-        "away_team": match.get("away_team", ""),
-        "home_team_id": str(match.get("home_team_id")) if match.get("home_team_id") else None,
-        "away_team_id": str(match.get("away_team_id")) if match.get("away_team_id") else None,
-        "match_date": ensure_utc(match.get("match_date")).isoformat() if match.get("match_date") else None,
-        "status": match.get("status"),
-        "score": match.get("score", {}),
-        "result": match.get("result", {}),
-        "matchday": matchday,
-        "stats": match.get("stats", {}),
-        "external_ids": match.get("external_ids", {}),
-        "odds_meta": odds_meta,
-        "has_odds": bool(odds_updated_at),
-        "odds_updated_at": ensure_utc(odds_updated_at).isoformat() if odds_updated_at else None,
+        "id": int(doc["_id"]),
+        "league_id": int(doc["league_id"]),
+        "league_name": league_map.get(doc.get("league_id", 0), ""),
+        "season_id": doc.get("season_id"),
+        "round_id": doc.get("round_id"),
+        "referee_id": referee_id_value,
+        "referee_name": doc.get("referee_name"),
+        "referee": _referee_payload(
+            profile=referee_profile,
+            referee_id=referee_id_value,
+            referee_name=str(doc.get("referee_name") or "") or None,
+            include_detail=True,
+        ),
+        "start_at": ensure_utc(doc["start_at"]).isoformat(),
+        "status": doc["status"],
+        "finish_type": doc.get("finish_type"),
+        "has_advanced_stats": bool(doc.get("has_advanced_stats")),
+        "teams": {"home": _team_out(home), "away": _team_out(away)},
+        "scores": doc.get("scores", {}),
+        "events": doc.get("events", []),
+        # FIXME: ODDS_V3_BREAK — returns odds_meta and odds_timeline no longer produced by connector
+        "odds_meta": doc.get("odds_meta", {}),
+        "odds_timeline": doc.get("odds_timeline", []),
+        "manual_check_required": bool(doc.get("manual_check_required")),
+        "manual_check_reasons": doc.get("manual_check_reasons", []),
     }
 
 
 @router.get("/match-duplicates")
-async def list_match_duplicates_admin(
-    league_id: Optional[str] = Query(None),
-    sport_key: Optional[str] = Query(None),
-    limit_groups: int = Query(200, ge=1, le=2000),
-    admin=Depends(get_admin_user),
-):
-    league_oid = _parse_object_id(league_id, "league_id") if league_id else None
-    result = await list_same_day_duplicate_matches(
-        league_id=league_oid,
-        sport_key=sport_key,
-        limit_groups=limit_groups,
-    )
-    league_ids: set[ObjectId] = set()
-    for group in result.get("groups", []):
-        raw = str(group.get("league_id") or "").strip()
-        if not raw:
-            continue
-        try:
-            league_ids.add(ObjectId(raw))
-        except Exception:
-            continue
-
-    leagues_by_id: dict[str, str] = {}
-    if league_ids:
-        league_docs = await _db.db.leagues.find({"_id": {"$in": list(league_ids)}}, {"display_name": 1, "name": 1}).to_list(length=5000)
-        leagues_by_id = {
-            str(doc["_id"]): str(doc.get("display_name") or doc.get("name") or "")
-            for doc in league_docs
-        }
-
-    for group in result.get("groups", []):
-        group["league_name"] = leagues_by_id.get(str(group.get("league_id") or ""), "")
-
-    return result
+async def list_match_duplicates_admin(admin=Depends(get_admin_user)):
+    raise HTTPException(status_code=410, detail="Legacy endpoint removed. V3 deduplicates at ingest time.")
 
 
 @router.post("/match-duplicates/cleanup")
-async def cleanup_match_duplicates_admin(
-    body: MatchDuplicateCleanupBody,
-    request: Request,
-    admin=Depends(get_admin_user),
-):
-    league_oid = _parse_object_id(body.league_id, "league_id") if body.league_id else None
-    result = await cleanup_same_day_duplicate_matches(
-        league_id=league_oid,
-        sport_key=body.sport_key,
-        limit_groups=int(body.limit_groups or 500),
-        dry_run=bool(body.dry_run),
-    )
-    _admin_matches_cache_invalidate()
-    await log_audit(
-        actor_id=str(admin["_id"]),
-        target_id=body.league_id or (body.sport_key or "all"),
-        action="MATCH_DUPLICATE_CLEANUP",
-        metadata={
-            "league_id": body.league_id,
-            "sport_key": body.sport_key,
-            "limit_groups": int(body.limit_groups or 500),
-            **result,
-        },
-        request=request,
-    )
-    return result
+async def cleanup_match_duplicates_admin(admin=Depends(get_admin_user)):
+    raise HTTPException(status_code=410, detail="Legacy endpoint removed. V3 deduplicates at ingest time.")
 
 
-async def _run_matches_sync_for_league(sport_key: str) -> None:
+async def _run_matches_sync_for_league(league_id: int) -> None:
     from app.services.match_service import sync_matches_for_sport
 
     try:
-        await sync_matches_for_sport(sport_key)
+        await sync_matches_for_sport(league_id)
     except Exception:
-        logger.exception("Manual match sync failed for %s", sport_key)
+        logger.exception("Manual match sync failed for %s", league_id)
 
 
 @router.post("/matches/sync")
@@ -1265,7 +1532,7 @@ async def override_result(
     match_id: str, body: ResultOverride, request: Request, admin=Depends(get_admin_user)
 ):
     """Override a match result (force settle)."""
-    match = await _db.db.matches.find_one({"_id": ObjectId(match_id)})
+    match = await _db.db.matches_v3.find_one({"_id": int(match_id)})
     if not match:
         raise HTTPException(status_code=404, detail="Match not found.")
 
@@ -1273,16 +1540,16 @@ async def override_result(
     before = {
         "status": match.get("status"),
         "result": match.get("result", {}),
-        "match_date": ensure_utc(match.get("match_date")).isoformat() if match.get("match_date") else None,
+        "start_at": ensure_utc(match.get("start_at")).isoformat() if match.get("start_at") else None,
     }
     old_result = before.get("result", {}).get("outcome")
 
     # Update match
-    await _db.db.matches.update_one(
-        {"_id": ObjectId(match_id)},
+    await _db.db.matches_v3.update_one(
+        {"_id": int(match_id)},
         {
             "$set": {
-                "status": "final",
+                "status": "FINISHED",
                 "result.outcome": body.result,
                 "result.home_score": body.home_score,
                 "result.away_score": body.away_score,
@@ -1312,13 +1579,13 @@ async def override_result(
             "home_score": body.home_score, "away_score": body.away_score,
             "before": before,
             "after": {
-                "status": "final",
+                "status": "FINISHED",
                 "result": {
                     "outcome": body.result,
                     "home_score": body.home_score,
                     "away_score": body.away_score,
                 },
-                "match_date": before.get("match_date"),
+                "start_at": before.get("start_at"),
             },
         },
         request=request,
@@ -1338,7 +1605,7 @@ async def _re_resolve_bets(match_id: str, new_result: str, now: datetime, admin:
     """Re-resolve all betting slips containing this match via the Universal Resolver."""
     from app.workers.match_resolver import resolve_selection, recalculate_slip
 
-    match = await _db.db.matches.find_one({"_id": ObjectId(match_id)})
+    match = await _db.db.matches_v3.find_one({"_id": int(match_id)})
     home_score = match.get("result", {}).get("home_score", 0) if match else 0
     away_score = match.get("result", {}).get("away_score", 0) if match else 0
 
@@ -1597,15 +1864,15 @@ def _league_to_dict(doc: dict) -> dict:
     features = doc.get("features", {})
     if not isinstance(features, dict):
         features = {}
-    sport_key = str(doc.get("sport_key", ""))
+    league_id = doc.get("league_id") if isinstance(doc.get("league_id"), int) else None
     season_start_month = int(
         doc.get("season_start_month")
-        or default_season_start_month_for_sport(sport_key)
+        or default_season_start_month_for_league(league_id)
     )
 
     return {
         "id": str(doc["_id"]),
-        "sport_key": sport_key,
+        "league_id": int(league_id) if isinstance(league_id, int) else None,
         "display_name": doc.get("display_name") or doc.get("name") or "",
         "structure_type": str(doc.get("structure_type") or "league"),
         "country_code": doc.get("country_code"),
@@ -1613,14 +1880,13 @@ def _league_to_dict(doc: dict) -> dict:
         "season_start_month": season_start_month,
         "current_season": int(
             doc.get("current_season")
-            or default_current_season_for_sport(
-                sport_key,
+            or default_current_season_for_league(
+                league_id,
                 season_start_month=season_start_month,
             )
         ),
         "ui_order": int(doc.get("ui_order", 999)),
         "is_active": bool(doc.get("is_active", False)),
-        "needs_review": bool(doc.get("needs_review", False)),
         "features": {
             "tipping": bool(features.get("tipping")),
             "match_load": bool(features.get("match_load")),
@@ -1632,13 +1898,13 @@ def _league_to_dict(doc: dict) -> dict:
             for provider, external_id in external_ids.items()
             if str(provider).strip() and str(external_id).strip()
         },
-        "football_data_last_import_at": (
-            ensure_utc(doc.get("football_data_last_import_at")).isoformat()
-            if doc.get("football_data_last_import_at")
+        "sportmonks_last_import_at": (
+            ensure_utc(doc.get("sportmonks_last_import_at")).isoformat()
+            if doc.get("sportmonks_last_import_at")
             else None
         ),
-        "football_data_last_import_season": doc.get("football_data_last_import_season"),
-        "football_data_last_import_by": doc.get("football_data_last_import_by"),
+        "sportmonks_last_import_season": doc.get("sportmonks_last_import_season"),
+        "sportmonks_last_import_by": doc.get("sportmonks_last_import_by"),
         "created_at": ensure_utc(doc.get("created_at")).isoformat() if doc.get("created_at") else None,
         "updated_at": ensure_utc(doc.get("updated_at")).isoformat() if doc.get("updated_at") else None,
     }
@@ -1667,7 +1933,7 @@ class LeagueUpdateBody(BaseModel):
 
 
 class LeagueOrderBody(BaseModel):
-    league_ids: list[str]
+    league_ids: list[int]
 
 
 class LeagueStatsImportBody(BaseModel):
@@ -1691,7 +1957,7 @@ class LeagueSyncRequest(BaseModel):
 
 
 class XGEnrichmentRequest(BaseModel):
-    sport_key: str | None = None
+    league_id: int | None = None
     season: str | None = None
     dry_run: bool = False
     force: bool = False
@@ -1706,7 +1972,7 @@ def _serialize_import_job(doc: dict) -> dict:
         "phase": doc.get("phase", "queued"),
         "progress": doc.get("progress", {"processed": 0, "total": 0, "percent": 0.0}),
         "counters": doc.get("counters", {}),
-        "league_id": str(doc.get("league_id")) if doc.get("league_id") else None,
+        "league_id": doc.get("league_id") if isinstance(doc.get("league_id"), int) else None,
         "season": doc.get("season"),
         "dry_run": bool(doc.get("dry_run", False)),
         "started_at": ensure_utc(doc.get("started_at")).isoformat() if doc.get("started_at") else None,
@@ -1717,104 +1983,9 @@ def _serialize_import_job(doc: dict) -> dict:
     }
 
 
-async def _run_football_data_import_job(
-    job_id: ObjectId,
-    league_id: ObjectId,
-    season: str | None,
-    dry_run: bool,
-    admin_id: str,
-) -> None:
-    now = utcnow()
-    await _db.db.admin_import_jobs.update_one(
-        {"_id": job_id},
-        {
-            "$set": {
-                "status": "running",
-                "phase": "fetching_csv",
-                "started_at": now,
-                "updated_at": now,
-            }
-        },
-    )
-
-    async def _progress_update(payload: dict[str, Any]) -> None:
-        update_doc: dict[str, Any] = {"updated_at": utcnow()}
-        if payload.get("phase"):
-            update_doc["phase"] = payload["phase"]
-        if payload.get("progress"):
-            update_doc["progress"] = payload["progress"]
-        await _db.db.admin_import_jobs.update_one({"_id": job_id}, {"$set": update_doc})
-
-    try:
-        result = await import_football_data_stats(
-            league_id=league_id,
-            season=season,
-            dry_run=dry_run,
-            progress_cb=_progress_update,
-        )
-        now = utcnow()
-        counters = {
-            "matched": int(result.get("matched", 0)),
-            "existing_matches": int(result.get("existing_matches", 0)),
-            "new_matches": int(result.get("new_matches", 0)),
-            "updated": int(result.get("updated", 0)),
-            "odds_snapshots_total": int(result.get("odds_snapshots_total", 0)),
-            "odds_ingest_inserted": int(result.get("odds_ingest_inserted", 0)),
-            "odds_ingest_deduplicated": int(result.get("odds_ingest_deduplicated", 0)),
-            "odds_ingest_markets_updated": int(result.get("odds_ingest_markets_updated", 0)),
-            "odds_ingest_errors": int(result.get("odds_ingest_errors", 0)),
-        }
-        await _db.db.admin_import_jobs.update_one(
-            {"_id": job_id},
-            {
-                "$set": {
-                    "status": "succeeded",
-                    "phase": "finalizing",
-                    "counters": counters,
-                    "results": result,
-                    "updated_at": now,
-                    "finished_at": now,
-                }
-            },
-        )
-        if not dry_run:
-            await _db.db.league_registry_v3.update_one(
-                {"_id": league_id},
-                {
-                    "$set": {
-                        "football_data_last_import_at": now,
-                        "football_data_last_import_season": result.get("season"),
-                        "football_data_last_import_by": admin_id,
-                        "football_data_last_import_summary": {
-                            "matched": counters["matched"],
-                            "updated": counters["updated"],
-                            "odds_snapshots_total": counters["odds_snapshots_total"],
-                        },
-                        "updated_at": now,
-                    }
-                },
-            )
-    except Exception as exc:
-        await _db.db.admin_import_jobs.update_one(
-            {"_id": job_id},
-            {
-                "$set": {
-                    "status": "failed",
-                    "updated_at": utcnow(),
-                    "finished_at": utcnow(),
-                    "error": {
-                        "message": str(exc),
-                        "type": type(exc).__name__,
-                    },
-                }
-            },
-        )
-        logger.exception("Async football-data import job failed: %s", str(job_id))
-
-
 async def _run_unified_match_ingest_job(
     job_id: ObjectId,
-    league_id: ObjectId,
+    league_id: int,
     source: str,
     season: int | str | None,
     dry_run: bool,
@@ -1838,106 +2009,9 @@ async def _run_unified_match_ingest_job(
 
     try:
         source_key = str(source or "").strip().lower()
-        if source_key == "football_data_uk":
-            if season is not None and not isinstance(season, str):
-                season = str(season)
-            result = await import_football_data_stats(
-                league_id=league_id,
-                season=season,
-                dry_run=dry_run,
-                progress_cb=_progress_update,
-            )
-            counters = {
-                "processed": int(result.get("processed", 0)),
-                "created": int(result.get("new_matches", 0)),
-                "updated": int(result.get("updated", 0)),
-                "matched": int(result.get("matched", 0)),
-                "skipped": 0,
-                "conflicts": 0,
-                "matched_by_external_id": 0,
-                "matched_by_identity_window": 0,
-                "unresolved_league": 0,
-                "unresolved_team": 0,
-                "team_name_conflict": 0,
-                "other_conflicts": 0,
-            }
-        elif source_key == "football_data":
-            if season is None:
-                raise ValueError("season is required for football_data")
-            result = await import_football_data_org_season(
-                league_id=league_id,
-                season_year=int(season),
-                dry_run=dry_run,
-                progress_cb=_progress_update,
-            )
-            ingest_meta = result.get("match_ingest") if isinstance(result.get("match_ingest"), dict) else {}
-            counters = {
-                "processed": int(result.get("processed", 0)),
-                "created": int(result.get("created", 0)),
-                "updated": int(result.get("updated", 0)),
-                "matched": int(result.get("matched", 0)),
-                "skipped": int(result.get("skipped_conflicts", 0)),
-                "conflicts": int(result.get("skipped_conflicts", 0)),
-                "matched_by_external_id": int(ingest_meta.get("matched_by_external_id", 0)),
-                "matched_by_identity_window": int(ingest_meta.get("matched_by_identity_window", 0)),
-                "unresolved_league": 0,
-                "unresolved_team": int(result.get("unresolved_teams", 0)),
-                "team_name_conflict": int(ingest_meta.get("team_name_conflict", 0)),
-                "other_conflicts": int(ingest_meta.get("other_conflicts", 0)),
-            }
-        elif source_key == "openligadb":
-            if season is None:
-                raise ValueError("season is required for openligadb")
-            result = await import_openligadb_season(
-                league_id=league_id,
-                season_year=int(season),
-                dry_run=dry_run,
-                progress_cb=_progress_update,
-            )
-            ingest_meta = result.get("match_ingest") if isinstance(result.get("match_ingest"), dict) else {}
-            counters = {
-                "processed": int(result.get("processed", 0)),
-                "created": int(result.get("created", 0)),
-                "updated": int(result.get("updated", 0)),
-                "matched": int(result.get("matched", 0)),
-                "skipped": int(result.get("skipped_conflicts", 0)),
-                "conflicts": int(result.get("skipped_conflicts", 0)),
-                "matched_by_external_id": int(ingest_meta.get("matched_by_external_id", 0)),
-                "matched_by_identity_window": int(ingest_meta.get("matched_by_identity_window", 0)),
-                "unresolved_league": 0,
-                "unresolved_team": int(result.get("unresolved_teams", 0)),
-                "team_name_conflict": int(ingest_meta.get("team_name_conflict", 0)),
-                "other_conflicts": int(ingest_meta.get("other_conflicts", 0)),
-            }
-        else:
-            raise ValueError(f"Unsupported ingest source: {source_key}")
-
-        now = utcnow()
-        await _db.db.admin_import_jobs.update_one(
-            {"_id": job_id},
-            {
-                "$set": {
-                    "status": "succeeded",
-                    "phase": "finalizing",
-                    "counters": counters,
-                    "results": result,
-                    "updated_at": now,
-                    "finished_at": now,
-                }
-            },
+        raise ValueError(
+            f"Legacy ingest source '{source_key}' removed. Use Sportmonks ingest endpoints."
         )
-        if not dry_run:
-            await _db.db.league_registry_v3.update_one(
-                {"_id": league_id},
-                {
-                    "$set": {
-                        "match_ingest_last_run_at": now,
-                        "match_ingest_last_source": source_key,
-                        "match_ingest_last_run_by": admin_id,
-                        "updated_at": now,
-                    }
-                },
-            )
     except Exception as exc:
         now = utcnow()
         await _db.db.admin_import_jobs.update_one(
@@ -1956,7 +2030,7 @@ async def _run_unified_match_ingest_job(
 
 async def _run_xg_enrichment_job(
     job_id: ObjectId,
-    sport_key: str | None,
+    league_id: int | None,
     season_spec: str | None,
     dry_run: bool,
     force: bool,
@@ -1967,177 +2041,23 @@ async def _run_xg_enrichment_job(
         {"_id": job_id},
         {"$set": {"status": "running", "phase": "resolving_scope", "started_at": now, "updated_at": now}},
     )
-
-    try:
-        seasons = parse_xg_season_spec(season_spec)
-    except Exception as exc:
-        now = utcnow()
-        await _db.db.admin_import_jobs.update_one(
-            {"_id": job_id},
-            {
-                "$set": {
-                    "status": "failed",
-                    "updated_at": now,
-                    "finished_at": now,
-                    "error": {"message": str(exc), "type": type(exc).__name__},
-                }
-            },
-        )
-        logger.exception("Async xG enrichment job invalid season spec: %s", str(job_id))
-        return
-
-    try:
-        target_sports = await list_xg_target_sport_keys(sport_key)
-        if sport_key and not target_sports:
-            raise ValueError(
-                f"sport_key={sport_key} is not eligible (requires active league + xg_sync + understat mapping)."
-            )
-        if not target_sports:
-            raise ValueError("No eligible leagues found for xG enrichment.")
-
-        total_runs = len(target_sports) * len(seasons)
-        runs_done = 0
-        counters = {
-            "processed": 0,
-            "total": 0,
-            "matched": 0,
-            "unmatched": 0,
-            "skipped": 0,
-            "already_enriched": 0,
-            "alias_suggestions_recorded": 0,
-            "leagues_processed": 0,
-            "seasons_processed": 0,
-            "runs_total": total_runs,
-            "runs_completed": 0,
-        }
-        results_items: list[dict[str, Any]] = []
-        unmatched_teams_seen: set[str] = set()
-        raw_rows_preview: list[dict[str, Any]] = []
-
-        for current_sport in target_sports:
-            for season_year in seasons:
-                await _db.db.admin_import_jobs.update_one(
-                    {"_id": job_id},
-                    {
-                        "$set": {
-                            "phase": "enriching_matches",
-                            "updated_at": utcnow(),
-                            "progress": {
-                                "processed": runs_done,
-                                "total": total_runs,
-                                "percent": round((runs_done / total_runs) * 100.0, 2) if total_runs else 0.0,
-                            },
-                            "counters": counters,
-                        }
-                    },
-                )
-
-                result = await enrich_xg_matches(
-                    current_sport,
-                    int(season_year),
-                    dry_run=dry_run,
-                    force=force,
-                )
-                runs_done += 1
-                counters["total"] += int(result.get("total", 0))
-                counters["processed"] += int(result.get("total", 0))
-                counters["matched"] += int(result.get("matched", 0))
-                counters["unmatched"] += int(result.get("unmatched", 0))
-                counters["skipped"] += int(result.get("skipped", 0))
-                counters["already_enriched"] += int(result.get("already_enriched", 0))
-                counters["alias_suggestions_recorded"] += int(result.get("alias_suggestions_recorded", 0))
-                counters["runs_completed"] = runs_done
-
-                if all(item.get("sport_key") != current_sport for item in results_items):
-                    counters["leagues_processed"] += 1
-                counters["seasons_processed"] += 1
-
-                team_samples = list(result.get("unmatched_teams", []) or [])
-                for name in team_samples:
-                    if len(unmatched_teams_seen) >= 500:
-                        break
-                    unmatched_teams_seen.add(str(name))
-
-                for raw in list(result.get("raw_rows_preview", []) or []):
-                    if len(raw_rows_preview) >= 500:
-                        break
-                    if not isinstance(raw, dict):
-                        continue
-                    row = dict(raw)
-                    row["sport_key"] = str(result.get("sport_key") or current_sport)
-                    row["season_year"] = int(result.get("season_year", season_year))
-                    raw_rows_preview.append(row)
-
-                results_items.append(
-                    {
-                        "sport_key": str(result.get("sport_key") or current_sport),
-                        "season_year": int(result.get("season_year", season_year)),
-                        "provider": str(result.get("provider") or "understat"),
-                        "total": int(result.get("total", 0)),
-                        "matched": int(result.get("matched", 0)),
-                        "unmatched": int(result.get("unmatched", 0)),
-                        "skipped": int(result.get("skipped", 0)),
-                        "already_enriched": int(result.get("already_enriched", 0)),
-                        "alias_suggestions_recorded": int(result.get("alias_suggestions_recorded", 0)),
-                        "unmatched_teams_sample": team_samples[:50],
-                        "raw_rows_preview_sample": list(result.get("raw_rows_preview", []) or [])[:20],
-                    }
-                )
-
-                await _db.db.admin_import_jobs.update_one(
-                    {"_id": job_id},
-                    {
-                        "$set": {
-                            "updated_at": utcnow(),
-                            "progress": {
-                                "processed": runs_done,
-                                "total": total_runs,
-                                "percent": round((runs_done / total_runs) * 100.0, 2) if total_runs else 100.0,
-                            },
-                            "counters": counters,
-                        }
-                    },
-                )
-
-        finished_at = utcnow()
-        await _db.db.admin_import_jobs.update_one(
-            {"_id": job_id},
-            {
-                "$set": {
-                    "status": "succeeded",
-                    "phase": "finalizing",
-                    "updated_at": finished_at,
-                    "finished_at": finished_at,
-                    "counters": counters,
-                    "results": {
-                        "sport_key": sport_key,
-                        "season": season_spec,
-                        "seasons": seasons,
-                        "dry_run": bool(dry_run),
-                        "force": bool(force),
-                        "provider": "understat",
-                        "summary": counters,
-                        "items": results_items,
-                        "raw_rows_preview": raw_rows_preview,
-                        "unmatched_teams": sorted(unmatched_teams_seen),
-                    },
-                }
-            },
-        )
-    except Exception as exc:
-        now = utcnow()
-        await _db.db.admin_import_jobs.update_one(
-            {"_id": job_id},
-            {
-                "$set": {
-                    "status": "failed",
-                    "updated_at": now,
-                    "finished_at": now,
-                    "error": {"message": str(exc), "type": type(exc).__name__},
-                }
-            },
-        )
-        logger.exception("Async xG enrichment job failed: %s", str(job_id))
+    _ = league_id, season_spec, dry_run, force, _admin_id
+    now = utcnow()
+    await _db.db.admin_import_jobs.update_one(
+        {"_id": job_id},
+        {
+            "$set": {
+                "status": "failed",
+                "phase": "disabled",
+                "updated_at": now,
+                "finished_at": now,
+                "error": {
+                    "message": "xg_enrichment_service removed in v3 hard-cut.",
+                    "type": "ServiceRemovedError",
+                },
+            }
+        },
+    )
 
 
 @router.get("/leagues")
@@ -2162,15 +2082,12 @@ async def update_leagues_order_admin(
         raise HTTPException(status_code=400, detail="league_ids must not be empty.")
 
     ordered_ids: list[int] = []
-    seen: set[str] = set()
+    seen: set[int] = set()
     for league_id in body.league_ids:
         if league_id in seen:
             continue
         seen.add(league_id)
-        try:
-            ordered_ids.append(int(league_id))
-        except (TypeError, ValueError):
-            raise HTTPException(status_code=400, detail="league_id must be an integer.") from None
+        ordered_ids.append(int(league_id))
 
     result = await update_league_order(ordered_ids)
     await log_audit(
@@ -2185,7 +2102,7 @@ async def update_leagues_order_admin(
 
 @router.patch("/leagues/{league_id}")
 async def update_league_admin(
-    league_id: str,
+    league_id: int,
     body: LeagueUpdateBody,
     request: Request,
     admin=Depends(get_admin_user),
@@ -2202,11 +2119,7 @@ async def update_league_admin(
     ):
         raise HTTPException(status_code=400, detail="Nothing to update.")
 
-    try:
-        league_id_int = int(league_id)
-    except (TypeError, ValueError):
-        raise HTTPException(status_code=400, detail="league_id must be an integer.") from None
-
+    league_id_int = int(league_id)
     league = await _db.db.league_registry_v3.find_one({"_id": league_id_int})
     if not league:
         raise HTTPException(status_code=404, detail="League not found.")
@@ -2277,7 +2190,7 @@ async def update_league_admin(
 
 
 async def _run_single_league_sync(
-    sport_key: str,
+    league_id: int,
     season: int | None = None,
     full_season: bool = False,
 ) -> None:
@@ -2285,25 +2198,25 @@ async def _run_single_league_sync(
 
     try:
         await sync_matchdays_for_sport(
-            sport_key,
+            int(league_id),
             season=season,
             full_season=full_season,
         )
     except Exception:
-        logger.exception("Manual league sync failed for %s", sport_key)
+        logger.exception("Manual league sync failed for %s", league_id)
 
 
-async def _check_football_data_import_rate_limit(
+async def _check_sportmonks_import_rate_limit(
     admin_id: str,
-    league_id: str,
+    league_id: int,
 ) -> None:
-    await _check_admin_import_rate_limit("football_data_import", admin_id, league_id)
+    await _check_admin_import_rate_limit("sportmonks_import", admin_id, league_id)
 
 
 async def _check_admin_import_rate_limit(
     import_key: str,
     admin_id: str,
-    league_id: str,
+    league_id: int,
 ) -> None:
     now = utcnow()
     limit_key = f"{import_key}:{admin_id}:{league_id}"
@@ -2311,7 +2224,7 @@ async def _check_admin_import_rate_limit(
     if existing and existing.get("last_requested_at"):
         last_requested_at = ensure_utc(existing["last_requested_at"])
         retry_after = int(
-            FOOTBALL_DATA_IMPORT_RATE_LIMIT_SECONDS
+            SPORTMONKS_IMPORT_RATE_LIMIT_SECONDS
             - (now - last_requested_at).total_seconds()
         )
         if retry_after > 0:
@@ -2345,7 +2258,7 @@ async def _check_admin_import_rate_limit(
         if existing and existing.get("last_requested_at"):
             last_requested_at = ensure_utc(existing["last_requested_at"])
             retry_after = int(
-                FOOTBALL_DATA_IMPORT_RATE_LIMIT_SECONDS
+                SPORTMONKS_IMPORT_RATE_LIMIT_SECONDS
                 - (utcnow() - last_requested_at).total_seconds()
             )
             if retry_after > 0:
@@ -2362,7 +2275,7 @@ async def _check_admin_import_rate_limit(
 
 @router.post("/leagues/{league_id}/sync")
 async def trigger_league_sync_admin(
-    league_id: str,
+    league_id: int,
     background_tasks: BackgroundTasks,
     request: Request,
     body: LeagueSyncRequest | None = None,
@@ -2373,8 +2286,8 @@ async def trigger_league_sync_admin(
 
 
 @router.post("/leagues/{league_id}/import-football-data")
-async def trigger_league_football_data_import_admin(
-    league_id: str,
+async def trigger_league_sportmonks_import_admin(
+    league_id: int,
     body: FootballDataImportRequest,
     request: Request,
     admin=Depends(get_admin_user),
@@ -2384,8 +2297,8 @@ async def trigger_league_football_data_import_admin(
 
 
 @router.post("/leagues/{league_id}/import-football-data/async")
-async def trigger_league_football_data_import_async_admin(
-    league_id: str,
+async def trigger_league_sportmonks_import_async_admin(
+    league_id: int,
     body: FootballDataImportRequest,
     background_tasks: BackgroundTasks,
     request: Request,
@@ -2397,7 +2310,7 @@ async def trigger_league_football_data_import_async_admin(
 
 @router.post("/leagues/{league_id}/match-ingest/async")
 async def trigger_unified_match_ingest_async_admin(
-    league_id: str,
+    league_id: int,
     body: UnifiedMatchIngestRequest,
     background_tasks: BackgroundTasks,
     request: Request,
@@ -2426,7 +2339,7 @@ async def get_league_import_job_status_admin(job_id: str, admin=Depends(get_admi
 
 @router.post("/leagues/{league_id}/import-stats")
 async def trigger_league_stats_import_admin(
-    league_id: str,
+    league_id: int,
     request: Request,
     body: LeagueStatsImportBody = LeagueStatsImportBody(),
     admin=Depends(get_admin_user),
@@ -2435,457 +2348,11 @@ async def trigger_league_stats_import_admin(
     raise HTTPException(status_code=410, detail="Legacy endpoint disabled in v3.1")
 
 
-def _team_to_dict(doc: dict) -> dict:
-    aliases = []
-    for alias in doc.get("aliases", []):
-        aliases.append(
-            {
-                "name": alias.get("name", ""),
-                "normalized": alias.get("normalized", ""),
-                "sport_key": alias.get("sport_key"),
-                "source": alias.get("source"),
-            }
-        )
-    return {
-        "id": str(doc["_id"]),
-        "display_name": doc.get("display_name", ""),
-        "normalized_name": doc.get("normalized_name", ""),
-        "sport_key": doc.get("sport_key"),
-        "needs_review": bool(doc.get("needs_review", False)),
-        "source": doc.get("source"),
-        "aliases": aliases,
-        "created_at": ensure_utc(doc.get("created_at")).isoformat() if doc.get("created_at") else None,
-        "updated_at": ensure_utc(doc.get("updated_at")).isoformat() if doc.get("updated_at") else None,
-    }
-
-
-async def _refresh_team_registry() -> None:
-    await TeamRegistry.get().initialize()
-
-
 def _parse_object_id(value: str, field_name: str) -> ObjectId:
     try:
         return ObjectId(value)
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Invalid {field_name}.") from exc
-
-
-class TeamAliasCreateBody(BaseModel):
-    name: str
-    sport_key: Optional[str] = None
-    source: str = "admin"
-
-
-class TeamAliasDeleteBody(BaseModel):
-    name: str
-    sport_key: Optional[str] = None
-
-
-class TeamUpdateBody(BaseModel):
-    display_name: Optional[str] = None
-    needs_review: Optional[bool] = None
-
-
-class TeamMergeBody(BaseModel):
-    target_id: str
-
-
-class AliasSuggestionApplyInput(BaseModel):
-    id: str
-    team_id: Optional[str] = None
-
-
-class ApplyAliasSuggestionsBody(BaseModel):
-    items: list[AliasSuggestionApplyInput]
-
-
-class RejectAliasSuggestionBody(BaseModel):
-    reason: Optional[str] = None
-
-
-@router.get("/teams/alias-suggestions")
-async def list_alias_suggestions_admin(
-    status_filter: str = Query("pending", alias="status"),
-    source: Optional[str] = Query(None),
-    sport_key: Optional[str] = Query(None),
-    league_id: Optional[str] = Query(None),
-    q: Optional[str] = Query(None),
-    limit: int = Query(200, ge=1, le=1000),
-    admin=Depends(get_admin_user),
-):
-    """List alias suggestions persisted by TeamRegistry across all providers."""
-    if isinstance(status_filter, str):
-        status_value = status_filter.strip().lower() or "pending"
-    else:
-        status_value = "pending"
-    if status_value not in {"pending", "applied", "rejected"}:
-        raise HTTPException(status_code=400, detail="Invalid status.")
-
-    query: dict[str, Any] = {"status": status_value}
-    source_value = source.strip().lower() if isinstance(source, str) else ""
-    sport_key_value = sport_key.strip() if isinstance(sport_key, str) else ""
-    league_id_value = league_id.strip() if isinstance(league_id, str) else ""
-    query_text = q.strip() if isinstance(q, str) else ""
-    if source_value:
-        query["source"] = source_value
-    if sport_key_value:
-        query["sport_key"] = sport_key_value
-    if league_id_value:
-        query["league_id"] = _parse_object_id(league_id_value, "league_id")
-    if query_text:
-        escaped = re.escape(query_text)
-        query["$or"] = [
-            {"raw_team_name": {"$regex": escaped, "$options": "i"}},
-            {"normalized_name": {"$regex": escaped, "$options": "i"}},
-        ]
-
-    docs = await _db.db.team_alias_suggestions.find(query).sort("last_seen_at", -1).limit(limit).to_list(length=limit)
-    team_ids: set[ObjectId] = set()
-    league_ids: set[ObjectId] = set()
-    for doc in docs:
-        suggested_id = doc.get("suggested_team_id")
-        applied_id = doc.get("applied_to_team_id")
-        if isinstance(suggested_id, ObjectId):
-            team_ids.add(suggested_id)
-        if isinstance(applied_id, ObjectId):
-            team_ids.add(applied_id)
-        if isinstance(doc.get("league_id"), ObjectId):
-            league_ids.add(doc["league_id"])
-
-    teams_by_id: dict[ObjectId, dict[str, Any]] = {}
-    if team_ids:
-        team_docs = await _db.db.teams.find({"_id": {"$in": list(team_ids)}}, {"display_name": 1, "aliases": 1}).to_list(length=len(team_ids))
-        teams_by_id = {row["_id"]: row for row in team_docs}
-
-    leagues_by_id: dict[ObjectId, dict[str, Any]] = {}
-    if league_ids:
-        league_docs = await _db.db.leagues.find({"_id": {"$in": list(league_ids)}}, {"name": 1, "sport_key": 1}).to_list(length=len(league_ids))
-        leagues_by_id = {row["_id"]: row for row in league_docs}
-
-    items: list[dict[str, Any]] = []
-    for doc in docs:
-        normalized_name = str(doc.get("normalized_name") or "")
-        sport_value = str(doc.get("sport_key") or "")
-        suggested_team = teams_by_id.get(doc.get("suggested_team_id"))
-        applied_team = teams_by_id.get(doc.get("applied_to_team_id"))
-        if status_value == "pending" and suggested_team:
-            alias_exists = False
-            for alias in (suggested_team.get("aliases") or []):
-                if not isinstance(alias, dict):
-                    continue
-                if str(alias.get("normalized") or "") != normalized_name:
-                    continue
-                alias_sport = str(alias.get("sport_key") or "")
-                if not sport_value or not alias_sport or alias_sport == sport_value:
-                    alias_exists = True
-                    break
-            if alias_exists:
-                continue
-
-        league_doc = leagues_by_id.get(doc.get("league_id"))
-        items.append(
-            {
-                "id": str(doc.get("_id")),
-                "status": str(doc.get("status") or "pending"),
-                "source": str(doc.get("source") or ""),
-                "sport_key": sport_value or None,
-                "league_id": str(doc.get("league_id")) if doc.get("league_id") else None,
-                "league_name": str((league_doc or {}).get("name") or ""),
-                "league_external_id": str(doc.get("league_external_id") or "") or None,
-                "raw_team_name": str(doc.get("raw_team_name") or ""),
-                "normalized_name": normalized_name,
-                "reason": str(doc.get("reason") or "unresolved_team"),
-                "confidence": doc.get("confidence"),
-                "seen_count": int(doc.get("seen_count") or 0),
-                "first_seen_at": ensure_utc(doc.get("first_seen_at")).isoformat() if doc.get("first_seen_at") else None,
-                "last_seen_at": ensure_utc(doc.get("last_seen_at")).isoformat() if doc.get("last_seen_at") else None,
-                "suggested_team_id": str(doc.get("suggested_team_id")) if doc.get("suggested_team_id") else None,
-                "suggested_team_name": str(doc.get("suggested_team_name") or (suggested_team or {}).get("display_name") or ""),
-                "applied_to_team_id": str(doc.get("applied_to_team_id")) if doc.get("applied_to_team_id") else None,
-                "applied_to_team_name": str((applied_team or {}).get("display_name") or ""),
-                "sample_refs": doc.get("sample_refs") or [],
-            }
-        )
-
-    return {"total": len(items), "items": items}
-
-
-@router.post("/teams/alias-suggestions/apply")
-async def apply_alias_suggestions_admin(
-    body: ApplyAliasSuggestionsBody,
-    request: Request,
-    admin=Depends(get_admin_user),
-):
-    if not body.items:
-        raise HTTPException(status_code=400, detail="Provide at least one suggestion id.")
-    registry = TeamRegistry.get()
-    applied = 0
-    failed: list[dict[str, Any]] = []
-    for item in body.items:
-        try:
-            suggestion_oid = _parse_object_id(item.id, "id")
-            suggestion_doc = await _db.db.team_alias_suggestions.find_one({"_id": suggestion_oid})
-            if not suggestion_doc:
-                failed.append({"id": item.id, "code": "not_found", "message": "Suggestion not found"})
-                continue
-            if str(suggestion_doc.get("status") or "pending") != "pending":
-                failed.append({"id": item.id, "code": "invalid_status", "message": "Suggestion is not pending"})
-                continue
-
-            target_team_id = item.team_id or (str(suggestion_doc.get("suggested_team_id")) if suggestion_doc.get("suggested_team_id") else "")
-            if not target_team_id:
-                failed.append({"id": item.id, "code": "missing_target", "message": "No target team_id provided"})
-                continue
-            team_oid = _parse_object_id(target_team_id, "team_id")
-            alias_name = str(suggestion_doc.get("raw_team_name") or "").strip()
-            if not alias_name:
-                failed.append({"id": item.id, "code": "invalid_alias", "message": "Suggestion has empty team name"})
-                continue
-
-            added = await registry.add_alias(
-                team_oid,
-                alias_name,
-                sport_key=suggestion_doc.get("sport_key"),
-                source="admin_alias_suggestion",
-                refresh_cache=False,
-            )
-            await _db.db.team_alias_suggestions.delete_one({"_id": suggestion_oid})
-            applied += 1
-            if not added:
-                failed.append({"id": item.id, "code": "duplicate_alias", "message": "Alias already exists"})
-        except HTTPException:
-            failed.append({"id": item.id, "code": "invalid_team_id", "message": "Invalid team_id"})
-        except ValueError as exc:
-            msg = str(exc).lower()
-            code = "alias_error"
-            if "team not found" in msg:
-                code = "team_not_found"
-            elif "normalization is empty" in msg or "empty" in msg:
-                code = "invalid_alias"
-            failed.append({"id": item.id, "code": code, "message": str(exc)})
-        except Exception as exc:
-            failed.append({"id": item.id, "code": "unexpected_error", "message": str(exc)})
-
-    await registry.initialize()
-    await log_audit(
-        actor_id=str(admin["_id"]),
-        target_id="team_alias_suggestions",
-        action="TEAM_ALIAS_SUGGESTIONS_APPLY",
-        metadata={
-            "requested": len(body.items),
-            "applied": applied,
-            "failed": len(failed),
-        },
-        request=request,
-    )
-    return {"applied": applied, "failed": failed}
-
-
-@router.post("/teams/alias-suggestions/{suggestion_id}/reject")
-async def reject_alias_suggestion_admin(
-    suggestion_id: str,
-    body: RejectAliasSuggestionBody,
-    request: Request,
-    admin=Depends(get_admin_user),
-):
-    suggestion_oid = _parse_object_id(suggestion_id, "suggestion_id")
-    suggestion_doc = await _db.db.team_alias_suggestions.find_one({"_id": suggestion_oid}, {"status": 1})
-    if not suggestion_doc:
-        raise HTTPException(status_code=404, detail="Suggestion not found.")
-    if str(suggestion_doc.get("status") or "pending") != "pending":
-        raise HTTPException(status_code=400, detail="Suggestion is not pending.")
-
-    now = utcnow()
-    await _db.db.team_alias_suggestions.update_one(
-        {"_id": suggestion_oid},
-        {
-            "$set": {
-                "status": "rejected",
-                "rejected_at": now,
-                "rejected_reason": str(body.reason or "").strip() or None,
-                "updated_at": now,
-            }
-        },
-    )
-    await log_audit(
-        actor_id=str(admin["_id"]),
-        target_id=str(suggestion_oid),
-        action="TEAM_ALIAS_SUGGESTION_REJECT",
-        metadata={"reason": str(body.reason or "").strip() or None},
-        request=request,
-    )
-    return {"ok": True, "id": str(suggestion_oid)}
-
-
-@router.get("/teams")
-async def list_teams_admin(
-    needs_review: Optional[bool] = Query(None),
-    search: Optional[str] = Query(None),
-    limit: int = Query(200, ge=1, le=1000),
-    offset: int = Query(0, ge=0),
-    admin=Depends(get_admin_user),
-):
-    query: dict = {}
-    if needs_review is not None:
-        query["needs_review"] = needs_review
-    if search:
-        escaped = re.escape(search.strip())
-        query["$or"] = [
-            {"display_name": {"$regex": escaped, "$options": "i"}},
-            {"aliases.name": {"$regex": escaped, "$options": "i"}},
-        ]
-
-    total = await _db.db.teams.count_documents(query)
-    docs = await _db.db.teams.find(query).sort("updated_at", -1).skip(offset).limit(limit).to_list(length=limit)
-    return {
-        "total": total,
-        "offset": offset,
-        "limit": limit,
-        "items": [_team_to_dict(d) for d in docs],
-    }
-
-
-@router.post("/teams/{team_id}/aliases")
-async def add_team_alias(
-    team_id: str,
-    body: TeamAliasCreateBody,
-    request: Request,
-    admin=Depends(get_admin_user),
-):
-    team_oid = _parse_object_id(team_id, "team_id")
-    team = await _db.db.teams.find_one({"_id": team_oid})
-    if not team:
-        raise HTTPException(status_code=404, detail="Team not found.")
-
-    normalized = normalize_team_name(body.name)
-    if not normalized:
-        raise HTTPException(status_code=400, detail="Alias normalization is empty.")
-
-    alias_doc = {
-        "name": body.name.strip(),
-        "normalized": normalized,
-        "sport_key": body.sport_key or team.get("sport_key"),
-        "source": body.source or "admin",
-    }
-    now = utcnow()
-    await _db.db.teams.update_one(
-        {"_id": team_oid},
-        {"$addToSet": {"aliases": alias_doc}, "$set": {"updated_at": now}},
-    )
-    cleanup_result = await _db.db.team_alias_suggestions.delete_many(
-        {
-            "status": "pending",
-            "normalized_name": normalized,
-            "$or": [
-                {"sport_key": alias_doc.get("sport_key")},
-                {"sport_key": None},
-                {"sport_key": ""},
-            ],
-        },
-    )
-    await _refresh_team_registry()
-
-    await log_audit(
-        actor_id=str(admin["_id"]),
-        target_id=team_id,
-        action="TEAM_ALIAS_ADD",
-        metadata={"alias": alias_doc, "alias_suggestions_deleted": int(cleanup_result.deleted_count or 0)},
-        request=request,
-    )
-    return {"message": "Alias added.", "alias": alias_doc}
-
-
-@router.delete("/teams/{team_id}/aliases")
-async def remove_team_alias(
-    team_id: str,
-    body: TeamAliasDeleteBody,
-    request: Request,
-    admin=Depends(get_admin_user),
-):
-    team_oid = _parse_object_id(team_id, "team_id")
-    team = await _db.db.teams.find_one({"_id": team_oid})
-    if not team:
-        raise HTTPException(status_code=404, detail="Team not found.")
-
-    normalized = normalize_team_name(body.name)
-    if not normalized:
-        raise HTTPException(status_code=400, detail="Alias normalization is empty.")
-
-    pull_filter: dict = {"normalized": normalized}
-    if body.sport_key:
-        pull_filter["sport_key"] = body.sport_key
-    now = utcnow()
-    await _db.db.teams.update_one(
-        {"_id": team_oid},
-        {"$pull": {"aliases": pull_filter}, "$set": {"updated_at": now}},
-    )
-    await _refresh_team_registry()
-
-    await log_audit(
-        actor_id=str(admin["_id"]),
-        target_id=team_id,
-        action="TEAM_ALIAS_REMOVE",
-        metadata={"normalized": normalized, "sport_key": body.sport_key},
-        request=request,
-    )
-    return {"message": "Alias removed.", "normalized": normalized}
-
-
-@router.patch("/teams/{team_id}")
-async def update_team_admin(
-    team_id: str,
-    body: TeamUpdateBody,
-    request: Request,
-    admin=Depends(get_admin_user),
-):
-    if body.display_name is None and body.needs_review is None:
-        raise HTTPException(status_code=400, detail="Nothing to update.")
-
-    team_oid = _parse_object_id(team_id, "team_id")
-    team = await _db.db.teams.find_one({"_id": team_oid})
-    if not team:
-        raise HTTPException(status_code=404, detail="Team not found.")
-
-    updates: dict = {"updated_at": utcnow()}
-    if body.display_name is not None:
-        updates["display_name"] = body.display_name.strip()
-    if body.needs_review is not None:
-        updates["needs_review"] = bool(body.needs_review)
-
-    await _db.db.teams.update_one({"_id": team_oid}, {"$set": updates})
-    await _refresh_team_registry()
-
-    await log_audit(
-        actor_id=str(admin["_id"]),
-        target_id=team_id,
-        action="TEAM_UPDATE",
-        metadata={"updates": updates},
-        request=request,
-    )
-    return {"message": "Team updated."}
-
-
-@router.post("/teams/{team_id}/merge")
-async def merge_team_admin(
-    team_id: str,
-    body: TeamMergeBody,
-    request: Request,
-    admin=Depends(get_admin_user),
-):
-    source_id = _parse_object_id(team_id, "team_id")
-    target_id = _parse_object_id(body.target_id, "target_id")
-    if source_id == target_id:
-        raise HTTPException(status_code=400, detail="source_id and target_id must differ.")
-
-    stats = await merge_teams(source_id, target_id)
-    await log_audit(
-        actor_id=str(admin["_id"]),
-        target_id=str(target_id),
-        action="TEAM_MERGE",
-        metadata={"source_id": str(source_id), "target_id": str(target_id), "stats": stats},
-        request=request,
-    )
-    return {"message": "Teams merged.", "stats": stats}
 
 
 # ---------------------------------------------------------------------------
@@ -2916,8 +2383,8 @@ async def qbot_strategies(admin=Depends(get_admin_user)):
 
     by_sport_docs: dict[str, list[dict]] = {}
     for doc in strategies:
-        sport_key = doc.get("sport_key", "all")
-        by_sport_docs.setdefault(sport_key, []).append(doc)
+        league_id = doc.get("league_id", "all")
+        by_sport_docs.setdefault(league_id, []).append(doc)
 
     def classify_strategy(doc: dict, val_f: dict, stress: dict, stage_used: int | None) -> str:
         val_roi = float(val_f.get("roi", 0.0))
@@ -3014,7 +2481,7 @@ async def qbot_strategies(admin=Depends(get_admin_user)):
 
         return {
             "id": str(doc["_id"]),
-            "sport_key": doc.get("sport_key", "all"),
+            "league_id": doc.get("league_id", "all"),
             "version": doc.get("version", "v1"),
             "generation": doc.get("generation", 0),
             "dna": doc.get("dna", {}),
@@ -3043,7 +2510,7 @@ async def qbot_strategies(admin=Depends(get_admin_user)):
     shadow_extras: list[dict] = []
     by_sport: dict[str, dict] = {}
 
-    for sport_key, docs in by_sport_docs.items():
+    for league_id, docs in by_sport_docs.items():
         active_doc = next((d for d in docs if d.get("is_active", False)), None)
         selected = active_doc or docs[0]
         identities: dict[str, dict] = {}
@@ -3063,7 +2530,7 @@ async def qbot_strategies(admin=Depends(get_admin_user)):
             identities=identities,
         )
         representatives.append(item)
-        by_sport[sport_key] = {
+        by_sport[league_id] = {
             "strategy": item,
             "category": item["category"],
             "identities": identities,
@@ -3133,7 +2600,7 @@ async def qbot_strategies(admin=Depends(get_admin_user)):
         val_roi = float(r.get("validation_fitness", {}).get("roi", 0.0))
         if val_roi < worst_roi:
             worst_roi = val_roi
-            worst_league = r.get("sport_key", "all")
+            worst_league = r.get("league_id", "all")
         oldest_days = max(oldest_days, int(r.get("age_days", 0)))
         stress = r.get("stress_test") or {}
         if r["category"] == "active" and not bool(stress.get("stress_passed", False)):
@@ -3208,7 +2675,7 @@ async def qbot_strategy_backtest_ledger(
     )
     return {
         "strategy_id": result["strategy_id"],
-        "sport_key": result["sport_key"],
+        "league_id": result["league_id"],
         "starting_bankroll": result["starting_bankroll"],
         "ending_bankroll": result["ending_bankroll"],
         "total_bets": result["total_bets"],
@@ -3275,8 +2742,8 @@ async def qbot_strategy_detail(strategy_id: str, admin=Depends(get_admin_user)):
             "created_at": created.isoformat(),
         }
 
-    sport_key = strategy.get("sport_key", "all")
-    docs = await _db.db.qbot_strategies.find({"sport_key": sport_key}).sort("created_at", -1).to_list(200)
+    league_id = strategy.get("league_id", "all")
+    docs = await _db.db.qbot_strategies.find({"league_id": league_id}).sort("created_at", -1).to_list(200)
     identities: dict[str, dict] = {}
     for doc in docs:
         archetype = archetype_of(doc)
@@ -3294,7 +2761,7 @@ async def qbot_strategy_detail(strategy_id: str, admin=Depends(get_admin_user)):
     stress = strategy.get("stress_test", {}) or {}
     return {
         "id": str(strategy["_id"]),
-        "sport_key": sport_key,
+        "league_id": int(league_id) if isinstance(league_id, int) else None,
         "version": strategy.get("version", "v1"),
         "generation": strategy.get("generation", 0),
         "dna": strategy.get("dna", {}),
@@ -3323,68 +2790,383 @@ async def qbot_strategy_activate(strategy_id: str, admin=Depends(get_admin_user)
     if not strategy:
         raise HTTPException(status_code=404, detail="Strategy not found.")
 
-    sport_key = strategy.get("sport_key", "all")
+    league_id = strategy.get("league_id", "all")
     await _db.db.qbot_strategies.update_many(
-        {"sport_key": sport_key, "is_active": True},
+        {"league_id": int(league_id) if isinstance(league_id, int) else None, "is_active": True},
         {"$set": {"is_active": False}},
     )
     await _db.db.qbot_strategies.update_one(
         {"_id": ObjectId(strategy_id)},
         {"$set": {"is_active": True, "is_shadow": False}},
     )
-    return {"status": "activated", "strategy_id": strategy_id, "sport_key": sport_key}
+    return {"status": "activated", "strategy_id": strategy_id, "league_id": league_id}
+
+
+def _odds_summary_overround(summary_1x2: dict[str, Any]) -> float | None:
+    home = ((summary_1x2.get("home") or {}).get("avg")) if isinstance(summary_1x2, dict) else None
+    draw = ((summary_1x2.get("draw") or {}).get("avg")) if isinstance(summary_1x2, dict) else None
+    away = ((summary_1x2.get("away") or {}).get("avg")) if isinstance(summary_1x2, dict) else None
+    if not all(isinstance(v, (int, float)) and float(v) > 0 for v in (home, draw, away)):
+        return None
+    return float((1.0 / float(home)) + (1.0 / float(draw)) + (1.0 / float(away)))
+
+
+# FIXME: ODDS_V3_BREAK — reads odds_timeline, market_entropy, and summary_1x2 no longer produced by connector
+def _odds_quality_anomalies_for_match(
+    doc: dict[str, Any],
+    *,
+    now_dt: datetime,
+    min_snapshots: int,
+    entropy_threshold: float,
+    overround_floor: float,
+    kickoff_window_hours: int,
+) -> tuple[list[dict[str, Any]], float]:
+    anomalies: list[dict[str, Any]] = []
+    odds_timeline = doc.get("odds_timeline") if isinstance(doc.get("odds_timeline"), list) else []
+    snapshot_count = len(odds_timeline)
+
+    start_at_raw = doc.get("start_at")
+    start_at = ensure_utc(start_at_raw) if start_at_raw else None
+    hours_to_kickoff = ((start_at - now_dt).total_seconds() / 3600.0) if start_at else None
+
+    status = str(doc.get("status") or "").upper()
+    near_kickoff = bool(hours_to_kickoff is not None and 0 <= hours_to_kickoff <= float(kickoff_window_hours))
+    upcoming_or_live = status in {"SCHEDULED", "LIVE"}
+
+    if upcoming_or_live and near_kickoff and snapshot_count < int(min_snapshots):
+        anomalies.append(
+            {
+                "code": "low_snapshot_count",
+                "severity": 30,
+                "detail": {
+                    "snapshot_count": int(snapshot_count),
+                    "min_snapshots": int(min_snapshots),
+                    "hours_to_kickoff": round(float(hours_to_kickoff or 0.0), 2),
+                },
+            }
+        )
+
+    odds_meta = doc.get("odds_meta") if isinstance(doc.get("odds_meta"), dict) else {}
+    market_entropy = odds_meta.get("market_entropy") if isinstance(odds_meta.get("market_entropy"), dict) else {}
+    spread = market_entropy.get("current_spread_pct")
+    drift = market_entropy.get("drift_velocity_3h")
+    spread_value = float(spread) if isinstance(spread, (int, float)) else None
+    drift_value = float(drift) if isinstance(drift, (int, float)) else None
+    if (spread_value is not None and spread_value >= float(entropy_threshold)) or (
+        drift_value is not None and drift_value >= float(entropy_threshold)
+    ):
+        anomalies.append(
+            {
+                "code": "high_entropy",
+                "severity": 35,
+                "detail": {
+                    "current_spread_pct": spread_value,
+                    "drift_velocity_3h": drift_value,
+                    "threshold": float(entropy_threshold),
+                },
+            }
+        )
+
+    summary_1x2 = odds_meta.get("summary_1x2") if isinstance(odds_meta.get("summary_1x2"), dict) else {}
+    overround = _odds_summary_overround(summary_1x2)
+    if overround is not None and overround < float(overround_floor):
+        anomalies.append(
+            {
+                "code": "negative_overround",
+                "severity": 45,
+                "detail": {
+                    "overround": round(float(overround), 6),
+                    "threshold": float(overround_floor),
+                },
+            }
+        )
+
+    lineups = doc.get("lineups") if isinstance(doc.get("lineups"), list) else []
+    if upcoming_or_live and near_kickoff and len(lineups) == 0:
+        anomalies.append(
+            {
+                "code": "missing_lineups",
+                "severity": 25,
+                "detail": {
+                    "lineup_count": 0,
+                    "hours_to_kickoff": round(float(hours_to_kickoff or 0.0), 2),
+                },
+            }
+        )
+
+    severity_score = float(sum(int(row.get("severity") or 0) for row in anomalies))
+    quality_score = max(0.0, min(100.0, 100.0 - severity_score))
+    return anomalies, quality_score
+
+
+@router.get("/odds/anomalies")
+async def list_odds_anomalies(
+    limit: int = Query(200, ge=1, le=1000),
+    kickoff_window_hours: int = Query(8, ge=1, le=72),
+    min_snapshots: int = Query(3, ge=1, le=50),
+    entropy_threshold: float = Query(0.12, ge=0.0, le=5.0),
+    overround_floor: float = Query(0.99, ge=0.5, le=2.0),
+    league_id: int | None = Query(None),
+    season_id: int | None = Query(None),
+    status: str | None = Query(None),
+    admin=Depends(get_admin_user),
+):
+    _ = admin
+    now_dt = utcnow()
+    query: dict[str, Any] = {
+        "start_at": {"$lte": now_dt + timedelta(hours=int(kickoff_window_hours))},
+    }
+    if league_id is not None:
+        query["league_id"] = int(league_id)
+    if season_id is not None:
+        query["season_id"] = int(season_id)
+    if status and str(status).strip():
+        query["status"] = str(status).strip().upper()
+    else:
+        query["status"] = {"$in": ["SCHEDULED", "LIVE"]}
+
+    rows = await _db.db.matches_v3.find(
+        query,
+        {
+            "_id": 1,
+            "league_id": 1,
+            "season_id": 1,
+            "round_id": 1,
+            "start_at": 1,
+            "status": 1,
+            "referee_id": 1,
+            "referee_name": 1,
+            "teams.home.name": 1,
+            "teams.away.name": 1,
+            # FIXME: ODDS_V3_BREAK — anomaly query projects odds_meta and odds_timeline no longer produced by connector
+            "odds_meta.summary_1x2": 1,
+            "odds_meta.market_entropy": 1,
+            "odds_meta.updated_at": 1,
+            "odds_timeline": 1,
+            "lineups": 1,
+            "manual_check_required": 1,
+            "manual_check_reasons": 1,
+            "model_excluded": 1,
+            "quality_override": 1,
+        },
+    ).sort("start_at", 1).limit(int(limit)).to_list(length=int(limit))
+
+    league_map = await _get_v3_league_map()
+    referee_profiles_by_key: dict[tuple[int, int], dict[str, Any]] = {}
+    referee_ids_by_league: dict[int, set[int]] = {}
+    for row in rows:
+        lid = row.get("league_id")
+        rid = row.get("referee_id")
+        if isinstance(lid, int) and isinstance(rid, int):
+            referee_ids_by_league.setdefault(int(lid), set()).add(int(rid))
+    for lid, ids in referee_ids_by_league.items():
+        profiles = await build_referee_profiles(sorted(ids), league_id=int(lid))
+        for rid, profile in profiles.items():
+            referee_profiles_by_key[(int(lid), int(rid))] = profile
+
+    items: list[dict[str, Any]] = []
+    for row in rows:
+        anomalies, quality_score = _odds_quality_anomalies_for_match(
+            row,
+            now_dt=now_dt,
+            min_snapshots=int(min_snapshots),
+            entropy_threshold=float(entropy_threshold),
+            overround_floor=float(overround_floor),
+            kickoff_window_hours=int(kickoff_window_hours),
+        )
+        if not anomalies:
+            continue
+        match_id = int(row.get("_id"))
+        start_at = ensure_utc(row.get("start_at")) if row.get("start_at") else None
+        teams = row.get("teams") if isinstance(row.get("teams"), dict) else {}
+        home = (teams.get("home") or {}) if isinstance(teams, dict) else {}
+        away = (teams.get("away") or {}) if isinstance(teams, dict) else {}
+        summary_1x2 = ((row.get("odds_meta") or {}).get("summary_1x2") or {}) if isinstance(row.get("odds_meta"), dict) else {}
+        overround = _odds_summary_overround(summary_1x2)
+        league_id_value = int(row.get("league_id") or 0)
+        referee_id_value = row.get("referee_id") if isinstance(row.get("referee_id"), int) else None
+        referee_profile = (
+            referee_profiles_by_key.get((league_id_value, int(referee_id_value)))
+            if referee_id_value is not None
+            else None
+        )
+        items.append(
+            {
+                "match_id": match_id,
+                "league_id": league_id_value,
+                "league_name": league_map.get(league_id_value, ""),
+                "season_id": int(row.get("season_id") or 0),
+                "round_id": row.get("round_id"),
+                "start_at": start_at.isoformat() if start_at else None,
+                "status": str(row.get("status") or ""),
+                "home_team": str(home.get("name") or ""),
+                "away_team": str(away.get("name") or ""),
+                "referee": _referee_payload(
+                    profile=referee_profile,
+                    referee_id=referee_id_value,
+                    referee_name=str(row.get("referee_name") or "") or None,
+                ),
+                "snapshot_count": len(row.get("odds_timeline") or []),
+                "overround": round(float(overround), 6) if isinstance(overround, float) else None,
+                "manual_check_required": bool(row.get("manual_check_required")),
+                "manual_check_reasons": list(row.get("manual_check_reasons") or []),
+                "model_excluded": bool(row.get("model_excluded", False)),
+                "quality_override": row.get("quality_override") if isinstance(row.get("quality_override"), dict) else None,
+                "quality_score": round(float(quality_score), 2),
+                "severity_score": int(sum(int(a.get("severity") or 0) for a in anomalies)),
+                "anomalies": anomalies,
+            }
+        )
+
+    items.sort(key=lambda r: (int(r.get("severity_score") or 0), str(r.get("start_at") or "")), reverse=True)
+    return {
+        "items": items,
+        "count": len(items),
+        "thresholds": {
+            "kickoff_window_hours": int(kickoff_window_hours),
+            "min_snapshots": int(min_snapshots),
+            "entropy_threshold": float(entropy_threshold),
+            "overround_floor": float(overround_floor),
+        },
+        "generated_at": now_dt.isoformat(),
+    }
+
+
+@router.post("/odds/fix/{match_id}")
+async def fix_odds_anomaly_match(
+    match_id: int,
+    request: Request,
+    admin=Depends(get_admin_user),
+):
+    doc = await _db.db.matches_v3.find_one({"_id": int(match_id)}, {"_id": 1, "round_id": 1, "season_id": 1})
+    if not isinstance(doc, dict):
+        raise HTTPException(status_code=404, detail="Match not found.")
+
+    odds_synced = await sportmonks_connector.sync_fixture_odds_summary(
+        int(match_id),
+        source="admin_odds_force_sync",
+        phase="admin_force_sync",
+    )
+
+    lineups_refreshed = False
+    round_id = doc.get("round_id")
+    season_id = doc.get("season_id")
+    if isinstance(round_id, int) and isinstance(season_id, int):
+        round_payload = await sportmonks_provider.get_round_fixtures(int(round_id))
+        fixtures = ((round_payload.get("payload") or {}).get("data") or []) if isinstance(round_payload, dict) else []
+        fixture = next(
+            (
+                row for row in fixtures
+                if isinstance(row, dict) and isinstance(row.get("id"), int) and int(row.get("id")) == int(match_id)
+            ),
+            None,
+        )
+        if isinstance(fixture, dict):
+            await sportmonks_connector._sync_people_from_fixture(fixture)
+            await sportmonks_connector.upsert_match_v3(int(match_id), sportmonks_connector._map_fixture_to_match(fixture, int(season_id)))
+            lineups_refreshed = True
+
+    now = utcnow()
+    await _db.db.matches_v3.update_one(
+        {"_id": int(match_id)},
+        {
+            "$set": {
+                "quality_override.last_fix_at": now,
+                "quality_override.last_fix_by": str(admin["_id"]),
+                "quality_override.last_fix_source": "admin_odds_force_sync",
+                "updated_at": now,
+                "updated_at_utc": now,
+            }
+        },
+    )
+    await log_audit(
+        actor_id=str(admin["_id"]),
+        target_id=str(int(match_id)),
+        action="ODDS_MONITOR_FORCE_SYNC",
+        metadata={"odds_synced": bool(odds_synced), "lineups_refreshed": bool(lineups_refreshed)},
+        request=request,
+    )
+    return {
+        "ok": True,
+        "match_id": int(match_id),
+        "odds_synced": bool(odds_synced),
+        "lineups_refreshed": bool(lineups_refreshed),
+    }
+
+
+@router.post("/odds/mark-valid/{match_id}")
+async def mark_odds_match_valid(
+    match_id: int,
+    request: Request,
+    admin=Depends(get_admin_user),
+):
+    now = utcnow()
+    result = await _db.db.matches_v3.update_one(
+        {"_id": int(match_id)},
+        {
+            "$set": {
+                "manual_check_required": False,
+                "manual_check_reasons": [],
+                "quality_override.state": "valid",
+                "quality_override.updated_at": now,
+                "quality_override.updated_by": str(admin["_id"]),
+                "updated_at": now,
+                "updated_at_utc": now,
+            }
+        },
+    )
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Match not found.")
+    await log_audit(
+        actor_id=str(admin["_id"]),
+        target_id=str(int(match_id)),
+        action="ODDS_MONITOR_MARK_VALID",
+        metadata={"match_id": int(match_id)},
+        request=request,
+    )
+    return {"ok": True, "match_id": int(match_id), "state": "valid"}
+
+
+@router.post("/odds/exclude/{match_id}")
+async def exclude_odds_match_from_model(
+    match_id: int,
+    body: OddsModelExcludeBody,
+    request: Request,
+    admin=Depends(get_admin_user),
+):
+    now = utcnow()
+    result = await _db.db.matches_v3.update_one(
+        {"_id": int(match_id)},
+        {
+            "$set": {
+                "model_excluded": True,
+                "model_excluded_reason": str(body.reason or "").strip() or "admin_odds_monitor_exclude",
+                "model_excluded_at": now,
+                "model_excluded_by": str(admin["_id"]),
+                "quality_override.state": "excluded",
+                "quality_override.updated_at": now,
+                "quality_override.updated_by": str(admin["_id"]),
+                "updated_at": now,
+                "updated_at_utc": now,
+            }
+        },
+    )
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Match not found.")
+    await log_audit(
+        actor_id=str(admin["_id"]),
+        target_id=str(int(match_id)),
+        action="ODDS_MONITOR_EXCLUDE",
+        metadata={"match_id": int(match_id), "reason": str(body.reason or "").strip() or None},
+        request=request,
+    )
+    return {"ok": True, "match_id": int(match_id), "state": "excluded"}
 
 
 @router.get("/odds/{match_id}")
-async def admin_odds_debug(match_id: str, limit: int = Query(500, ge=10, le=5000), admin=Depends(get_admin_user)):
-    """Admin debug: current odds_meta plus raw odds_events timeline for one match."""
-    if not ObjectId.is_valid(match_id):
-        raise HTTPException(status_code=400, detail="Invalid match id.")
-    oid = ObjectId(match_id)
-
-    match = await _db.db.matches.find_one(
-        {"_id": oid},
-        {"_id": 1, "sport_key": 1, "home_team": 1, "away_team": 1, "odds_meta": 1},
+async def admin_odds_debug(match_id: str, admin=Depends(get_admin_user)):
+    """Deprecated — odds_timeline is now included in GET /admin/matches/{match_id}."""
+    raise HTTPException(
+        status_code=410,
+        detail="Use GET /admin/matches/{match_id} which includes odds_timeline.",
     )
-    if not match:
-        raise HTTPException(status_code=404, detail="Match not found.")
-
-    events = await _db.db.odds_events.find(
-        {"match_id": oid},
-        {
-            "_id": 0,
-            "provider": 1,
-            "market": 1,
-            "selection_key": 1,
-            "price": 1,
-            "line": 1,
-            "snapshot_at": 1,
-            "ingested_at": 1,
-        },
-    ).sort("snapshot_at", -1).limit(limit).to_list(length=limit)
-
-    provider_count = {}
-    dropped_by_line = {}
-    stale_excluded = {}
-    markets = ((match.get("odds_meta") or {}).get("markets") or {})
-    for market, node in markets.items():
-        provider_count[market] = int(node.get("provider_count", 0) or 0)
-        dropped_by_line[market] = int(node.get("dropped_by_line", 0) or 0)
-        stale_excluded[market] = int(node.get("stale_excluded", 0) or 0)
-
-    return {
-        "match": {
-            "id": str(match["_id"]),
-            "sport_key": match.get("sport_key"),
-            "home_team": match.get("home_team"),
-            "away_team": match.get("away_team"),
-            "odds_meta": match.get("odds_meta", {}),
-        },
-        "diagnostics": {
-            "provider_count": provider_count,
-            "dropped_by_line": dropped_by_line,
-            "stale_excluded": stale_excluded,
-        },
-        "events": events,
-        "event_count": len(events),
-    }

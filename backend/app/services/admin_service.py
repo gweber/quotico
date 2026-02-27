@@ -25,7 +25,7 @@ _ZERO_OID = ObjectId("000000000000000000000000")
 
 
 def _alias_key(alias: dict) -> tuple[str, str]:
-    return (str(alias.get("normalized", "")), str(alias.get("sport_key", "")))
+    return (str(alias.get("normalized", "")), str(alias.get("league_id", "")))
 
 
 def _canonical_aliases(team: dict) -> list[dict]:
@@ -35,7 +35,7 @@ def _canonical_aliases(team: dict) -> list[dict]:
         item = {
             "name": alias.get("name", ""),
             "normalized": alias.get("normalized", ""),
-            "sport_key": alias.get("sport_key", team.get("sport_key")),
+            "league_id": alias.get("league_id", team.get("league_id")),
             "source": alias.get("source", team.get("source", "admin")),
         }
         key = _alias_key(item)
@@ -50,7 +50,7 @@ def _canonical_aliases(team: dict) -> list[dict]:
         display_alias = {
             "name": display_name,
             "normalized": normalized,
-            "sport_key": team.get("sport_key"),
+            "league_id": team.get("league_id"),
             "source": team.get("source", "admin"),
         }
         key = _alias_key(display_alias)
@@ -137,7 +137,7 @@ def _match_merge_key(match_doc: dict, source_id: ObjectId, target_id: ObjectId) 
 
 def _match_date_bucket(match_doc: dict) -> str:
     """Group duplicate matches by UTC calendar day to tolerate kickoff time variants."""
-    for field in ("match_date", "match_date_hour"):
+    for field in ("start_at", "match_date_hour"):
         value = match_doc.get(field)
         if hasattr(value, "date"):
             try:
@@ -515,7 +515,7 @@ async def _collapse_duplicate_matches_for_team_merge(
 ) -> dict[str, int]:
     source_values = [source_id, str(source_id)]
     target_values = [target_id, str(target_id)]
-    match_docs = await _db.db.matches.find(
+    match_docs = await _db.db.matches_v3.find(
         {
             "$or": [
                 {"home_team_id": {"$in": [*source_values, *target_values]}},
@@ -573,11 +573,11 @@ async def _collapse_duplicate_matches_for_team_merge(
     rewrite_stats = await _rewrite_match_references(loser_to_keeper, now=now, session=session)
     rewritten_total = sum(rewrite_stats.values())
 
-    loser_ids = [ObjectId(mid) for mid in loser_to_keeper.keys()]
+    loser_ids = [int(mid) for mid in loser_to_keeper.keys()]
     loser_id_strings = list(loser_to_keeper.keys())
 
     # Archive loser matches.
-    loser_match_docs = await _db.db.matches.find({"_id": {"$in": loser_ids}}, session=session).to_list(length=len(loser_ids))
+    loser_match_docs = await _db.db.matches_v3.find({"_id": {"$in": loser_ids}}, session=session).to_list(length=len(loser_ids))
     archived_matches = await _archive_documents(
         collection_name="archived_matches",
         docs=loser_match_docs,
@@ -633,7 +633,7 @@ async def _collapse_duplicate_matches_for_team_merge(
         )
 
     keeper_match_ids_str = sorted(set(loser_to_keeper.values()))
-    keeper_match_ids_oid = [ObjectId(mid) for mid in keeper_match_ids_str]
+    keeper_match_ids_oid = [int(mid) for mid in keeper_match_ids_str]
     deduped_tips = await _dedupe_quotico_tips_for_matches(
         keeper_match_ids_str,
         merge_job_id=merge_job_id,
@@ -649,7 +649,7 @@ async def _collapse_duplicate_matches_for_team_merge(
         session=session,
     )
 
-    await _db.db.matches.delete_many({"_id": {"$in": loser_ids}}, session=session)
+    await _db.db.matches_v3.delete_many({"_id": {"$in": loser_ids}}, session=session)
 
     return {
         "collisions_detected": collisions,
@@ -666,27 +666,23 @@ async def _collapse_duplicate_matches_for_team_merge(
 
 async def _collect_same_day_duplicate_groups(
     *,
-    league_id: ObjectId | None = None,
-    sport_key: str | None = None,
+    league_id: int | None = None,
     limit_groups: int = 200,
 ) -> list[dict]:
     query: dict = {}
     if league_id is not None:
-        query["league_id"] = league_id
-    if sport_key:
-        query["sport_key"] = str(sport_key).strip()
+        query["league_id"] = int(league_id)
 
-    docs = await _db.db.matches.find(
+    docs = await _db.db.matches_v3.find(
         query,
         {
             "_id": 1,
             "league_id": 1,
-            "sport_key": 1,
             "home_team_id": 1,
             "away_team_id": 1,
             "home_team": 1,
             "away_team": 1,
-            "match_date": 1,
+            "start_at": 1,
             "match_date_hour": 1,
             "status": 1,
             "score": 1,
@@ -710,8 +706,7 @@ async def _collect_same_day_duplicate_groups(
         out.append(
             {
                 "key": key,
-                "league_id": str(keeper.get("league_id") or ""),
-                "sport_key": str(keeper.get("sport_key") or ""),
+                "league_id": int(keeper.get("league_id") or 0),
                 "home_team": str(keeper.get("home_team") or ""),
                 "away_team": str(keeper.get("away_team") or ""),
                 "match_day": match_day,
@@ -722,7 +717,7 @@ async def _collect_same_day_duplicate_groups(
                         {
                             "id": str(m.get("_id")),
                             "status": str(m.get("status") or ""),
-                            "match_date": _as_iso(m.get("match_date")),
+                            "start_at": _as_iso(m.get("start_at")),
                             "match_date_hour": _as_iso(m.get("match_date_hour")),
                             "result": m.get("result") or {},
                             "score": m.get("score") or {},
@@ -730,7 +725,7 @@ async def _collect_same_day_duplicate_groups(
                         }
                         for m in items
                     ],
-                    key=lambda row: (not row["is_keeper"], row.get("match_date") or "", row.get("id") or ""),
+                    key=lambda row: (not row["is_keeper"], row.get("start_at") or "", row.get("id") or ""),
                 ),
             }
         )
@@ -741,13 +736,11 @@ async def _collect_same_day_duplicate_groups(
 
 async def list_same_day_duplicate_matches(
     *,
-    league_id: ObjectId | None = None,
-    sport_key: str | None = None,
+    league_id: int | None = None,
     limit_groups: int = 200,
 ) -> dict:
     groups = await _collect_same_day_duplicate_groups(
         league_id=league_id,
-        sport_key=sport_key,
         limit_groups=limit_groups,
     )
     return {
@@ -759,14 +752,12 @@ async def list_same_day_duplicate_matches(
 
 async def cleanup_same_day_duplicate_matches(
     *,
-    league_id: ObjectId | None = None,
-    sport_key: str | None = None,
+    league_id: int | None = None,
     limit_groups: int = 500,
     dry_run: bool = False,
 ) -> dict:
     groups = await _collect_same_day_duplicate_groups(
         league_id=league_id,
-        sport_key=sport_key,
         limit_groups=limit_groups,
     )
     loser_to_keeper: dict[str, str] = {}
@@ -828,7 +819,7 @@ async def cleanup_same_day_duplicate_matches(
         )
 
     keeper_match_ids_str = sorted(set(loser_to_keeper.values()))
-    keeper_match_ids_oid = [ObjectId(mid) for mid in keeper_match_ids_str]
+    keeper_match_ids_oid = [int(mid) for mid in keeper_match_ids_str]
     deduped_tips = await _dedupe_quotico_tips_for_matches(
         keeper_match_ids_str,
         merge_job_id=str(ObjectId()),
@@ -844,7 +835,7 @@ async def cleanup_same_day_duplicate_matches(
         session=None,
     )
 
-    loser_docs = await _db.db.matches.find({"_id": {"$in": losers}}).to_list(length=len(losers))
+    loser_docs = await _db.db.matches_v3.find({"_id": {"$in": losers}}).to_list(length=len(losers))
     merge_job_id = str(ObjectId())
     archived = await _archive_documents(
         collection_name="archived_matches",
@@ -856,7 +847,7 @@ async def cleanup_same_day_duplicate_matches(
         reason="same_day_duplicate_cleanup",
         session=None,
     )
-    delete_result = await _db.db.matches.delete_many({"_id": {"$in": losers}})
+    delete_result = await _db.db.matches_v3.delete_many({"_id": {"$in": losers}})
     return {
         "dry_run": False,
         "groups": len(groups),
@@ -917,11 +908,11 @@ async def merge_teams(source_id: ObjectId, target_id: ObjectId) -> dict:
     target_str = str(target_id)
     target_display_name = str(target.get("display_name") or "")
 
-    matches_home = await _db.db.matches.update_many(
+    matches_home = await _db.db.matches_v3.update_many(
         {"home_team_id": {"$in": source_values}},
         {"$set": {"home_team_id": target_id, "home_team": target_display_name, "updated_at": now}},
     )
-    matches_away = await _db.db.matches.update_many(
+    matches_away = await _db.db.matches_v3.update_many(
         {"away_team_id": {"$in": source_values}},
         {"$set": {"away_team_id": target_id, "away_team": target_display_name, "updated_at": now}},
     )

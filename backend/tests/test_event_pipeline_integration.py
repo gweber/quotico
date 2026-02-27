@@ -57,8 +57,7 @@ async def test_match_finalized_pipeline_and_failure_isolation(monkeypatch):
             source="test",
             correlation_id="corr-integration-1",
             match_id=str(ObjectId()),
-            league_id=str(ObjectId()),
-            sport_key="soccer_epl",
+            league_id=8,
             season=2025,
             final_score={"home": 1, "away": 0},
         )

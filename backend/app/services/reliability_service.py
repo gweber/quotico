@@ -18,7 +18,7 @@ import math
 from datetime import datetime, timedelta
 
 import app.database as _db
-from app.services.optimizer_service import CALIBRATED_LEAGUES
+from app.services.optimizer_service import _get_calibrated_league_ids
 from app.utils import utcnow
 
 logger = logging.getLogger("quotico.reliability")
@@ -67,7 +67,7 @@ REGRESSION_MAX = 0.40
 # ---------------------------------------------------------------------------
 
 async def analyze_engine_reliability(
-    sport_key: str,
+    league_id: int,
     before_date: datetime | None = None,
 ) -> dict | None:
     """Analyze historical tip performance and compute reliability parameters.
@@ -80,7 +80,7 @@ async def analyze_engine_reliability(
 
     Algorithm
     ---------
-    1. Fetch last RELIABILITY_WINDOW_DAYS of resolved tips for *sport_key*.
+    1. Fetch last RELIABILITY_WINDOW_DAYS of resolved tips for *league_id*.
     2. Bucket by confidence bands.
     3. Per band: Bayesian-smoothed win rate, reliability factor.
     4. Weighted-average reliability factor → multiplier.
@@ -94,7 +94,7 @@ async def analyze_engine_reliability(
 
     tips = await _db.db.quotico_tips.find(
         {
-            "sport_key": sport_key,
+            "league_id": league_id,
             "status": "resolved",
             "was_correct": {"$ne": None},
             "confidence": {"$gt": 0},
@@ -106,7 +106,7 @@ async def analyze_engine_reliability(
     if len(tips) < MIN_TIPS_FOR_RELIABILITY:
         logger.info(
             "Skipping reliability for %s: only %d tips (need %d)",
-            sport_key, len(tips), MIN_TIPS_FOR_RELIABILITY,
+            league_id, len(tips), MIN_TIPS_FOR_RELIABILITY,
         )
         return None
 
@@ -197,7 +197,7 @@ async def analyze_engine_reliability(
     logger.info(
         "Reliability for %s: mult=%.3f cap=%.3f reg=%.3f "
         "avg_WR=%.3f N=%d bands=%d",
-        sport_key, multiplier, cap, regression_factor,
+        league_id, multiplier, cap, regression_factor,
         avg_win_rate, len(tips), len(bands),
     )
     return result
@@ -207,14 +207,14 @@ async def analyze_engine_reliability(
 # Persistence
 # ---------------------------------------------------------------------------
 
-async def update_reliability(sport_key: str) -> dict | None:
+async def update_reliability(league_id: int) -> dict | None:
     """Analyze and persist reliability params to engine_config."""
-    result = await analyze_engine_reliability(sport_key)
+    result = await analyze_engine_reliability(league_id)
     if not result:
         return None
 
     await _db.db.engine_config.update_one(
-        {"_id": sport_key},
+        {"_id": league_id},
         {"$set": {
             "reliability": result,
             "reliability_updated_at": utcnow(),
@@ -229,15 +229,15 @@ async def run_reliability_analysis() -> dict:
 
     Called by calibration_worker.run_reliability_check().
     """
-    results: dict[str, dict] = {}
-    for sport_key in CALIBRATED_LEAGUES:
+    results: dict[int, dict] = {}
+    for league_id in await _get_calibrated_league_ids():
         try:
-            r = await update_reliability(sport_key)
-            results[sport_key] = {
+            r = await update_reliability(league_id)
+            results[league_id] = {
                 "status": "analyzed" if r else "skipped",
                 **(r or {}),
             }
         except Exception:
-            logger.exception("Reliability analysis failed for %s", sport_key)
-            results[sport_key] = {"status": "error"}
+            logger.exception("Reliability analysis failed for %s", league_id)
+            results[league_id] = {"status": "error"}
     return results

@@ -1,10 +1,13 @@
 <script setup lang="ts">
 import { ref, onMounted } from "vue";
+import { useI18n } from "vue-i18n";
 import { useApi } from "@/composables/useApi";
 import { useToast } from "@/composables/useToast";
+import type { TipPersona, TipPersonaSource } from "@/types/persona";
 
 const api = useApi();
 const toast = useToast();
+const { t } = useI18n();
 
 interface AdminUser {
   id: string;
@@ -16,13 +19,25 @@ interface AdminUser {
   is_banned: boolean;
   is_2fa_enabled: boolean;
   created_at: string;
-  tip_count: number;
+  bet_count: number;
+  tip_persona: TipPersona;
+  tip_override_persona: TipPersona | null;
+  tip_persona_effective: TipPersona;
+  tip_persona_source: TipPersonaSource;
+  tip_persona_updated_at: string | null;
 }
 
 const users = ref<AdminUser[]>([]);
 const search = ref("");
 const loading = ref(true);
 const error = ref(false);
+const savingPolicy = ref(false);
+const simulatingPolicy = ref(false);
+const policyVersion = ref(1);
+const policyNote = ref("");
+const policyRulesJson = ref("[]");
+const policySimulation = ref<{ affected_users: number; delta: Record<string, number> } | null>(null);
+const personaOptions: TipPersona[] = ["casual", "pro", "silent", "experimental"];
 
 // Points adjustment
 const adjustUserId = ref<string | null>(null);
@@ -40,6 +55,64 @@ async function fetchUsers() {
     error.value = true;
   } finally {
     loading.value = false;
+  }
+}
+
+async function setPersona(user: AdminUser, persona: TipPersona) {
+  try {
+    await api.patch(`/admin/users/${user.id}/tip-persona`, { tip_persona: persona });
+    await fetchUsers();
+    toast.success(t("admin.userManager.personaSaved"));
+  } catch (e: unknown) {
+    toast.error(e instanceof Error ? e.message : t("common.loadError"));
+  }
+}
+
+async function setOverride(user: AdminUser, override: TipPersona | null) {
+  try {
+    await api.patch(`/admin/users/${user.id}/tip-override`, { tip_override_persona: override });
+    await fetchUsers();
+    toast.success(t("admin.userManager.overrideSaved"));
+  } catch (e: unknown) {
+    toast.error(e instanceof Error ? e.message : t("common.loadError"));
+  }
+}
+
+async function fetchPolicy() {
+  try {
+    const doc = await api.get<{ version: number; note?: string | null; rules: unknown[] }>("/admin/tip-policy");
+    policyVersion.value = doc.version || 1;
+    policyNote.value = doc.note || "";
+    policyRulesJson.value = JSON.stringify(doc.rules || [], null, 2);
+  } catch {
+    // silent
+  }
+}
+
+async function simulatePolicy() {
+  simulatingPolicy.value = true;
+  try {
+    const rules = JSON.parse(policyRulesJson.value);
+    policySimulation.value = await api.post("/admin/tip-policy/simulate", { rules, note: policyNote.value || null });
+  } catch (e: unknown) {
+    toast.error(e instanceof Error ? e.message : t("common.loadError"));
+  } finally {
+    simulatingPolicy.value = false;
+  }
+}
+
+async function savePolicy() {
+  savingPolicy.value = true;
+  try {
+    const rules = JSON.parse(policyRulesJson.value);
+    const result = await api.patch<{ new_version: number }>("/admin/tip-policy", { rules, note: policyNote.value || null });
+    policyVersion.value = result.new_version;
+    toast.success(t("admin.userManager.policySaved"));
+    await fetchPolicy();
+  } catch (e: unknown) {
+    toast.error(e instanceof Error ? e.message : t("common.loadError"));
+  } finally {
+    savingPolicy.value = false;
   }
 }
 
@@ -85,7 +158,9 @@ async function resetAlias(user: AdminUser) {
   }
 }
 
-onMounted(fetchUsers);
+onMounted(async () => {
+  await Promise.all([fetchUsers(), fetchPolicy()]);
+});
 
 let searchTimer: ReturnType<typeof setTimeout> | null = null;
 function onSearch() {
@@ -114,6 +189,45 @@ function onSearch() {
       />
     </div>
 
+    <div class="mb-6 rounded-card border border-surface-3/50 bg-surface-1 p-4">
+      <h2 class="text-base font-semibold text-text-primary">{{ t("admin.userManager.policyTitle") }}</h2>
+      <p class="mt-1 text-xs text-text-muted">{{ t("admin.userManager.policyVersion", { version: policyVersion }) }}</p>
+      <label class="mt-3 block text-xs text-text-secondary">{{ t("admin.userManager.policyNote") }}</label>
+      <input
+        v-model="policyNote"
+        type="text"
+        class="mt-1 w-full rounded-lg border border-surface-3 bg-surface-2 px-3 py-2 text-sm text-text-primary"
+      />
+      <label class="mt-3 block text-xs text-text-secondary">{{ t("admin.userManager.policyRules") }}</label>
+      <textarea
+        v-model="policyRulesJson"
+        rows="8"
+        class="mt-1 w-full rounded-lg border border-surface-3 bg-surface-2 px-3 py-2 font-mono text-xs text-text-primary"
+      />
+      <div class="mt-3 flex flex-wrap gap-2">
+        <button
+          class="rounded bg-surface-2 px-3 py-1.5 text-xs text-text-secondary hover:bg-surface-3"
+          :disabled="simulatingPolicy"
+          @click="simulatePolicy"
+        >
+          {{ t("admin.userManager.simulate") }}
+        </button>
+        <button
+          class="rounded bg-primary px-3 py-1.5 text-xs text-surface-0 hover:bg-primary-hover disabled:opacity-60"
+          :disabled="savingPolicy"
+          @click="savePolicy"
+        >
+          {{ t("admin.userManager.savePolicy") }}
+        </button>
+      </div>
+      <div v-if="policySimulation" class="mt-3 rounded border border-surface-3 bg-surface-2 px-3 py-2 text-xs text-text-secondary">
+        {{ t("admin.userManager.simAffected", { count: policySimulation.affected_users }) }}
+        <span v-if="Object.keys(policySimulation.delta).length > 0" class="ml-2">
+          {{ Object.entries(policySimulation.delta).map(([k, v]) => `${k}:${v}`).join(", ") }}
+        </span>
+      </div>
+    </div>
+
     <!-- Error -->
     <div v-if="error" class="text-center py-12">
       <p class="text-text-muted mb-3">Error loading.</p>
@@ -128,13 +242,14 @@ function onSearch() {
             <th class="text-left px-4 py-3 font-medium">User</th>
             <th class="text-right px-4 py-3 font-medium">Punkte</th>
             <th class="text-right px-4 py-3 font-medium">Tipps</th>
+            <th class="text-left px-4 py-3 font-medium">{{ t("admin.userManager.persona") }}</th>
             <th class="text-center px-4 py-3 font-medium">Status</th>
             <th class="text-right px-4 py-3 font-medium">Aktionen</th>
           </tr>
         </thead>
         <tbody>
           <tr v-if="loading">
-            <td colspan="5" class="px-4 py-8 text-center text-text-muted">Laden...</td>
+            <td colspan="6" class="px-4 py-8 text-center text-text-muted">Laden...</td>
           </tr>
           <tr
             v-for="u in users"
@@ -151,7 +266,35 @@ function onSearch() {
               </div>
             </td>
             <td class="px-4 py-3 text-right tabular-nums text-text-primary">{{ u.points.toFixed(1) }}</td>
-            <td class="px-4 py-3 text-right tabular-nums text-text-muted">{{ u.tip_count }}</td>
+            <td class="px-4 py-3 text-right tabular-nums text-text-muted">{{ u.bet_count }}</td>
+            <td class="px-4 py-3">
+              <div class="space-y-1">
+                <div class="flex items-center gap-2">
+                  <select
+                    class="rounded border border-surface-3 bg-surface-2 px-2 py-1 text-xs text-text-primary"
+                    :value="u.tip_persona"
+                    @change="setPersona(u, ($event.target as HTMLSelectElement).value as TipPersona)"
+                  >
+                    <option v-for="p in personaOptions" :key="`p-${u.id}-${p}`" :value="p">
+                      {{ $t(`settings.persona.options.${p}`) }}
+                    </option>
+                  </select>
+                  <select
+                    class="rounded border border-surface-3 bg-surface-2 px-2 py-1 text-xs text-text-primary"
+                    :value="u.tip_override_persona ?? ''"
+                    @change="setOverride(u, (($event.target as HTMLSelectElement).value || null) as TipPersona | null)"
+                  >
+                    <option value="">{{ t("admin.userManager.noOverride") }}</option>
+                    <option v-for="p in personaOptions" :key="`o-${u.id}-${p}`" :value="p">
+                      {{ $t(`settings.persona.options.${p}`) }}
+                    </option>
+                  </select>
+                </div>
+                <div class="text-[11px] text-text-muted">
+                  {{ t("admin.userManager.effective", { persona: $t(`settings.persona.options.${u.tip_persona_effective}`), source: $t(`settings.persona.source.${u.tip_persona_source}`) }) }}
+                </div>
+              </div>
+            </td>
             <td class="px-4 py-3 text-center">
               <span
                 v-if="u.is_banned"

@@ -61,7 +61,7 @@ onMounted(loadTrace);
 
     <div v-else class="space-y-4">
       <div class="bg-surface-1 rounded-card p-4 border border-surface-3/50">
-        <div class="text-xs text-text-muted">{{ sportLabel(tip.sport_key) }}</div>
+        <div class="text-xs text-text-muted">{{ sportLabel(tip.league_id) }}</div>
         <div class="text-sm text-text-primary font-medium mt-1">
           {{ tip.home_team }} vs {{ tip.away_team }}
         </div>

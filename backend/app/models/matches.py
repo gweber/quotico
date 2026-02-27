@@ -50,8 +50,7 @@ class MatchScore(BaseModel):
 
 class MatchInDB(BaseModel):
     id: PyObjectId | None = Field(alias="_id", default=None)
-    league_id: PyObjectId
-    sport_key: str
+    league_id: int
     home_team_id: PyObjectId
     away_team_id: PyObjectId
     match_date: datetime
@@ -92,7 +91,7 @@ class ResultResponse(BaseModel):
 
 class MatchResponse(BaseModel):
     id: str
-    sport_key: str
+    league_id: int
     home_team: str
     away_team: str
     match_date: datetime
@@ -132,10 +131,14 @@ def db_to_response(doc: dict) -> MatchResponse:
     full_time = score.get("full_time", {}) if isinstance(score, dict) else {}
     home_score, away_score = _coerce_score(full_time)
 
+    league_id = doc.get("league_id")
+    if isinstance(league_id, bool) or not isinstance(league_id, int):
+        raise ValueError(f"Invalid league_id in match document: {league_id!r}")
+
     odds = build_legacy_like_odds(doc)
     return MatchResponse(
         id=str(doc["_id"]),
-        sport_key=str(doc.get("sport_key") or ""),
+        league_id=league_id,
         home_team=str(doc.get("home_team") or ""),
         away_team=str(doc.get("away_team") or ""),
         match_date=ensure_utc(doc.get("match_date")),

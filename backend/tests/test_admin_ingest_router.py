@@ -118,12 +118,11 @@ async def test_discovery_uses_cache_when_not_stale(monkeypatch):
         leagues=[
             {
                 "_id": 8,
-                "sport_key": "soccer_germany_bundesliga",
+                "league_id": 82,
                 "name": "Bundesliga",
                 "country": "Germany",
                 "is_cup": False,
                 "is_active": True,
-                "needs_review": False,
                 "ui_order": 1,
                 "features": {"tipping": True, "match_load": True, "xg_sync": True, "odds_sync": True},
                 "available_seasons": [{"id": 1, "name": "2024/2025"}],
@@ -142,6 +141,7 @@ async def test_discovery_uses_cache_when_not_stale(monkeypatch):
     assert len(result["items"]) == 1
     assert result["items"][0]["is_active"] is True
     assert result["items"][0]["features"]["tipping"] is True
+    assert "needs_review" not in result["items"][0]
 
 
 @pytest.mark.asyncio
@@ -151,12 +151,11 @@ async def test_patch_discovery_league_updates_runtime_flags(monkeypatch):
         leagues=[
             {
                 "_id": 8,
-                "sport_key": "soccer_germany_bundesliga",
+                "league_id": 82,
                 "name": "Bundesliga",
                 "country": "Germany",
                 "is_cup": False,
                 "is_active": False,
-                "needs_review": False,
                 "ui_order": 10,
                 "features": {"tipping": False, "match_load": True, "xg_sync": False, "odds_sync": False},
                 "available_seasons": [{"id": 1, "name": "2024/2025"}],
@@ -182,6 +181,44 @@ async def test_patch_discovery_league_updates_runtime_flags(monkeypatch):
     )
     assert result["item"]["is_active"] is True
     assert result["item"]["features"]["tipping"] is True
+    assert "needs_review" not in result["item"]
+    assert invalidated["hit"] is True
+
+
+@pytest.mark.asyncio
+async def test_discovery_force_refresh_invalidates_navigation_cache(monkeypatch):
+    fake_db = _FakeDB(leagues=[], meta=[])
+    monkeypatch.setattr(ingest_router._db, "db", fake_db, raising=False)
+
+    async def _available():
+        return {
+            "remaining": 10,
+            "reset_at": 123456,
+            "items": [
+                {
+                    "_id": 8,
+                    "name": "Bundesliga",
+                    "country": "Germany",
+                    "is_cup": False,
+                    "available_seasons": [{"id": 1, "name": "2024/2025"}],
+                }
+            ],
+        }
+
+    async def _sync(_items):
+        return {"inserted": 0, "updated": 1, "rejected": 0}
+
+    invalidated = {"hit": False}
+
+    async def _invalidate():
+        invalidated["hit"] = True
+
+    monkeypatch.setattr(ingest_router.sportmonks_connector, "get_available_leagues", _available)
+    monkeypatch.setattr(ingest_router.sportmonks_connector, "sync_leagues_to_registry", _sync)
+    monkeypatch.setattr(ingest_router, "invalidate_navigation_cache", _invalidate)
+
+    result = await ingest_router.discover_leagues(force=True, admin={"_id": ObjectId()})
+    assert result["source"] == "sportmonks"
     assert invalidated["hit"] is True
 
 
@@ -246,7 +283,7 @@ async def test_metrics_health_counts_coverage(monkeypatch):
                 "_id": 1,
                 "season_id": 25536,
                 "has_advanced_stats": True,
-                "odds_meta": {"summary_1x2": {"home": {"avg": 2.0}, "draw": {"avg": 3.2}, "away": {"avg": 3.4}}},
+                "odds_meta": {"summary_1x2": {"home": {"avg": 2.0}, "draw": {"avg": 3.2}, "away": {"avg": 3.4}}},  # FIXME: ODDS_V3_BREAK — test uses stale odds_meta.summary_1x2
             },
             {
                 "_id": 2,
@@ -278,7 +315,7 @@ async def test_overview_stats_returns_v3_shape(monkeypatch):
                 "status": "FINISHED",
                 "updated_at": now,
                 "has_advanced_stats": True,
-                "odds_meta": {"summary_1x2": {"home": {"avg": 2.1}, "draw": {"avg": 3.4}, "away": {"avg": 3.6}}},
+                "odds_meta": {"summary_1x2": {"home": {"avg": 2.1}, "draw": {"avg": 3.4}, "away": {"avg": 3.6}}},  # FIXME: ODDS_V3_BREAK — test uses stale odds_meta.summary_1x2
             },
             {"_id": 2, "status": "LIVE", "updated_at": now},
             {"_id": 3, "status": "POSTPONED", "updated_at": now},

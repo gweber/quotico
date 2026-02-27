@@ -59,7 +59,7 @@ async def resolve_parlays() -> None:
                     any_lost = True
                 continue
 
-            match = await _db.db.matches.find_one({"_id": ObjectId(leg["match_id"])})
+            match = await _db.db.matches_v3.find_one({"_id": int(leg["match_id"])})
             if not match or match["status"] != "final":
                 all_resolved = False
                 updated_legs.append(leg)
@@ -123,7 +123,7 @@ async def resolve_parlays() -> None:
                 wallet = await _db.db.wallets.find_one({
                     "user_id": parlay["user_id"],
                     "squad_id": parlay["squad_id"],
-                    "sport_key": parlay.get("sport_key"),
+                    "league_id": parlay.get("league_id"),
                     "season": parlay.get("season"),
                 })
                 if wallet:
@@ -154,7 +154,7 @@ async def resolve_parlays() -> None:
                 wallet = await _db.db.wallets.find_one({
                     "user_id": parlay["user_id"],
                     "squad_id": parlay["squad_id"],
-                    "sport_key": parlay.get("sport_key"),
+                    "league_id": parlay.get("league_id"),
                     "season": parlay.get("season"),
                 })
                 if wallet:
@@ -173,7 +173,7 @@ async def _void_parlay(parlay: dict, updated_legs: list, now) -> None:
         wallet = await _db.db.wallets.find_one({
             "user_id": parlay["user_id"],
             "squad_id": parlay["squad_id"],
-            "sport_key": parlay.get("sport_key"),
+            "league_id": parlay.get("league_id"),
             "season": parlay.get("season"),
         })
         if wallet:

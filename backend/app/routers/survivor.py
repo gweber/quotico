@@ -30,7 +30,7 @@ async def make_pick(
 @router.get("/{squad_id}/status")
 async def get_status(
     squad_id: str,
-    sport: str = Query(...),
+    league_id: int = Query(...),
     season: int = Query(None),
     user=Depends(get_current_user),
 ):
@@ -39,7 +39,7 @@ async def get_status(
     if not season:
         season = utcnow().year
 
-    entry = await survivor_service.get_entry(user_id, squad_id, sport, season)
+    entry = await survivor_service.get_entry(user_id, squad_id, int(league_id), season)
     if not entry:
         return {"status": "not_started", "picks": [], "used_teams": [], "streak": 0}
     return _entry_response(entry)
@@ -48,14 +48,14 @@ async def get_status(
 @router.get("/{squad_id}/standings")
 async def get_standings(
     squad_id: str,
-    sport: str = Query(...),
+    league_id: int = Query(...),
     season: int = Query(None),
     user=Depends(get_current_user),
 ):
     """Get survivor standings for a squad."""
     if not season:
         season = utcnow().year
-    return await survivor_service.get_standings(squad_id, sport, season)
+    return await survivor_service.get_standings(squad_id, int(league_id), season)
 
 
 def _entry_response(entry: dict) -> dict:

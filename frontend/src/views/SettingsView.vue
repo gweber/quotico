@@ -7,6 +7,7 @@ import { useApi } from "@/composables/useApi";
 import { useToast } from "@/composables/useToast";
 import TwoFaSetup from "@/components/TwoFaSetup.vue";
 import AliasEditor from "@/components/AliasEditor.vue";
+import type { TipPersona } from "@/types/persona";
 
 const { t } = useI18n();
 const router = useRouter();
@@ -87,6 +88,22 @@ async function exportData() {
 const showDeleteConfirm = ref(false);
 const deleteConfirmText = ref("");
 const deleting = ref(false);
+const updatingPersona = ref(false);
+
+const personaOptions: TipPersona[] = ["casual", "pro", "silent", "experimental"];
+
+async function updatePersona(persona: TipPersona) {
+  updatingPersona.value = true;
+  try {
+    await auth.updateTipPersona(persona);
+    toast.success(t("settings.persona.saved"));
+  } catch (e: unknown) {
+    const msg = e instanceof Error ? e.message : t("settings.persona.saveError");
+    toast.error(msg);
+  } finally {
+    updatingPersona.value = false;
+  }
+}
 
 async function deleteAccount() {
   if (deleteConfirmText.value !== "LÖSCHEN") return;
@@ -166,6 +183,42 @@ async function deleteAccount() {
 
     <!-- Alias / Spielername -->
     <AliasEditor />
+
+    <!-- Persona -->
+    <div class="bg-surface-1 rounded-card p-6">
+      <h2 class="text-lg font-semibold text-text-primary mb-1">{{ $t("settings.persona.title") }}</h2>
+      <p class="text-sm text-text-secondary mb-4">{{ $t("settings.persona.description") }}</p>
+      <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+        <label class="block">
+          <span class="block text-sm text-text-secondary mb-1">{{ $t("settings.persona.selected") }}</span>
+          <select
+            class="w-full rounded-lg border border-surface-3 bg-surface-2 px-3 py-2 text-sm text-text-primary"
+            :value="auth.user?.tip_persona || 'casual'"
+            :disabled="updatingPersona || !auth.user"
+            @change="updatePersona(($event.target as HTMLSelectElement).value as TipPersona)"
+          >
+            <option v-for="p in personaOptions" :key="p" :value="p">
+              {{ $t(`settings.persona.options.${p}`) }}
+            </option>
+          </select>
+        </label>
+        <div class="rounded-lg border border-surface-3 bg-surface-2 px-3 py-2">
+          <div class="text-sm text-text-secondary">{{ $t("settings.persona.effective") }}</div>
+          <div class="mt-1 text-sm font-medium text-text-primary">
+            {{ $t(`settings.persona.options.${auth.user?.tip_persona_effective || "casual"}`) }}
+          </div>
+          <div class="mt-1 text-xs text-text-muted">
+            {{ $t(`settings.persona.source.${auth.user?.tip_persona_source || "default"}`) }}
+          </div>
+        </div>
+      </div>
+      <p
+        v-if="auth.user?.tip_persona && auth.user?.tip_persona_effective && auth.user.tip_persona !== auth.user.tip_persona_effective"
+        class="mt-3 text-xs text-warning"
+      >
+        {{ $t("settings.persona.limitedHint") }}
+      </p>
+    </div>
 
     <!-- 2FA -->
     <TwoFaSetup />

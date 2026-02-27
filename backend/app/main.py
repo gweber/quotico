@@ -165,10 +165,11 @@ from app.routers.historical import router as historical_router
 from app.routers.quotico_tips import router as quotico_tips_router
 from app.routers.qbot import router as qbot_router
 from app.routers.betting_slips import router as betting_slips_router
-from app.routers.leagues import router as leagues_router
+from app.routers.teams import router as teams_router
 from app.routers.admin import router as admin_router
 from app.routers.admin_ingest import router as admin_ingest_router
 from app.routers.admin_teams_v3 import router as admin_teams_v3_router
+from app.routers.admin_persons import router as admin_persons_router
 from app.routers.v3_query import router as v3_query_router
 
 app.include_router(auth_router)
@@ -191,10 +192,11 @@ app.include_router(historical_router)
 app.include_router(quotico_tips_router)
 app.include_router(qbot_router)
 app.include_router(betting_slips_router)
-app.include_router(leagues_router)
+app.include_router(teams_router)
 app.include_router(admin_router)
 app.include_router(admin_ingest_router)
 app.include_router(admin_teams_v3_router)
+app.include_router(admin_persons_router)
 app.include_router(v3_query_router)
 
 
@@ -259,9 +261,7 @@ async def unhandled_exception_handler(request: Request, exc: Exception):
 
 @app.get("/health")
 async def health():
-    """Health check -- verifies DB connection and provider status."""
-    from app.providers.odds_api import odds_provider
-
+    """Health check -- verifies DB connection."""
     try:
         result = await _db.db.command("ping")
         db_ok = result.get("ok") == 1.0
@@ -271,7 +271,5 @@ async def health():
     return {
         "status": "healthy" if db_ok else "degraded",
         "db": "connected" if db_ok else "disconnected",
-        "odds_provider": {
-            "circuit_open": odds_provider.circuit_open,
-        },
+        "provider": "sportmonks",
     }

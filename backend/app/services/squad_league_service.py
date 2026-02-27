@@ -10,7 +10,7 @@ from app.models.game_mode import GAME_MODE_LABELS
 
 
 def get_active_league_config(
-    squad: dict, sport_key: str, expected_mode: str | None = None,
+    squad: dict, league_id: int, expected_mode: str | None = None,
 ) -> dict | None:
     """Find the active league config for a sport within a squad.
 
@@ -18,7 +18,12 @@ def get_active_league_config(
     Raises HTTPException 400 if expected_mode doesn't match.
     """
     for config in squad.get("league_configs", []):
-        if config["sport_key"] == sport_key and config.get("deactivated_at") is None:
+        if not isinstance(config.get("league_id"), int):
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                "Invalid squad league configuration: league_id must be int.",
+            )
+        if config["league_id"] == league_id and config.get("deactivated_at") is None:
             if expected_mode and config["game_mode"] != expected_mode:
                 label = GAME_MODE_LABELS.get(expected_mode, expected_mode)
                 raise HTTPException(
@@ -30,10 +35,10 @@ def get_active_league_config(
 
 
 def require_active_league_config(
-    squad: dict, sport_key: str, expected_mode: str,
+    squad: dict, league_id: int, expected_mode: str,
 ) -> dict:
     """Like get_active_league_config but raises 400 if not found."""
-    config = get_active_league_config(squad, sport_key, expected_mode)
+    config = get_active_league_config(squad, league_id, expected_mode)
     if not config:
         label = GAME_MODE_LABELS.get(expected_mode, expected_mode)
         raise HTTPException(
@@ -44,7 +49,7 @@ def require_active_league_config(
 
 
 async def get_squad_mode_for_sport(
-    squad_id: str, sport_key: str,
+    squad_id: str, league_id: int,
 ) -> str | None:
     """Quick lookup: what game_mode does this squad use for this sport?"""
     squad = await _db.db.squads.find_one(
@@ -52,7 +57,7 @@ async def get_squad_mode_for_sport(
             "_id": ObjectId(squad_id),
             "league_configs": {
                 "$elemMatch": {
-                    "sport_key": sport_key,
+                    "league_id": league_id,
                     "deactivated_at": None,
                 }
             },

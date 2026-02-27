@@ -116,7 +116,7 @@ const history = ref<HistoryResponse | null>(null);
 const handlers = ref<HandlersResponse | null>(null);
 const error = ref<string | null>(null);
 const windowKey = ref<"1h" | "6h" | "24h">("24h");
-const sourceFilter = ref<"all" | "football_data" | "openligadb" | "football_data_uk" | "theoddsapi">("all");
+const sourceFilter = ref<"all" | "sportmonks">("all");
 let timer: number | null = null;
 
 const depthChartData = computed(() => {
@@ -304,10 +304,7 @@ onUnmounted(() => {
             class="rounded-card border border-surface-3 bg-surface-0 px-2 py-1 text-xs text-text-primary"
           >
             <option value="all">{{ t("admin.eventBus.sources.all") }}</option>
-            <option value="football_data">football-data.org</option>
-            <option value="openligadb">openligadb</option>
-            <option value="football_data_uk">football-data.co.uk</option>
-            <option value="theoddsapi">theoddsapi</option>
+            <option value="sportmonks">sportmonks</option>
           </select>
         </div>
         <table class="w-full text-sm">

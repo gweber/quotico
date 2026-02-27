@@ -1,9 +1,17 @@
+/**
+ * frontend/src/stores/matches.ts
+ *
+ * Purpose:
+ * Runtime store for dashboard matches, odds refresh, and live-score websocket.
+ * Uses v3 match endpoints and league_id-based filtering for the startpage nav.
+ */
 import { defineStore } from "pinia";
 import { ref, computed } from "vue";
 import { useApi } from "@/composables/useApi";
 import { prefetchUserBets } from "@/composables/useUserBets";
 import { oddsValueBySelection } from "@/composables/useMatchV3Adapter";
-import type { MatchV3, OddsMetaV3 } from "@/types/MatchV3";
+import type { MatchV3, OddsMetaV3, PeriodScoresV3 } from "@/types/MatchV3";
+import type { MatchQtipPayload, OutputLevel } from "@/types/persona";
 
 export interface MatchOdds {
   h2h: Record<string, number>;
@@ -20,8 +28,7 @@ export interface MatchResult {
 
 export interface Match {
   id: string;
-  sport_key: string;
-  league_id?: number;
+  league_id: number;
   league_name?: string;
   league_country?: string;
   home_team: string;
@@ -33,8 +40,11 @@ export interface Match {
   result: MatchResult;
   odds_meta?: OddsMetaV3;
   has_advanced_stats?: boolean;
-  referee_id?: number | string | null;
+  referee_id?: number | null;
   teams?: MatchV3["teams"];
+  scores?: PeriodScoresV3;
+  qtip?: MatchQtipPayload | null;
+  qtip_output_level?: OutputLevel;
 }
 
 export interface LiveScore {
@@ -51,12 +61,16 @@ const WS_URL = `${window.location.protocol === "https:" ? "wss:" : "ws:"}//${win
 // Refresh interval: matches are re-fetched every 5 minutes (or on WS odds_updated)
 const REFRESH_INTERVAL_MS = 5 * 60 * 1000;
 
+interface FetchMatchesOptions {
+  leagueId?: number | null;
+}
+
 export const useMatchesStore = defineStore("matches", () => {
   const api = useApi();
   const matches = ref<Match[]>([]);
   const liveScores = ref<Map<string, LiveScore>>(new Map());
   const loading = ref(true);
-  const activeSport = ref<string | null>(null);
+  const activeLeagueId = ref<number | null>(null);
   const wsConnected = ref(false);
 
   // Odds change tracking: match IDs whose odds changed on last refresh
@@ -89,6 +103,7 @@ export const useMatchesStore = defineStore("matches", () => {
     const id = String(row?._id ?? row?.id ?? "");
     const homeId = Number(row?.teams?.home?.sm_id || 0);
     const awayId = Number(row?.teams?.away?.sm_id || 0);
+    // FIXME: ODDS_V3_BREAK — reads odds_meta.summary_1x2 for odds display which is no longer produced by connector
     const summary = row?.odds_meta?.summary_1x2 || {};
     const h2h: Record<string, number> = {};
     const homeAvg = Number(summary?.home?.avg);
@@ -99,8 +114,7 @@ export const useMatchesStore = defineStore("matches", () => {
     if (Number.isFinite(awayAvg)) h2h["2"] = awayAvg;
     return {
       id,
-      sport_key: "football",
-      league_id: typeof row?.league_id === "number" ? row.league_id : undefined,
+      league_id: typeof row?.league_id === "number" ? row.league_id : 0,
       league_name: typeof row?.league_name === "string" ? row.league_name : undefined,
       league_country: typeof row?.league_country === "string" ? row.league_country : undefined,
       home_team: String(row?.teams?.home?.name || `Team ${homeId || "?"}`),
@@ -116,16 +130,20 @@ export const useMatchesStore = defineStore("matches", () => {
       },
       odds_meta: row?.odds_meta,
       has_advanced_stats: Boolean(row?.has_advanced_stats),
-      referee_id: row?.referee_id ?? null,
+      referee_id: typeof row?.referee_id === "number" ? row.referee_id : null,
       teams: row?.teams,
+      scores: row?.scores,
+      qtip: row?.qtip ?? null,
+      qtip_output_level: typeof row?.qtip_output_level === "string" ? row.qtip_output_level : "none",
     };
   }
 
-  async function fetchMatches(sport?: string) {
+  async function fetchMatches(options: FetchMatchesOptions = {}) {
     loading.value = true;
     try {
-      const params: Record<string, string> = {};
-      if (sport) params.sport = sport;
+      const params: Record<string, string> = { status: "SCHEDULED" };
+      const leagueId = options.leagueId ?? activeLeagueId.value;
+      if (typeof leagueId === "number") params.league_id = String(leagueId);
       const response = await api.get<{ items: any[] }>("/v3/matches", params);
       const freshMatches = (response.items || []).map(_toLegacyMatch);
       _detectOddsChanges(freshMatches);
@@ -142,8 +160,8 @@ export const useMatchesStore = defineStore("matches", () => {
   /** Silently refresh odds without loading spinner. */
   async function refreshOdds() {
     try {
-      const params: Record<string, string> = {};
-      if (activeSport.value) params.sport = activeSport.value;
+      const params: Record<string, string> = { status: "SCHEDULED" };
+      if (typeof activeLeagueId.value === "number") params.league_id = String(activeLeagueId.value);
       const response = await api.get<{ items: any[] }>("/v3/matches", params);
       const freshMatches = (response.items || []).map(_toLegacyMatch);
       _detectOddsChanges(freshMatches);
@@ -152,6 +170,34 @@ export const useMatchesStore = defineStore("matches", () => {
       nextRefreshIn.value = REFRESH_INTERVAL_MS;
     } catch {
       // Silent fail — keep showing existing data
+    }
+  }
+
+  /** Refresh only selected matches and merge them into the current list. */
+  async function refreshOddsByMatchIds(matchIds: string[]) {
+    const ids = [...new Set(matchIds.map((id) => Number(id)).filter((id) => Number.isFinite(id)))];
+    if (ids.length === 0) {
+      await refreshOdds();
+      return;
+    }
+    try {
+      const query = await api.post<{ items: any[] }>("/v3/matches/query", {
+        ids,
+        statuses: ["SCHEDULED"],
+        limit: Math.min(200, ids.length),
+      });
+      const freshSubset = (query.items || []).map(_toLegacyMatch);
+      if (freshSubset.length === 0) return;
+      const mergedMap = new Map(matches.value.map((m) => [m.id, m]));
+      for (const fresh of freshSubset) mergedMap.set(fresh.id, fresh);
+      const merged = [...mergedMap.values()];
+      _detectOddsChanges(merged);
+      matches.value = merged;
+      lastRefreshAt.value = Date.now();
+      nextRefreshIn.value = REFRESH_INTERVAL_MS;
+    } catch {
+      // Fallback to full silent refresh if targeted refresh fails.
+      refreshOdds();
     }
   }
 
@@ -209,7 +255,7 @@ export const useMatchesStore = defineStore("matches", () => {
         }
         if (msg.type === "match_resolved") {
           // Refetch matches to get updated status
-          fetchMatches(activeSport.value ?? undefined);
+          fetchMatches({ leagueId: activeLeagueId.value });
           // Refetch user bet for this match to get won/lost status
           const matchId = msg.data?.match_id;
           if (matchId) {
@@ -217,8 +263,15 @@ export const useMatchesStore = defineStore("matches", () => {
           }
         }
         if (msg.type === "odds_updated") {
-          // Server pushed fresh odds — refresh silently
-          refreshOdds();
+          const ids = Array.isArray(msg?.data?.match_ids)
+            ? msg.data.match_ids.map((x: unknown) => String(x)).filter((x: string) => x.length > 0)
+            : [];
+          if (ids.length > 0) {
+            refreshOddsByMatchIds(ids);
+          } else {
+            // Server pushed fresh odds — refresh silently
+            refreshOdds();
+          }
         }
       } catch {
         // Ignore non-JSON (pong)
@@ -289,23 +342,24 @@ export const useMatchesStore = defineStore("matches", () => {
     }, reconnectDelay);
   }
 
-  function setSport(sport: string | null) {
-    activeSport.value = sport;
-    fetchMatches(sport ?? undefined);
+  function setLeague(leagueId: number | null) {
+    activeLeagueId.value = leagueId;
+    fetchMatches({ leagueId });
   }
 
   return {
     matches,
     liveScores,
     loading,
-    activeSport,
+    activeLeagueId,
     wsConnected,
     recentlyChangedOdds,
     refreshCountdown,
     fetchMatches,
     refreshOdds,
+    refreshOddsByMatchIds,
     connectLive,
     disconnectLive,
-    setSport,
+    setLeague,
   };
 });

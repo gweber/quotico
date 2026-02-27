@@ -5,7 +5,7 @@ import { useApi } from "@/composables/useApi";
 export interface Wallet {
   id: string;
   squad_id: string;
-  sport_key: string;
+  league_id: number;
   season: number;
   balance: number;
   initial_balance: number;
@@ -80,10 +80,10 @@ export const useWalletStore = defineStore("wallet", () => {
   const loading = ref(false);
   const disclaimerAccepted = ref(false);
 
-  async function fetchWallet(squadId: string, sport: string, season?: number) {
+  async function fetchWallet(squadId: string, leagueId: number, season?: number) {
     loading.value = true;
     try {
-      const params: Record<string, string> = { sport };
+      const params: Record<string, string> = { league_id: String(leagueId) };
       if (season) params.season = String(season);
       wallet.value = await api.get<Wallet>(`/wallet/${squadId}`, params);
     } catch {
@@ -159,9 +159,9 @@ export const useWalletStore = defineStore("wallet", () => {
     return bet;
   }
 
-  async function fetchTransactions(squadId: string, sport: string, season?: number) {
+  async function fetchTransactions(squadId: string, leagueId: number, season?: number) {
     try {
-      const params: Record<string, string> = { sport };
+      const params: Record<string, string> = { league_id: String(leagueId) };
       if (season) params.season = String(season);
       transactions.value = await api.get<WalletTransaction[]>(
         `/wallet/${squadId}/transactions`,

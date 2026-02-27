@@ -7,7 +7,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pymongo.errors import DuplicateKeyError
 
 from app.database import get_db
-from app.models.user import AliasUpdate, ChangePasswordRequest, SetPasswordRequest, UnlinkGoogleRequest
+from app.models.user import AliasUpdate, ChangePasswordRequest, SetPasswordRequest, TipPersonaUpdate, UnlinkGoogleRequest
 from app.services.alias_service import validate_alias, normalize_slug
 from app.services.auth_service import get_current_user, hash_password, verify_password
 from app.services.audit_service import log_audit
@@ -70,6 +70,41 @@ async def update_alias(
     )
     logger.info("User %s changed alias to: %s", user_id, body.alias)
     return {"message": "Alias changed successfully.", "alias": body.alias, "alias_slug": slug}
+
+
+@router.patch("/tip-persona")
+async def update_tip_persona(
+    body: TipPersonaUpdate,
+    request: Request,
+    user=Depends(get_current_user),
+    db=Depends(get_db),
+):
+    """Update preferred tip persona for the current user."""
+    now = utcnow()
+    previous = str(user.get("tip_persona") or "casual")
+    await db.users.update_one(
+        {"_id": user["_id"]},
+        {
+            "$set": {
+                "tip_persona": str(body.tip_persona),
+                "tip_persona_updated_at": now,
+                "updated_at": now,
+            }
+        },
+    )
+    user_id = str(user["_id"])
+    await log_audit(
+        actor_id=user_id,
+        target_id=user_id,
+        action="TIP_PERSONA_CHANGED",
+        metadata={"old_value": previous, "new_value": str(body.tip_persona)},
+        request=request,
+    )
+    return {
+        "message": "Tip persona updated.",
+        "tip_persona": str(body.tip_persona),
+        "tip_persona_updated_at": now.isoformat(),
+    }
 
 
 @router.post("/set-password")

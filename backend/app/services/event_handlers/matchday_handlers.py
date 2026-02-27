@@ -26,7 +26,7 @@ logger = logging.getLogger("quotico.event_handlers.matchday")
 async def handle_match_updated(event: BaseEvent) -> None:
     # Idempotency/workload guard: only projection-affecting changes should trigger recalculation.
     changed_fields = set(getattr(event, "changed_fields", []) or [])
-    if changed_fields and changed_fields.isdisjoint({"status", "score", "matchday", "match_date"}):
+    if changed_fields and changed_fields.isdisjoint({"status", "score", "matchday", "start_at"}):
         return
 
     match_id = str(getattr(event, "match_id", "") or "")
@@ -45,13 +45,13 @@ async def handle_match_updated(event: BaseEvent) -> None:
         object_ids: list[ObjectId] = []
         for item in ids:
             try:
-                object_ids.append(ObjectId(item))
+                object_ids.append(int(item))
             except Exception:
                 continue
         if not object_ids:
             continue
 
-        matches = await _db.db.matches.find(
+        matches = await _db.db.matches_v3.find(
             {"_id": {"$in": object_ids}},
             {"status": 1},
         ).to_list(length=len(object_ids))

@@ -354,7 +354,7 @@ const calibrationChartOptions = computed(() => ({
                 {{ tip.home_team }} – {{ tip.away_team }}
               </div>
               <div class="text-xs text-text-muted flex items-center gap-2 mt-0.5">
-                <span>{{ sportLabel(tip.sport_key) }}</span>
+                <span>{{ sportLabel(String(tip.league_id)) }}</span>
                 <span>{{ formatDate(tip.match_date) }}</span>
               </div>
             </div>
@@ -412,7 +412,7 @@ const calibrationChartOptions = computed(() => ({
                   {{ c.home_team }} – {{ c.away_team }}
                 </div>
                 <div class="text-xs text-text-muted flex items-center gap-2 mt-0.5">
-                  <span>{{ sportLabel(c.sport_key) }}</span>
+                  <span>{{ sportLabel(String(c.league_id)) }}</span>
                   <span>{{ formatDate(c.match_date) }}</span>
                 </div>
               </div>
@@ -493,7 +493,7 @@ const calibrationChartOptions = computed(() => ({
                 {{ tip.home_team }} – {{ tip.away_team }}
               </div>
               <div class="text-xs text-text-muted flex items-center gap-2 mt-0.5">
-                <span>{{ sportLabel(tip.sport_key) }}</span>
+                <span>{{ sportLabel(String(tip.league_id)) }}</span>
                 <span>{{ formatDate(tip.match_date) }}</span>
               </div>
             </div>
@@ -543,11 +543,11 @@ const calibrationChartOptions = computed(() => ({
             <tbody>
               <tr
                 v-for="sp in data.by_sport"
-                :key="sp.sport_key"
+                :key="sp.league_id"
                 class="border-b border-surface-3/20 last:border-0"
               >
                 <td class="py-2 text-text-secondary">
-                  {{ sportLabel(sp.sport_key) }}
+                  {{ sportLabel(String(sp.league_id)) }}
                 </td>
                 <td class="py-2 text-right text-text-primary tabular-nums">
                   {{ sp.total }}

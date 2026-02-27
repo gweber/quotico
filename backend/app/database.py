@@ -72,13 +72,13 @@ async def _ensure_indexes() -> None:
     )
     # Survivor dedup (one season-long entry per user/squad/sport/season)
     await db.betting_slips.create_index(
-        [("user_id", 1), ("squad_id", 1), ("sport_key", 1), ("season", 1)],
+        [("user_id", 1), ("squad_id", 1), ("league_id", 1), ("season", 1)],
         unique=True,
         partialFilterExpression={"type": "survivor"},
     )
     # Fantasy dedup (one pick per user/squad/sport/season/matchday)
     await db.betting_slips.create_index(
-        [("user_id", 1), ("squad_id", 1), ("sport_key", 1), ("season", 1), ("matchday_number", 1)],
+        [("user_id", 1), ("squad_id", 1), ("league_id", 1), ("season", 1), ("matchday_number", 1)],
         unique=True,
         partialFilterExpression={"type": "fantasy"},
     )
@@ -94,10 +94,10 @@ async def _ensure_indexes() -> None:
     )
     # Survivor/fantasy standings + type-scoped season queries
     await db.betting_slips.create_index(
-        [("type", 1), ("sport_key", 1), ("season", 1), ("status", 1)]
+        [("type", 1), ("league_id", 1), ("season", 1), ("status", 1)]
     )
     await db.betting_slips.create_index(
-        [("squad_id", 1), ("type", 1), ("sport_key", 1), ("season", 1)]
+        [("squad_id", 1), ("type", 1), ("league_id", 1), ("season", 1)]
     )
     # Wallet-funded slip lookup for resolver
     await db.betting_slips.create_index(
@@ -144,7 +144,7 @@ async def _ensure_indexes() -> None:
     await db.squads.create_index("members")
     await db.squads.create_index("admin_id")
     await db.squads.create_index(
-        [("league_configs.sport_key", 1), ("league_configs.game_mode", 1)]
+        [("league_configs.league_id", 1), ("league_configs.game_mode", 1)]
     )
 
     # ---- Join Requests ----
@@ -173,23 +173,23 @@ async def _ensure_indexes() -> None:
     # ---- Matchdays ----
 
     await db.matchdays.create_index(
-        [("sport_key", 1), ("season", 1), ("matchday_number", 1)], unique=True
+        [("league_id", 1), ("season", 1), ("matchday_number", 1)], unique=True
     )
     await db.matchdays.create_index([("status", 1)])
-    await db.matchdays.create_index([("sport_key", 1), ("status", 1)])
-    await db.matchdays.create_index([("sport_key", 1), ("first_kickoff", 1)])
+    await db.matchdays.create_index([("league_id", 1), ("status", 1)])
+    await db.matchdays.create_index([("league_id", 1), ("first_kickoff", 1)])
     await db.matchdays.create_index("updated_at")
 
     # ---- Matchday Leaderboard (materialized, squad-scoped) ----
 
     await db.matchday_leaderboard.create_index(
-        [("sport_key", 1), ("season", 1), ("total_points", -1)]
+        [("league_id", 1), ("season", 1), ("total_points", -1)]
     )
     await db.matchday_leaderboard.create_index(
-        [("sport_key", 1), ("season", 1), ("user_id", 1), ("squad_id", 1)], unique=True
+        [("league_id", 1), ("season", 1), ("user_id", 1), ("squad_id", 1)], unique=True
     )
     await db.matchday_leaderboard.create_index(
-        [("squad_id", 1), ("sport_key", 1), ("season", 1), ("total_points", -1)]
+        [("squad_id", 1), ("league_id", 1), ("season", 1), ("total_points", -1)]
     )
 
     # ---- Audit Logs ----
@@ -277,7 +277,7 @@ async def _ensure_indexes() -> None:
     await db.team_alias_resolution_events.create_index([("team_id", 1), ("resolved_at", -1)])
     await db.team_alias_suggestions_v3.create_index([("status", 1), ("last_seen_at", -1)])
     await db.team_alias_suggestions_v3.create_index(
-        [("normalized_name", 1), ("source", 1), ("sport_key", 1), ("status", 1)]
+        [("normalized_name", 1), ("source", 1), ("league_id", 1), ("status", 1)]
     )
     await db.team_alias_suggestions_v3.create_index([("confidence_score", -1), ("status", 1)])
     await db.v3_query_cache.create_index(
@@ -294,6 +294,25 @@ async def _ensure_indexes() -> None:
     )
     await db.sportmonks_page_cache.create_index([("endpoint", 1)], name="sportmonks_page_cache_endpoint")
     await db.sportmonks_page_cache.create_index([("endpoint", 1), ("updated_at_utc", -1)], name="sportmonks_page_cache_endpoint_updated_utc")
+
+    # ---- Odds v3 Raw Cache ----
+
+    await db.odds_raw_v3.create_index(
+        [("fixture_id", 1), ("fetched_at", -1)],
+        name="odds_raw_v3_fixture_fetched",
+    )
+    await db.odds_raw_v3.create_index(
+        "fetched_at",
+        expireAfterSeconds=63_072_000,  # 730 days
+        name="odds_raw_v3_ttl",
+    )
+
+    # ---- Odds v3 Timeline (Phase 2 prep, no TTL) ----
+
+    await db.odds_timeline_v3.create_index(
+        [("match_id", 1), ("ts", -1)],
+        name="odds_timeline_v3_match_ts",
+    )
 
     # ---- Provider Runtime Settings ----
 
@@ -323,7 +342,7 @@ async def _ensure_indexes() -> None:
     # ---- Game Modes: Wallets ----
 
     await db.wallets.create_index(
-        [("user_id", 1), ("squad_id", 1), ("sport_key", 1), ("season", 1)],
+        [("user_id", 1), ("squad_id", 1), ("league_id", 1), ("season", 1)],
         unique=True,
     )
     await db.wallets.create_index("status")
@@ -365,7 +384,7 @@ async def _ensure_indexes() -> None:
     await db.quotico_tips.create_index("home_team_id")
     await db.quotico_tips.create_index("away_team_id")
     await db.quotico_tips.create_index(
-        [("sport_key", 1), ("status", 1), ("confidence", -1)]
+        [("league_id", 1), ("status", 1), ("confidence", -1)]
     )
     await db.quotico_tips.create_index(
         [("status", 1), ("was_correct", 1), ("match_date", -1)]
@@ -376,35 +395,35 @@ async def _ensure_indexes() -> None:
     # ---- Qbot Intelligence ----
 
     await db.qbot_strategies.create_index(
-        [("is_active", 1), ("sport_key", 1)],
+        [("is_active", 1), ("league_id", 1)],
         unique=True,
         partialFilterExpression={"is_active": True},
     )
     await db.qbot_strategies.create_index("created_at")
     await db.qbot_strategies.create_index(
-        [("sport_key", 1), ("is_active", 1), ("is_shadow", 1), ("created_at", -1)]
+        [("league_id", 1), ("is_active", 1), ("is_shadow", 1), ("created_at", -1)]
     )
     await db.qbot_strategies.create_index(
         [("optimization_notes.stage_info.stage_used", 1), ("created_at", -1)]
     )
-    await db.qbot_strategies.create_index([("status", 1), ("sport_key", 1), ("created_at", -1)])
+    await db.qbot_strategies.create_index([("status", 1), ("league_id", 1), ("created_at", -1)])
 
-    await db.qbot_cluster_stats.create_index("sport_key")
+    await db.qbot_cluster_stats.create_index("league_id")
     # _id = cluster_key string, no additional unique index needed
 
     # ---- Engine Config (calibration) ----
-    # _id = sport_key, no indexes needed (6 docs max, all lookups by _id)
+    # _id = league_id, no indexes needed (6 docs max, all lookups by _id)
 
     # ---- Engine Config History (time machine snapshots) ----
     await db.engine_config_history.create_index(
-        [("sport_key", 1), ("snapshot_date", 1)],
+        [("league_id", 1), ("snapshot_date", 1)],
         unique=True,
     )
     await db.engine_time_machine_justice.create_index(
-        [("sport_key", 1), ("snapshot_date", 1)],
+        [("league_id", 1), ("snapshot_date", 1)],
         unique=True,
     )
-    await db.engine_time_machine_justice.create_index([("sport_key", 1), ("snapshot_date", -1)])
+    await db.engine_time_machine_justice.create_index([("league_id", 1), ("snapshot_date", -1)])
     await db.engine_time_machine_justice.create_index([("meta.generated_at", -1)])
 
     # ---- Engine Policies v3 ----
@@ -424,3 +443,9 @@ async def _ensure_indexes() -> None:
 
     # ---- Meta / runtime docs ----
     await db.meta.create_index([("updated_at_utc", -1)])
+
+    # ---- API consumption analytics (90-day TTL) ----
+    await db.stats_api_usage.create_index([("ts", -1)])
+    await db.stats_api_usage.create_index("ts", expireAfterSeconds=90 * 24 * 3600)
+    await db.stats_api_usage.create_index([("module", 1), ("ts", -1)])
+    await db.stats_api_usage.create_index([("season_id", 1), ("ts", -1)])

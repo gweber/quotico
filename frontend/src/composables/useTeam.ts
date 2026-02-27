@@ -1,3 +1,9 @@
+/**
+ * frontend/src/composables/useTeam.ts
+ *
+ * Purpose:
+ * Typed API client composable for public team profile and recent form data.
+ */
 import { ref, type Ref } from "vue";
 import { useApi } from "./useApi";
 
@@ -17,7 +23,7 @@ export interface SeasonStats {
 
 export interface UpcomingMatch {
   id: string;
-  sport_key: string;
+  league_id: number;
   home_team: string;
   away_team: string;
   match_date: string;
@@ -25,7 +31,6 @@ export interface UpcomingMatch {
   status: string;
 }
 
-/** Legacy match shape returned by the team profile endpoint (Team Tower IDs). */
 export interface TeamRecentMatch {
   match_date: string;
   home_team: string;
@@ -41,7 +46,7 @@ export interface TeamRecentMatch {
 }
 
 export interface TeamProfile {
-  team_key: string;
+  team_id: string;
   display_name: string;
   sport_keys: string[];
   form: string[];
@@ -76,7 +81,7 @@ export function useTeam() {
 
     try {
       const params: Record<string, string> = {};
-      if (sportKey) params.sport_key = sportKey;
+      if (sportKey) params.league_id = sportKey;
       const result = await api.get<TeamProfile>(`/teams/${slug}`, params);
       data.value = result;
     } catch {

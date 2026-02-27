@@ -47,13 +47,13 @@ def _valid_h2h_current(match: dict[str, Any]) -> bool:
         return False
 
 
-async def validate_match_odds_meta(sport_key: str | None) -> dict[str, int]:
+async def validate_match_odds_meta(league_id: int | None) -> dict[str, int]:
     """Read-only quality scan for final matches and odds_meta.h2h availability."""
     import app.database as _db
 
     query: dict[str, Any] = {"status": "final", "result.outcome": {"$ne": None}}
-    if sport_key:
-        query["sport_key"] = sport_key
+    if league_id is not None:
+        query["league_id"] = league_id
 
     projection = {"odds_meta.markets.h2h.current": 1}
     t0 = time.monotonic()
@@ -92,11 +92,11 @@ async def validate_match_odds_meta(sport_key: str | None) -> dict[str, int]:
     return stats
 
 
-async def run_calibration_step(sport_key: str | None) -> None:
+async def run_calibration_step(league_id: int | None) -> None:
     """Run exploration calibration for leagues."""
-    from app.services.optimizer_service import CALIBRATED_LEAGUES, calibrate_league
+    from app.services.optimizer_service import _get_calibrated_league_ids, calibrate_league
 
-    target_leagues = [sport_key] if sport_key else CALIBRATED_LEAGUES
+    target_leagues = [league_id] if league_id is not None else await _get_calibrated_league_ids()
     log.info("Starting engine calibration (Exploration Mode) for %d leagues...", len(target_leagues))
 
     t0 = time.monotonic()
@@ -159,19 +159,19 @@ async def clear_engine_config_cache() -> None:
     log.info("Engine config cache cleared.")
 
 
-async def load_history_snapshots(sport_key: str | None) -> dict[str, list[tuple[datetime, dict[str, Any]]]]:
-    """Load engine_config_history snapshots grouped by sport_key (v3-aware)."""
+async def load_history_snapshots(league_id: int | None) -> dict[int, list[tuple[datetime, dict[str, Any]]]]:
+    """Load engine_config_history snapshots grouped by league_id (v3-aware)."""
     import app.database as _db
     from app.utils import ensure_utc
 
     query: dict[str, Any] = {}
-    if sport_key:
-        query["sport_key"] = sport_key
+    if league_id is not None:
+        query["league_id"] = league_id
 
     cursor = _db.db.engine_config_history.find(
         query,
         {
-            "sport_key": 1,
+            "league_id": 1,
             "snapshot_date": 1,
             "params": 1,
             "reliability": 1,
@@ -182,17 +182,17 @@ async def load_history_snapshots(sport_key: str | None) -> dict[str, list[tuple[
         },
     ).sort("snapshot_date", 1)
 
-    grouped_all: dict[str, list[tuple[datetime, dict[str, Any], str]]] = {}
+    grouped_all: dict[int, list[tuple[datetime, dict[str, Any], str]]] = {}
     async for doc in cursor:
         params = doc.get("params") or {}
         meta = doc.get("meta") or {}
-        sk = str(doc.get("sport_key") or "")
-        if not sk or not isinstance(doc.get("snapshot_date"), datetime):
+        doc_league_id = doc.get("league_id")
+        if not isinstance(doc_league_id, int) or not isinstance(doc.get("snapshot_date"), datetime):
             continue
         sd = ensure_utc(doc["snapshot_date"])
         source = str(meta.get("source") or "legacy")
         cache_entry = {
-            "_id": sk,
+            "_id": doc_league_id,
             "rho": params.get("rho"),
             "alpha_time_decay": params.get("alpha"),
             "alpha_weight_floor": params.get("floor"),
@@ -201,17 +201,17 @@ async def load_history_snapshots(sport_key: str | None) -> dict[str, list[tuple[
             "market_performance": doc.get("market_performance"),
             "statistical_integrity": doc.get("statistical_integrity"),
         }
-        grouped_all.setdefault(sk, []).append((sd, cache_entry, source))
+        grouped_all.setdefault(doc_league_id, []).append((sd, cache_entry, source))
 
-    grouped: dict[str, list[tuple[datetime, dict[str, Any]]]] = {}
-    for sk, snaps in grouped_all.items():
+    grouped: dict[int, list[tuple[datetime, dict[str, Any]]]] = {}
+    for doc_league_id, snaps in grouped_all.items():
         has_retro = any(s in {"time_machine", "time_machine_carry_forward"} for _, _, s in snaps)
         filtered = [
             (sd, ce)
             for sd, ce, src in snaps
             if (not has_retro) or src in {"time_machine", "time_machine_carry_forward", "legacy"}
         ]
-        grouped[sk] = filtered
+        grouped[doc_league_id] = filtered
     return grouped
 
 
@@ -230,11 +230,11 @@ def find_snapshot_for_date(
     return snapshots[idx - 1][1]
 
 
-def inject_engine_params(sport_key: str, cache_entry: dict[str, Any]) -> None:
+def inject_engine_params(league_id: int, cache_entry: dict[str, Any]) -> None:
     """Inject historical params into quotico_tip_service in-memory cache."""
     import app.services.quotico_tip_service as _qts
 
-    _qts._engine_config_cache[sport_key] = cache_entry
+    _qts._engine_config_cache[league_id] = cache_entry
 
 
 async def _upsert_error_tip(match: dict[str, Any], reason: str) -> None:
@@ -244,7 +244,7 @@ async def _upsert_error_tip(match: dict[str, Any], reason: str) -> None:
 
     tip_doc = {
         "match_id": str(match["_id"]),
-        "sport_key": str(match.get("sport_key") or ""),
+        "league_id": match.get("league_id"),
         "home_team": str(match.get("home_team") or ""),
         "away_team": str(match.get("away_team") or ""),
         "home_team_id": match.get("home_team_id"),
@@ -258,7 +258,7 @@ async def _upsert_error_tip(match: dict[str, Any], reason: str) -> None:
 
 
 async def run_backfill(
-    sport_key: str | None,
+    league_id: int | None,
     batch_size: int,
     skip: int,
     dry_run: bool,
@@ -278,7 +278,7 @@ async def run_backfill(
     await _db.connect_db()
     log.info("Connected to MongoDB: %s", _db.db.name)
 
-    history_snapshots = await load_history_snapshots(sport_key)
+    history_snapshots = await load_history_snapshots(league_id)
     if history_snapshots:
         total_snaps = sum(len(v) for v in history_snapshots.values())
         for sk, snaps in history_snapshots.items():
@@ -300,11 +300,11 @@ async def run_backfill(
 
     if calibrate or calibrate_only:
         log.info("=== PHASE 1: PREPARATION ===")
-        await validate_match_odds_meta(sport_key)
+        await validate_match_odds_meta(league_id)
         if dry_run:
             log.info("DRY RUN: skipping calibration execution.")
         else:
-            await run_calibration_step(sport_key)
+            await run_calibration_step(league_id)
             await clear_engine_config_cache()
             if history_snapshots:
                 _qts._engine_config_expires = time.time() + 999_999
@@ -318,8 +318,8 @@ async def run_backfill(
 
     if (rerun or rerun_failed) and not dry_run:
         del_query: dict[str, Any] = {}
-        if sport_key:
-            del_query["sport_key"] = sport_key
+        if league_id is not None:
+            del_query["league_id"] = league_id
         if rerun_failed:
             del_query["status"] = "error"
         result = await _db.db.quotico_tips.delete_many(del_query)
@@ -334,12 +334,12 @@ async def run_backfill(
         "result.outcome": {"$ne": None},
         "odds_meta.markets.h2h.current": {"$exists": True, "$ne": {}},
     }
-    if sport_key:
-        query["sport_key"] = sport_key
+    if league_id is not None:
+        query["league_id"] = league_id
 
     projection = {
         "_id": 1,
-        "sport_key": 1,
+        "league_id": 1,
         "home_team": 1,
         "away_team": 1,
         "home_team_id": 1,
@@ -398,22 +398,24 @@ async def run_backfill(
                 skipped_missing_odds_meta += 1
                 continue
             try:
-                match_sport = str(match.get("sport_key") or "")
-                sport_snaps = history_snapshots.get(match_sport)
-                if sport_snaps:
-                    snap_entry = find_snapshot_for_date(sport_snaps, match["match_date"])
+                match_league_id = match.get("league_id")
+                if not isinstance(match_league_id, int):
+                    raise ValueError("match.league_id must be int")
+                league_snaps = history_snapshots.get(match_league_id)
+                if league_snaps:
+                    snap_entry = find_snapshot_for_date(league_snaps, match["match_date"])
                     if snap_entry:
-                        inject_engine_params(match_sport, snap_entry)
-                    elif match_sport not in warned_no_history:
+                        inject_engine_params(match_league_id, snap_entry)
+                    elif str(match_league_id) not in warned_no_history:
                         log.warning(
                             "No snapshot covers %s before %s — using live/default params",
-                            match_sport,
+                            match_league_id,
                             ensure_utc(match["match_date"]).strftime("%Y-%m-%d"),
                         )
-                        warned_no_history.add(match_sport)
-                elif match_sport not in warned_no_history:
-                    log.warning("No engine history for %s — using live/default params", match_sport)
-                    warned_no_history.add(match_sport)
+                        warned_no_history.add(str(match_league_id))
+                elif str(match_league_id) not in warned_no_history:
+                    log.warning("No engine history for %s — using live/default params", match_league_id)
+                    warned_no_history.add(str(match_league_id))
 
                 tip = await generate_quotico_tip(match, before_date=match["match_date"])
                 tip = await enrich_tip(tip, match=match)
@@ -535,7 +537,12 @@ async def run_backfill(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Q-Tip honest backfill for historical matches (v3)")
-    parser.add_argument("--sport", type=str, default=None, help="Filter by sport_key")
+    if "--sport" in sys.argv:
+        parser.error(
+            "Error: --sport is deprecated. Use --league-id <int>. "
+            "Example: --league-id 82 (Bundesliga)."
+        )
+    parser.add_argument("--league-id", type=int, default=None, help="Filter by league_id (int, Sportmonks league id)")
     parser.add_argument("--batch-size", type=int, default=500, help="Matches per batch")
     parser.add_argument("--skip", type=int, default=0, help="Skip first N matches")
     parser.add_argument("--max-batches", type=int, default=9999, help="Max batches to run")
@@ -551,7 +558,7 @@ def main() -> None:
 
     asyncio.run(
         run_backfill(
-            sport_key=args.sport,
+            league_id=args.league_id,
             batch_size=args.batch_size,
             skip=args.skip,
             dry_run=args.dry_run,

@@ -37,19 +37,19 @@ const activeConfigs = computed(() =>
 );
 
 const configuredSportKeys = computed(() =>
-  new Set(activeConfigs.value.map((lc) => lc.sport_key))
+  new Set(activeConfigs.value.map((lc) => lc.league_id))
 );
 
 const availableToAdd = computed(() =>
-  matchday.sports.filter((s) => !configuredSportKeys.value.has(s.sport_key))
+  matchday.sports.filter((s) => !configuredSportKeys.value.has(s.league_id))
 );
 
-async function addLeague(sportKey: string) {
+async function addLeague(leagueId: number) {
   saving.value = true;
   try {
-    await squadsStore.setLeagueConfig(props.squadId, sportKey, addModePick.value);
+    await squadsStore.setLeagueConfig(props.squadId, leagueId, addModePick.value);
     toast.success(
-      `${sportLabels[sportKey] || sportKey} ${t("common.added")}`
+      `${sportLabels[String(leagueId)] || String(leagueId)} ${t("common.added")}`
     );
     showAddMenu.value = false;
     addModePick.value = "classic";
@@ -60,7 +60,7 @@ async function addLeague(sportKey: string) {
   }
 }
 
-async function removeLeague(sportKey: string) {
+async function removeLeague(leagueId: number) {
   if (
     !confirm(
       t("squadDetail.deactivateConfirm")
@@ -70,7 +70,7 @@ async function removeLeague(sportKey: string) {
 
   saving.value = true;
   try {
-    await squadsStore.removeLeagueConfig(props.squadId, sportKey);
+    await squadsStore.removeLeagueConfig(props.squadId, leagueId);
     toast.success(t("squadDetail.deactivated"));
   } catch (e: unknown) {
     toast.error(e instanceof Error ? e.message : t("common.error"));
@@ -99,12 +99,12 @@ async function removeLeague(sportKey: string) {
     <div v-if="activeConfigs.length > 0" class="space-y-2">
       <div
         v-for="config in activeConfigs"
-        :key="config.sport_key"
+        :key="config.league_id"
         class="flex items-center justify-between p-3 bg-surface-1 rounded-lg border border-surface-3"
       >
         <div class="flex-1 min-w-0">
           <div class="text-sm font-medium text-text-primary truncate">
-            {{ sportLabels[config.sport_key] || config.sport_key }}
+            {{ sportLabels[String(config.league_id)] || config.league_id }}
           </div>
         </div>
 
@@ -120,7 +120,7 @@ async function removeLeague(sportKey: string) {
             class="text-text-muted hover:text-red-500 transition-colors p-1"
             :disabled="saving"
             :title="$t('squadDetail.deactivated')"
-            @click="removeLeague(config.sport_key)"
+            @click="removeLeague(config.league_id)"
           >
             <svg
               xmlns="http://www.w3.org/2000/svg"
@@ -166,12 +166,12 @@ async function removeLeague(sportKey: string) {
       <div class="space-y-1">
         <button
           v-for="sport in availableToAdd"
-          :key="sport.sport_key"
+          :key="sport.league_id"
           class="w-full text-left px-3 py-2 rounded text-sm text-text-primary hover:bg-surface-2 transition-colors"
           :disabled="saving"
-          @click="addLeague(sport.sport_key)"
+          @click="addLeague(sport.league_id)"
         >
-          {{ sportLabels[sport.sport_key] || sport.sport_key }}
+          {{ sportLabels[String(sport.league_id)] || sport.league_id }}
         </button>
       </div>
     </div>

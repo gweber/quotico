@@ -27,7 +27,7 @@ _VIEW_CATALOG: list[dict[str, Any]] = [
     {"id": "squad_detail", "name_key": "admin.viewsCatalog.names.squadDetail", "route_name": "squad-detail", "path": "/squads/:id", "group": "public", "requires_auth": True, "requires_admin": False, "enabled": True},
     {"id": "squad_war_room", "name_key": "admin.viewsCatalog.names.squadWarRoom", "route_name": "squad-war-room", "path": "/squads/:id/war-room/:matchId", "group": "public", "requires_auth": True, "requires_admin": False, "enabled": True},
     {"id": "battles", "name_key": "admin.viewsCatalog.names.battles", "route_name": "battles", "path": "/battles", "group": "public", "requires_auth": True, "requires_admin": False, "enabled": True},
-    {"id": "matchday", "name_key": "admin.viewsCatalog.names.matchday", "route_name": "matchday", "path": "/matchday/:sport?/:matchday?", "group": "public", "requires_auth": False, "requires_admin": False, "enabled": True},
+    {"id": "matchday", "name_key": "admin.viewsCatalog.names.matchday", "route_name": "matchday", "path": "/matchday/:leagueId?/:matchday?", "group": "public", "requires_auth": False, "requires_admin": False, "enabled": True},
     {"id": "qbot", "name_key": "admin.viewsCatalog.names.qbot", "route_name": "qbot", "path": "/qbot", "group": "public", "requires_auth": False, "requires_admin": False, "enabled": True},
     {"id": "qtip_performance", "name_key": "admin.viewsCatalog.names.qtipPerformance", "route_name": "qtip-performance", "path": "/qtip-performance", "group": "public", "requires_auth": False, "requires_admin": False, "enabled": True},
     {"id": "settings", "name_key": "admin.viewsCatalog.names.settings", "route_name": "settings", "path": "/settings", "group": "public", "requires_auth": True, "requires_admin": False, "enabled": True},
@@ -43,6 +43,9 @@ _VIEW_CATALOG: list[dict[str, Any]] = [
     {"id": "admin_event_bus", "name_key": "admin.viewsCatalog.names.adminEventBus", "route_name": "admin-event-bus", "path": "/admin/event-bus", "group": "admin", "requires_auth": True, "requires_admin": True, "enabled": True},
     {"id": "admin_time_machine_justice", "name_key": "admin.viewsCatalog.names.adminTimeMachineJustice", "route_name": "admin-time-machine-justice", "path": "/admin/time-machine-justice", "group": "admin", "requires_auth": True, "requires_admin": True, "enabled": True},
     {"id": "admin_team_tower", "name_key": "admin.viewsCatalog.names.adminTeamTower", "route_name": "admin-team-tower", "path": "/admin/team-tower", "group": "admin", "requires_auth": True, "requires_admin": True, "enabled": True},
+    {"id": "admin_referees", "name_key": "admin.viewsCatalog.names.adminReferees", "route_name": "admin-referees", "path": "/admin/referees", "group": "admin", "requires_auth": True, "requires_admin": True, "enabled": True},
+    {"id": "admin_referee_detail", "name_key": "admin.viewsCatalog.names.adminRefereeDetail", "route_name": "admin-referee-detail", "path": "/admin/referees/:refereeId", "group": "admin", "requires_auth": True, "requires_admin": True, "enabled": True},
+    {"id": "admin_odds_monitor", "name_key": "admin.viewsCatalog.names.adminOddsMonitor", "route_name": "admin-odds-monitor", "path": "/admin/odds-monitor", "group": "admin", "requires_auth": True, "requires_admin": True, "enabled": True},
     {"id": "admin_qbot_lab", "name_key": "admin.viewsCatalog.names.adminQbotLab", "route_name": "admin-qbot-lab", "path": "/admin/qbot-lab", "group": "admin", "requires_auth": True, "requires_admin": True, "enabled": True},
     {"id": "admin_qbot_strategy_detail", "name_key": "admin.viewsCatalog.names.adminQbotStrategyDetail", "route_name": "admin-qbot-strategy-detail", "path": "/admin/qbot/strategies/:strategyId", "group": "admin", "requires_auth": True, "requires_admin": True, "enabled": True},
     {"id": "admin_provider_status", "name_key": "admin.viewsCatalog.names.adminProviderStatus", "route_name": "admin-provider-status", "path": "/admin/provider-status", "group": "admin", "requires_auth": True, "requires_admin": True, "enabled": True},
@@ -67,4 +70,3 @@ def list_view_catalog() -> dict[str, Any]:
         "summary": summary,
         "items": items,
     }
-

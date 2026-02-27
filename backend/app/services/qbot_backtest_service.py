@@ -179,12 +179,12 @@ async def simulate_strategy_backtest(
     since_date: str | None = None,
 ) -> dict[str, Any]:
     """Simulate full-history bankroll curve for a strategy document."""
-    sport_key = strategy.get("sport_key", "all")
+    league_id = strategy.get("league_id", "all")
     dna = strategy.get("dna", {}) or {}
     if not dna:
         return {
             "strategy_id": str(strategy.get("_id")),
-            "sport_key": sport_key,
+            "league_id": league_id,
             "starting_bankroll": starting_bankroll,
             "ending_bankroll": starting_bankroll,
             "total_bets": 0,
@@ -195,15 +195,15 @@ async def simulate_strategy_backtest(
         }
 
     query: dict[str, Any] = {"status": "resolved", "was_correct": {"$ne": None}}
-    if sport_key and sport_key != "all":
-        query["sport_key"] = sport_key
+    if league_id and league_id != "all":
+        query["league_id"] = league_id
 
     window_meta: dict[str, Any] = {"mode": "fallback"}
 
     # 1) Explicit since_date wins.
     if since_date:
         since_dt = parse_utc(since_date)
-        query["match_date"] = {"$gte": since_dt}
+        query["start_at"] = {"$gte": since_dt}
         window_meta = {
             "mode": "since_date",
             "since_date": since_dt.isoformat(),
@@ -222,9 +222,9 @@ async def simulate_strategy_backtest(
         if val_start:
             start_dt = parse_utc(val_start)
             end_dt = parse_utc(val_end) if val_end else None
-            query["match_date"] = {"$gte": start_dt}
+            query["start_at"] = {"$gte": start_dt}
             if end_dt is not None:
-                query["match_date"]["$lte"] = end_dt
+                query["start_at"]["$lte"] = end_dt
             window_meta = {
                 "mode": "validation_window",
                 "source": "strategy_metadata",
@@ -234,24 +234,24 @@ async def simulate_strategy_backtest(
         else:
             created_at = ensure_utc(strategy.get("created_at", utcnow()))
             pre_query = {"status": "resolved", "was_correct": {"$ne": None}}
-            if sport_key and sport_key != "all":
-                pre_query["sport_key"] = sport_key
+            if league_id and league_id != "all":
+                pre_query["league_id"] = league_id
             pre_query["$or"] = [
                 {"generated_at": {"$lte": created_at}},
-                {"generated_at": {"$exists": False}, "match_date": {"$lte": created_at}},
+                {"generated_at": {"$exists": False}, "start_at": {"$lte": created_at}},
             ]
             pre_tips = await _db.db.quotico_tips.find(
                 pre_query,
-                {"match_date": 1},
-            ).sort("match_date", 1).to_list(length=200_000)
+                {"start_at": 1},
+            ).sort("start_at", 1).to_list(length=200_000)
 
             if pre_tips:
                 split_idx = int(len(pre_tips) * 0.80)
                 val_tips = pre_tips[split_idx:] if split_idx < len(pre_tips) else []
                 if val_tips:
-                    start_dt = ensure_utc(val_tips[0]["match_date"])
-                    end_dt = ensure_utc(val_tips[-1]["match_date"])
-                    query["match_date"] = {"$gte": start_dt, "$lte": end_dt}
+                    start_dt = ensure_utc(val_tips[0]["start_at"])
+                    end_dt = ensure_utc(val_tips[-1]["start_at"])
+                    query["start_at"] = {"$gte": start_dt, "$lte": end_dt}
                     window_meta = {
                         "mode": "validation_window",
                         "source": "reconstructed_80_20",
@@ -264,7 +264,7 @@ async def simulate_strategy_backtest(
     projection = {
         "_id": 0,
         "match_id": 1,
-        "match_date": 1,
+        "start_at": 1,
         "home_team": 1,
         "away_team": 1,
         "recommended_selection": 1,
@@ -275,20 +275,20 @@ async def simulate_strategy_backtest(
         "tier_signals": 1,
         "qbot_logic": 1,
     }
-    tips = await _db.db.quotico_tips.find(query, projection).sort("match_date", 1).to_list(length=200_000)
+    tips = await _db.db.quotico_tips.find(query, projection).sort("start_at", 1).to_list(length=200_000)
 
     # 3) If no explicit/validation window is active, apply default lookback:
     # last 3 years and max last 1000 tips.
     if window_meta.get("mode") == "fallback" and tips:
         now = utcnow()
         cutoff = now - timedelta(days=365 * DEFAULT_LOOKBACK_YEARS)
-        tips = [t for t in tips if ensure_utc(t["match_date"]) >= cutoff]
+        tips = [t for t in tips if ensure_utc(t["start_at"]) >= cutoff]
         if len(tips) > DEFAULT_LOOKBACK_MAX_TIPS:
             tips = tips[-DEFAULT_LOOKBACK_MAX_TIPS:]
         window_meta = {
             "mode": "default_lookback",
-            "since_date": ensure_utc(tips[0]["match_date"]).isoformat() if tips else cutoff.isoformat(),
-            "until_date": ensure_utc(tips[-1]["match_date"]).isoformat() if tips else now.isoformat(),
+            "since_date": ensure_utc(tips[0]["start_at"]).isoformat() if tips else cutoff.isoformat(),
+            "until_date": ensure_utc(tips[-1]["start_at"]).isoformat() if tips else now.isoformat(),
             "lookback_years": DEFAULT_LOOKBACK_YEARS,
             "lookback_max_tips": DEFAULT_LOOKBACK_MAX_TIPS,
         }
@@ -304,7 +304,7 @@ async def simulate_strategy_backtest(
             continue
         if len(mid) == 24:
             try:
-                object_ids.append(ObjectId(mid))
+                object_ids.append(int(mid))
             except Exception:
                 continue
     if int_ids:
@@ -327,7 +327,7 @@ async def simulate_strategy_backtest(
                 "2": float(h2h.get("2", 0.0)) if h2h.get("2") is not None else 0.0,
             }
     if object_ids:
-        matches = await _db.db.matches.find(
+        matches = await _db.db.matches_v3.find(
             {"_id": {"$in": object_ids}},
             {"_id": 1, "odds_meta.markets.h2h.current": 1},
         ).to_list(length=len(object_ids))
@@ -409,7 +409,7 @@ async def simulate_strategy_backtest(
         if is_win:
             wins += 1
         bankroll += profit
-        raw_match_date = tip.get("match_date")
+        raw_match_date = tip.get("start_at")
         if raw_match_date is None:
             continue
         match_date = ensure_utc(raw_match_date)
@@ -458,7 +458,7 @@ async def simulate_strategy_backtest(
         ledger = ledger[:limit_ledger]
     return {
         "strategy_id": str(strategy.get("_id")),
-        "sport_key": sport_key,
+        "league_id": league_id,
         "starting_bankroll": float(starting_bankroll),
         "ending_bankroll": round(bankroll, 4),
         "total_bets": total_bets,

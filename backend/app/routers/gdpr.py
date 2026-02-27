@@ -149,7 +149,7 @@ async def export_data(request: Request, user=Depends(get_current_user), db=Depen
     wallets_export = [
         {
             "squad_id": w["squad_id"],
-            "sport_key": w.get("sport_key"),
+            "league_id": w.get("league_id"),
             "season": w.get("season"),
             "balance": w["balance"],
             "initial_balance": w.get("initial_balance"),

@@ -16,7 +16,7 @@ from __future__ import annotations
 import logging
 import re
 import time
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import Any
 
 import numpy as np
@@ -37,6 +37,7 @@ logger = logging.getLogger("quotico.admin_ingest")
 
 _JOB_TYPE = "sportmonks_deep_ingest"
 _JOB_TYPE_METRICS = "sportmonks_metrics_sync"
+_JOB_TYPE_XG = "sportmonks_xg_sync"
 _RATE_META_ID = "sportmonks_rate_limit_state"
 _CACHE_METRICS_META_ID = "sportmonks_page_cache_metrics"
 _GUARD_METRICS_META_ID = "sportmonks_guard_metrics"
@@ -77,6 +78,7 @@ class OverviewSportmonksApiStats(BaseModel):
     remaining: int | None
     reset_at: str | None
     reserve_credits: int
+    last_request_type: str | None = None
 
 
 class AdminOverviewStatsResponse(BaseModel):
@@ -118,12 +120,10 @@ def _serialize_discovery_items(rows: list[dict[str, Any]]) -> list[dict[str, Any
         out.append(
             {
                 "league_id": int(row.get("_id")),
-                "sport_key": str(row.get("sport_key") or ""),
                 "name": str(row.get("name") or ""),
                 "country": str(row.get("country") or ""),
                 "is_cup": bool(row.get("is_cup", False)),
                 "is_active": bool(row.get("is_active", False)),
-                "needs_review": bool(row.get("needs_review", False)),
                 "ui_order": int(row.get("ui_order", 999)),
                 "features": {
                     "tipping": bool(features_raw.get("tipping", False)),
@@ -172,6 +172,7 @@ async def get_admin_overview_stats(admin=Depends(get_admin_user)):
     )
     match_walkover = int(await _db.db.matches_v3.count_documents({"status": "WALKOVER"}))
     match_with_xg = int(await _db.db.matches_v3.count_documents({"has_advanced_stats": True}))
+    # FIXME: ODDS_V3_BREAK — counts odds_meta.summary_1x2 no longer produced by connector
     match_with_odds = int(
         await _db.db.matches_v3.count_documents(
             {
@@ -202,18 +203,33 @@ async def get_admin_overview_stats(admin=Depends(get_admin_user)):
     ingest_failed = int(await _db.db.admin_import_jobs.count_documents({"status": "failed"}))
     ingest_succeeded = int(await _db.db.admin_import_jobs.count_documents({"status": "succeeded"}))
 
-    rate_meta = await _db.db.meta.find_one({"_id": _RATE_META_ID}, {"remaining": 1, "reset_at": 1})
+    rate_meta = await _db.db.meta.find_one(
+        {"_id": _RATE_META_ID}, {"remaining": 1, "reset_at": 1, "last_request_type": 1}
+    )
     remaining = (
         int(rate_meta.get("remaining"))
         if isinstance(rate_meta, dict) and rate_meta.get("remaining") is not None
         else None
     )
-    reset_at = None
-    if isinstance(rate_meta, dict) and rate_meta.get("reset_at") is not None:
+    reset_at_raw = rate_meta.get("reset_at") if isinstance(rate_meta, dict) else None
+    last_request_type = rate_meta.get("last_request_type") if isinstance(rate_meta, dict) else None
+
+    # Stale-check: if reset_at is a Unix timestamp in the past, the rolling window
+    # has moved on and the persisted remaining value is no longer meaningful.
+    if reset_at_raw is not None and remaining is not None:
         try:
-            reset_at = ensure_utc(rate_meta.get("reset_at")).isoformat()
+            reset_ts = int(reset_at_raw) if not isinstance(reset_at_raw, datetime) else int(reset_at_raw.timestamp())
+            if reset_ts < int(now.timestamp()):
+                remaining = None
+        except (TypeError, ValueError):
+            pass
+
+    reset_at = None
+    if reset_at_raw is not None:
+        try:
+            reset_at = ensure_utc(reset_at_raw).isoformat()
         except Exception:
-            reset_at = str(rate_meta.get("reset_at"))
+            reset_at = str(reset_at_raw)
 
     return AdminOverviewStatsResponse(
         users=OverviewUserStats(total=users_total, banned=users_banned),
@@ -241,6 +257,7 @@ async def get_admin_overview_stats(admin=Depends(get_admin_user)):
             remaining=remaining,
             reset_at=reset_at,
             reserve_credits=int(settings.SPORTMONKS_RESERVE_CREDITS),
+            last_request_type=str(last_request_type) if last_request_type else None,
         ),
         generated_at=now.isoformat(),
     )
@@ -323,11 +340,7 @@ async def discover_leagues(
     remaining = discovery.get("remaining")
     reset_at = discovery.get("reset_at")
     if remaining is not None and int(remaining) <= 1:
-        await _db.db.meta.update_one(
-            {"_id": _RATE_META_ID},
-            {"$set": {"remaining": int(remaining), "reset_at": reset_at, "updated_at": now, "updated_at_utc": now}},
-            upsert=True,
-        )
+        # _persist_rate_limit() already wrote the meta document inside get_available_leagues()
         return {
             "source": "cache_fallback_rate_limited",
             "ttl_minutes": ttl_minutes,
@@ -338,11 +351,10 @@ async def discover_leagues(
         }
 
     await sportmonks_connector.sync_leagues_to_registry(discovery.get("items") or [])
-    await _db.db.meta.update_one(
-        {"_id": _RATE_META_ID},
-        {"$set": {"remaining": remaining, "reset_at": reset_at, "updated_at": now, "updated_at_utc": now}},
-        upsert=True,
-    )
+    # Write-through invalidation: discovery refresh mutates league_registry_v3 fields
+    # that are consumed by /api/leagues/navigation.
+    await invalidate_navigation_cache()
+    # _persist_rate_limit() already wrote the meta document inside get_available_leagues()
     refreshed = await _list_cached_leagues()
     refreshed_last = _latest_synced_at(refreshed)
     return {
@@ -624,6 +636,130 @@ async def start_metrics_sync(
     }
 
 
+async def _run_xg_resolve_job(job_id: ObjectId, season_id: int) -> None:
+    """Resolve xg_raw cache → matches_v3 for a season (no API calls)."""
+    try:
+        result = await sportmonks_connector.resolve_season_xg_from_cache(
+            int(season_id), job_id=job_id,
+        )
+        now = utcnow()
+        await _db.db.admin_import_jobs.update_one(
+            {"_id": job_id},
+            {
+                "$set": {
+                    "status": "succeeded",
+                    "phase": "done",
+                    "active_lock": False,
+                    "results": result,
+                    "finished_at": now,
+                    "updated_at": now,
+                    "updated_at_utc": now,
+                }
+            },
+        )
+    except Exception as exc:
+        now = utcnow()
+        await _db.db.admin_import_jobs.update_one(
+            {"_id": job_id},
+            {
+                "$set": {
+                    "status": "failed",
+                    "phase": "failed",
+                    "active_lock": False,
+                    "error": {"message": str(exc), "type": type(exc).__name__},
+                    "updated_at": now,
+                    "updated_at_utc": now,
+                    "finished_at": now,
+                }
+            },
+        )
+
+
+@router.get("/season/{season_id}/xg-sync/preview")
+async def preview_xg_sync(
+    season_id: int,
+    admin=Depends(get_admin_user),
+):
+    _ = admin
+    result = await sportmonks_connector.preview_season_xg_resolve(int(season_id))
+    return result
+
+
+@router.post("/season/{season_id}/xg-sync")
+async def start_xg_sync(
+    season_id: int,
+    background_tasks: BackgroundTasks,
+    admin=Depends(get_admin_user),
+):
+    admin_id = str(admin.get("_id"))
+    has_matches = await _db.db.matches_v3.count_documents({"season_id": int(season_id)}, limit=1)
+    if int(has_matches) == 0:
+        raise HTTPException(
+            status_code=status.HTTP_428_PRECONDITION_REQUIRED,
+            detail="Precondition Required: Perform Deep Ingest first.",
+        )
+    existing = await _db.db.admin_import_jobs.find_one(
+        {
+            "type": _JOB_TYPE_XG,
+            "season_id": int(season_id),
+            "status": {"$in": ["queued", "running", "paused"]},
+        },
+        {"_id": 1, "status": 1},
+    )
+    if existing:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "detail": "An active xG-sync job already exists for this season.",
+                "active_job_id": str(existing["_id"]),
+                "season_id": int(season_id),
+                "status": str(existing.get("status") or ""),
+            },
+        )
+    now = utcnow()
+    doc = {
+        "type": _JOB_TYPE_XG,
+        "source": "sportmonks",
+        "season_id": int(season_id),
+        "status": "queued",
+        "phase": "queued",
+        "active_lock": True,
+        "rate_limit_paused": False,
+        "rate_limit_remaining": None,
+        "total_rounds": 0,
+        "processed_rounds": 0,
+        "current_round_name": None,
+        "progress": {"processed": 0, "total": 0, "percent": 0.0},
+        "timeout_at": None,
+        "max_runtime_minutes": int(settings.SPORTMONKS_MAX_RUNTIME_METRICS_MINUTES),
+        "page_requests_total": 0,
+        "duplicate_page_blocks": 0,
+        "phase_page_requests": {},
+        "pages_processed": 0,
+        "pages_total": None,
+        "rows_processed": 0,
+        "error_log": [],
+        "retry_count": 0,
+        "error": None,
+        "results": None,
+        "admin_id": admin_id,
+        "created_at": now,
+        "started_at": None,
+        "updated_at": now,
+        "updated_at_utc": now,
+        "finished_at": None,
+    }
+    inserted = await _db.db.admin_import_jobs.insert_one(doc)
+    job_id = inserted.inserted_id
+    background_tasks.add_task(_run_xg_resolve_job, job_id, int(season_id))
+    return {
+        "accepted": True,
+        "job_id": str(job_id),
+        "season_id": int(season_id),
+        "status": "queued",
+    }
+
+
 @router.post("/manual-check/auto-heal", response_model=ManualCheckAutoHealResponse)
 async def auto_heal_manual_checks(
     season_id: int | None = Query(None, ge=1),
@@ -656,6 +792,7 @@ async def get_metrics_health(season_id: int, admin=Depends(get_admin_user)):
             "has_advanced_stats": True,
         }
     )
+    # FIXME: ODDS_V3_BREAK — counts odds_meta.summary_1x2 no longer produced by connector
     odds_covered = await _db.db.matches_v3.count_documents(
         {
             "season_id": int(season_id),
@@ -720,6 +857,7 @@ async def get_season_integrity(season_id: int, admin=Depends(get_admin_user)):
     teams_without_name = await _db.db.teams_v3.count_documents(
         {"$or": [{"name": {"$exists": False}}, {"name": None}, {"name": ""}]}
     )
+    # FIXME: ODDS_V3_BREAK — aggregates odds_timeline size no longer produced by connector
     max_timeline_row = await _db.db.matches_v3.aggregate(
         [
             {"$match": {"season_id": sid}},
@@ -964,6 +1102,7 @@ async def get_season_audit(season_id: int, admin=Depends(get_admin_user)):
         "season_id": sid, "status": "FINISHED",
         "teams.home.xg": {"$ne": None}, "teams.away.xg": {"$ne": None},
     })
+    # FIXME: ODDS_V3_BREAK — counts odds_meta.summary_1x2 no longer produced by connector
     odds_covered = await _db.db.matches_v3.count_documents({
         "season_id": sid, "status": "FINISHED",
         "odds_meta.summary_1x2.home.avg": {"$exists": True},
@@ -987,6 +1126,7 @@ async def get_season_audit(season_id: int, admin=Depends(get_admin_user)):
     xg_max = round(float(xg_stats_rows[0]["max"]), 2) if xg_stats_rows else 0.0
 
     # Odds overround (sample)
+    # FIXME: ODDS_V3_BREAK — reads odds_meta.summary_1x2 for overround calculation, no longer produced by connector
     odds_sample = await _db.db.matches_v3.find(
         {"season_id": sid, "status": "FINISHED", "odds_meta.summary_1x2.home.avg": {"$exists": True}},
         {"odds_meta.summary_1x2": 1},
@@ -1002,6 +1142,7 @@ async def get_season_audit(season_id: int, admin=Depends(get_admin_user)):
     avg_overround = round(sum(overrounds) / len(overrounds), 4) if overrounds else 0.0
 
     # Timeline depth
+    # FIXME: ODDS_V3_BREAK — aggregates odds_timeline depth stats no longer produced by connector
     timeline_stats_cursor = _db.db.matches_v3.aggregate([
         {"$match": {"season_id": sid}},
         {"$project": {"len": {"$size": {"$ifNull": ["$odds_timeline", []]}}}},
@@ -1242,7 +1383,24 @@ async def get_ops_snapshot(admin=Depends(get_admin_user)):
     now = utcnow()
     rate_meta = await _db.db.meta.find_one({"_id": _RATE_META_ID})
     remaining = int(rate_meta.get("remaining")) if isinstance(rate_meta, dict) and rate_meta.get("remaining") is not None else None
-    reset_at = rate_meta.get("reset_at") if isinstance(rate_meta, dict) else None
+    reset_at_raw = rate_meta.get("reset_at") if isinstance(rate_meta, dict) else None
+    last_request_type = rate_meta.get("last_request_type") if isinstance(rate_meta, dict) else None
+
+    # Stale-check: if reset_at is a Unix timestamp in the past, remaining is outdated
+    if reset_at_raw is not None and remaining is not None:
+        try:
+            reset_ts = int(reset_at_raw) if not isinstance(reset_at_raw, datetime) else int(reset_at_raw.timestamp())
+            if reset_ts < int(now.timestamp()):
+                remaining = None
+        except (TypeError, ValueError):
+            pass
+
+    reset_at: Any = None
+    if reset_at_raw is not None:
+        try:
+            reset_at = ensure_utc(reset_at_raw).isoformat()
+        except Exception:
+            reset_at = str(reset_at_raw)
 
     queued = await _db.db.admin_import_jobs.count_documents(
         {"type": {"$in": [_JOB_TYPE, _JOB_TYPE_METRICS]}, "status": "queued"}
@@ -1306,6 +1464,7 @@ async def get_ops_snapshot(admin=Depends(get_admin_user)):
             "remaining": remaining,
             "reset_at": reset_at,
             "reserve_credits": int(settings.SPORTMONKS_RESERVE_CREDITS),
+            "last_request_type": str(last_request_type) if last_request_type else None,
         },
         "queue_metrics": {
             "queued": int(queued),
@@ -1371,7 +1530,7 @@ async def get_ingest_job(job_id: str, admin=Depends(get_admin_user)):
         oid = ObjectId(job_id)
     except Exception as exc:
         raise HTTPException(status_code=400, detail="Invalid job_id.") from exc
-    doc = await _db.db.admin_import_jobs.find_one({"_id": oid, "type": {"$in": [_JOB_TYPE, _JOB_TYPE_METRICS]}})
+    doc = await _db.db.admin_import_jobs.find_one({"_id": oid, "type": {"$in": [_JOB_TYPE, _JOB_TYPE_METRICS, _JOB_TYPE_XG]}})
     if not doc:
         raise HTTPException(status_code=404, detail="Ingest job not found.")
     now = utcnow()
@@ -1519,3 +1678,375 @@ async def resume_ingest_job(
         "status": "queued",
         "resumed": True,
     }
+
+
+# ---------------------------------------------------------------------------
+# Consumption analytics
+# ---------------------------------------------------------------------------
+
+_RANGE_MAP = {"24h": timedelta(hours=24), "7d": timedelta(days=7), "30d": timedelta(days=30)}
+
+
+@router.get("/metrics/consumption")
+async def get_consumption_metrics(
+    range_param: str = Query("24h", alias="range"),
+    admin=Depends(get_admin_user),
+):
+    """Aggregate API credit consumption by hour and module."""
+    _ = admin
+    now = utcnow()
+    delta = _RANGE_MAP.get(range_param, timedelta(hours=24))
+    since = now - delta
+
+    pipeline: list[dict[str, Any]] = [
+        {"$match": {"ts": {"$gte": since}}},
+        {
+            "$group": {
+                "_id": {
+                    "hour": {"$dateTrunc": {"date": "$ts", "unit": "hour"}},
+                    "module": "$module",
+                },
+                "credits": {"$sum": "$credits_consumed"},
+                "calls": {"$sum": 1},
+            }
+        },
+        {"$sort": {"_id.hour": 1}},
+        {
+            "$group": {
+                "_id": "$_id.hour",
+                "modules": {
+                    "$push": {
+                        "module": "$_id.module",
+                        "credits": "$credits",
+                        "calls": "$calls",
+                    }
+                },
+                "total_credits": {"$sum": "$credits"},
+            }
+        },
+        {"$sort": {"_id": 1}},
+    ]
+
+    rows = await _db.db.stats_api_usage.aggregate(pipeline).to_list(length=2000)
+
+    hourly = []
+    grand_credits = 0
+    grand_calls = 0
+    module_agg: dict[str, dict[str, int]] = {}
+
+    for row in rows:
+        hour_iso = row["_id"].isoformat() if hasattr(row["_id"], "isoformat") else str(row["_id"])
+        hourly.append({
+            "hour": hour_iso,
+            "total_credits": int(row.get("total_credits") or 0),
+            "modules": row.get("modules") or [],
+        })
+        grand_credits += int(row.get("total_credits") or 0)
+        for m in row.get("modules") or []:
+            name = str(m.get("module") or "unknown")
+            if name not in module_agg:
+                module_agg[name] = {"credits": 0, "calls": 0}
+            module_agg[name]["credits"] += int(m.get("credits") or 0)
+            module_agg[name]["calls"] += int(m.get("calls") or 0)
+            grand_calls += int(m.get("calls") or 0)
+
+    hours_in_range = max(1, delta.total_seconds() / 3600)
+    avg_per_hour = round(grand_credits / hours_in_range, 1)
+    burn_rate_per_minute = round(grand_credits / max(1, delta.total_seconds() / 60), 2)
+
+    modules_sorted = sorted(module_agg.items(), key=lambda x: x[1]["credits"], reverse=True)
+    top_module = modules_sorted[0][0] if modules_sorted else None
+    top_module_credits = modules_sorted[0][1]["credits"] if modules_sorted else 0
+
+    summary_modules = []
+    for name, data in modules_sorted:
+        pct = round((data["credits"] / grand_credits) * 100, 1) if grand_credits > 0 else 0.0
+        summary_modules.append({
+            "module": name,
+            "credits": data["credits"],
+            "calls": data["calls"],
+            "pct": pct,
+        })
+
+    return {
+        "range": range_param,
+        "since": since.isoformat(),
+        "generated_at": now.isoformat(),
+        "hourly": hourly,
+        "summary": {
+            "total_credits": grand_credits,
+            "total_calls": grand_calls,
+            "avg_credits_per_hour": avg_per_hour,
+            "top_module": top_module,
+            "top_module_credits": top_module_credits,
+            "burn_rate_per_minute": burn_rate_per_minute,
+            "modules": summary_modules,
+        },
+    }
+
+
+# ---------------------------------------------------------------------------
+# League Dashboard — hierarchical league → season view with health + credits
+# ---------------------------------------------------------------------------
+
+_league_dashboard_cache: dict[str, Any] = {"data": None, "expires_at": 0.0}
+_LEAGUE_DASHBOARD_TTL = 300  # 5 minutes
+
+
+@router.get("/metrics/league-dashboard")
+async def get_league_dashboard(
+    force: bool = Query(False),
+    admin=Depends(get_admin_user),
+):
+    """Aggregated league → season dashboard with health metrics and credit tracking."""
+    _ = admin
+    now_ts = time.monotonic()
+    if not force and _league_dashboard_cache["data"] is not None and now_ts < _league_dashboard_cache["expires_at"]:
+        return _league_dashboard_cache["data"]
+
+    now = utcnow()
+    since_30d = now - timedelta(days=30)
+    since_7d = now - timedelta(days=7)
+
+    # 1. Load all leagues from registry
+    leagues_cursor = _db.db.league_registry_v3.find({}).sort([("is_active", -1), ("name", 1)])
+    leagues_raw = await leagues_cursor.to_list(length=500)
+
+    # 2. Collect all season_ids across all leagues and build league→seasons map
+    all_season_ids: list[int] = []
+    league_season_map: dict[int, list[dict[str, Any]]] = {}  # league_id → season info list
+    for league in leagues_raw:
+        league_id = int(league["_id"])
+        seasons = league.get("available_seasons") or []
+        season_infos = []
+        for s in seasons:
+            sid = s.get("id")
+            if sid is not None:
+                sid = int(sid)
+                all_season_ids.append(sid)
+                season_infos.append({"id": sid, "name": s.get("name") or str(sid)})
+        league_season_map[league_id] = season_infos
+
+    # 3. Batch health aggregation: per-season fixture counts from matches_v3
+    health_pipeline: list[dict[str, Any]] = [
+        {"$match": {"season_id": {"$in": all_season_ids}}},
+        {
+            "$group": {
+                "_id": "$season_id",
+                "total": {"$sum": 1},
+                "finished": {
+                    "$sum": {"$cond": [{"$eq": ["$status", "FINISHED"]}, 1, 0]}
+                },
+                "scheduled": {
+                    "$sum": {"$cond": [{"$eq": ["$status", "SCHEDULED"]}, 1, 0]}
+                },
+                "live": {
+                    "$sum": {"$cond": [{"$eq": ["$status", "LIVE"]}, 1, 0]}
+                },
+                "xg_covered": {
+                    "$sum": {"$cond": [{"$eq": ["$has_advanced_stats", True]}, 1, 0]}
+                },
+                # FIXME: ODDS_V3_BREAK — aggregates odds_meta.summary_1x2 no longer produced by connector
+                "odds_covered": {
+                    "$sum": {
+                        "$cond": [
+                            {
+                                "$and": [
+                                    {"$gt": [{"$ifNull": ["$odds_meta.summary_1x2.home.avg", None]}, None]},
+                                    {"$gt": [{"$ifNull": ["$odds_meta.summary_1x2.draw.avg", None]}, None]},
+                                    {"$gt": [{"$ifNull": ["$odds_meta.summary_1x2.away.avg", None]}, None]},
+                                ]
+                            },
+                            1,
+                            0,
+                        ]
+                    }
+                },
+                "manual_check_count": {
+                    "$sum": {"$cond": [{"$eq": ["$manual_check_required", True]}, 1, 0]}
+                },
+            }
+        },
+    ]
+    health_rows = await _db.db.matches_v3.aggregate(health_pipeline).to_list(length=2000)
+
+    # 3b. xg_raw cache coverage per season (fixture_id join)
+    season_fixture_ids: dict[int, list[int]] = {}
+    async for doc in _db.db.matches_v3.find(
+        {"season_id": {"$in": all_season_ids}, "status": "FINISHED"},
+        {"_id": 1, "season_id": 1},
+    ):
+        sid = int(doc.get("season_id") or 0)
+        fid = int(doc.get("_id") or 0)
+        if sid and fid:
+            season_fixture_ids.setdefault(sid, []).append(fid)
+
+    xg_cache_by_season: dict[int, int] = {}
+    for sid, fids in season_fixture_ids.items():
+        if not fids:
+            continue
+        cache_pipeline: list[dict[str, Any]] = [
+            {"$match": {"fixture_id": {"$in": fids}, "type_id": 5304}},
+            {"$group": {"_id": "$fixture_id"}},
+            {"$count": "n"},
+        ]
+        cache_result = await _db.db.xg_raw.aggregate(cache_pipeline).to_list(length=1)
+        xg_cache_by_season[sid] = int(cache_result[0]["n"]) if cache_result else 0
+
+    health_by_season: dict[int, dict[str, Any]] = {}
+    for row in health_rows:
+        sid = int(row["_id"])
+        total = int(row.get("total") or 0)
+        finished = int(row.get("finished") or 0)
+        xg = int(row.get("xg_covered") or 0)
+        odds = int(row.get("odds_covered") or 0)
+        xg_cache = xg_cache_by_season.get(sid, 0)
+        xg_pct = round((xg / finished) * 100, 1) if finished > 0 else 0.0
+        xg_cache_pct = round((xg_cache / finished) * 100, 1) if finished > 0 else 0.0
+        odds_pct = round((odds / finished) * 100, 1) if finished > 0 else 0.0
+        if xg_pct >= 80 and odds_pct >= 80:
+            status_label = "green"
+        elif xg_pct >= 50 or odds_pct >= 50:
+            status_label = "yellow"
+        else:
+            status_label = "red"
+        health_by_season[sid] = {
+            "total_fixtures": total,
+            "finished": finished,
+            "scheduled": int(row.get("scheduled") or 0),
+            "live": int(row.get("live") or 0),
+            "xg_covered": xg,
+            "xg_cache_count": xg_cache,
+            "xg_cache_pct": xg_cache_pct,
+            "odds_covered": odds,
+            "xg_pct": xg_pct,
+            "odds_pct": odds_pct,
+            "manual_check_count": int(row.get("manual_check_count") or 0),
+            "status": status_label,
+        }
+
+    # 4. Active jobs per season
+    active_jobs_cursor = _db.db.admin_import_jobs.find(
+        {"status": {"$in": ["queued", "running", "paused"]}, "season_id": {"$in": all_season_ids}},
+        {"season_id": 1, "type": 1, "status": 1, "progress": 1},
+    )
+    active_jobs_raw = await active_jobs_cursor.to_list(length=500)
+    active_job_by_season: dict[int, dict[str, Any]] = {}
+    for job in active_jobs_raw:
+        sid = int(job.get("season_id") or 0)
+        if sid and sid not in active_job_by_season:
+            progress = job.get("progress") or {}
+            active_job_by_season[sid] = {
+                "job_id": str(job["_id"]),
+                "type": job.get("type") or "unknown",
+                "status": job.get("status") or "unknown",
+                "progress": int(progress.get("percent") or 0) if isinstance(progress, dict) else 0,
+            }
+
+    # 5. Per-league credit consumption (30d total + 7d sparkline)
+    # Build reverse map: season_id → league_id
+    season_to_league: dict[int, int] = {}
+    for league_id, season_infos in league_season_map.items():
+        for s in season_infos:
+            season_to_league[s["id"]] = league_id
+
+    # 30d total per league
+    credit_30d_pipeline: list[dict[str, Any]] = [
+        {"$match": {"season_id": {"$exists": True, "$in": all_season_ids}, "ts": {"$gte": since_30d}}},
+        {"$group": {"_id": "$season_id", "credits": {"$sum": "$credits_consumed"}}},
+    ]
+    credit_30d_rows = await _db.db.stats_api_usage.aggregate(credit_30d_pipeline).to_list(length=2000)
+    credit_30d_by_league: dict[int, int] = {}
+    for row in credit_30d_rows:
+        sid = int(row["_id"])
+        lid = season_to_league.get(sid)
+        if lid is not None:
+            credit_30d_by_league[lid] = credit_30d_by_league.get(lid, 0) + int(row.get("credits") or 0)
+
+    # 7d sparkline per league (daily buckets)
+    spark_pipeline: list[dict[str, Any]] = [
+        {"$match": {"season_id": {"$exists": True, "$in": all_season_ids}, "ts": {"$gte": since_7d}}},
+        {
+            "$group": {
+                "_id": {
+                    "season_id": "$season_id",
+                    "day": {"$dateTrunc": {"date": "$ts", "unit": "day"}},
+                },
+                "credits": {"$sum": "$credits_consumed"},
+            }
+        },
+        {"$sort": {"_id.day": 1}},
+    ]
+    spark_rows = await _db.db.stats_api_usage.aggregate(spark_pipeline).to_list(length=5000)
+    # Build per-league daily map
+    league_daily: dict[int, dict[str, int]] = {}  # league_id → {day_iso: credits}
+    for row in spark_rows:
+        sid = int(row["_id"]["season_id"])
+        lid = season_to_league.get(sid)
+        if lid is None:
+            continue
+        day_key = row["_id"]["day"].strftime("%Y-%m-%d") if hasattr(row["_id"]["day"], "strftime") else str(row["_id"]["day"])
+        if lid not in league_daily:
+            league_daily[lid] = {}
+        league_daily[lid][day_key] = league_daily[lid].get(day_key, 0) + int(row.get("credits") or 0)
+
+    # Generate 7-day sparkline arrays (fill missing days with 0)
+    sparkline_by_league: dict[int, list[int]] = {}
+    for lid in league_daily:
+        daily = league_daily[lid]
+        sparkline = []
+        for i in range(7):
+            d = (now - timedelta(days=6 - i)).strftime("%Y-%m-%d")
+            sparkline.append(daily.get(d, 0))
+        sparkline_by_league[lid] = sparkline
+
+    # 6. Assemble response
+    leagues_out = []
+    for league in leagues_raw:
+        league_id = int(league["_id"])
+        features = league.get("features") or {}
+        seasons_out = []
+        for s in league_season_map.get(league_id, []):
+            sid = s["id"]
+            seasons_out.append({
+                "id": sid,
+                "name": s["name"],
+                "health": health_by_season.get(sid, {
+                    "total_fixtures": 0, "finished": 0, "scheduled": 0, "live": 0,
+                    "xg_covered": 0, "odds_covered": 0, "xg_pct": 0, "odds_pct": 0,
+                    "manual_check_count": 0, "status": "red",
+                }),
+                "active_job": active_job_by_season.get(sid),
+            })
+        # Sort seasons: newest first (by id descending — Sportmonks season IDs are monotonically increasing)
+        seasons_out.sort(key=lambda x: x["id"], reverse=True)
+
+        leagues_out.append({
+            "id": league_id,
+            "name": league.get("name") or f"League {league_id}",
+            "country": league.get("country") or "",
+            "league_id": league.get("league_id") or "",
+            "is_active": bool(league.get("is_active")),
+            "features": {
+                "tipping": bool(features.get("tipping")),
+                "match_load": bool(features.get("match_load")),
+                "xg_sync": bool(features.get("xg_sync")),
+                "odds_sync": bool(features.get("odds_sync")),
+            },
+            "ui_order": int(league.get("ui_order") or 999),
+            "last_synced_at": league.get("last_synced_at"),
+            "credit_total_30d": credit_30d_by_league.get(league_id, 0),
+            "credit_sparkline_7d": sparkline_by_league.get(league_id, [0] * 7),
+            "seasons": seasons_out,
+        })
+
+    # Sort: active first, then by ui_order, then by name
+    leagues_out.sort(key=lambda x: (not x["is_active"], x["ui_order"], x["name"]))
+
+    result = {
+        "generated_at": now.isoformat(),
+        "leagues": leagues_out,
+    }
+    _league_dashboard_cache["data"] = result
+    _league_dashboard_cache["expires_at"] = now_ts + _LEAGUE_DASHBOARD_TTL
+    return result

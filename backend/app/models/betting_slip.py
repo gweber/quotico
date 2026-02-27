@@ -72,6 +72,8 @@ class SelectionInDB(BaseModel):
     is_admin_entry: bool = False                  # Admin-entered prediction
     status: SelectionStatus = SelectionStatus.draft
     locked_at: Optional[datetime] = None          # Timestamp when this leg was frozen
+    invalid_reason: Optional[str] = None
+    invalid_at: Optional[datetime] = None
 
     # Resolution audit fields
     actual_score: Optional[Dict[str, int]] = None   # {"home": int, "away": int}
@@ -99,7 +101,7 @@ class BettingSlipInDB(BaseModel):
     # Matchday round fields
     matchday_id: Optional[str] = None             # Links to matchdays collection
     matchday_number: Optional[int] = None
-    sport_key: Optional[str] = None
+    league_id: Optional[int] = None
     season: Optional[int] = None
     auto_bet_strategy: Optional[str] = None       # "none" | "draw" | "favorite" | "q_bot"
     total_points: Optional[int] = None            # Sum of selection points_earned
@@ -140,17 +142,18 @@ class CreateDraftRequest(BaseModel):
     type: SlipType = SlipType.single
     squad_id: Optional[str] = None
     matchday_id: Optional[str] = None
-    sport_key: Optional[str] = None
+    league_id: Optional[int] = None
     funding: str = "virtual"
 
 
 class PatchSelectionRequest(BaseModel):
     """Add, update, or remove a leg on a draft slip."""
-    action: str                                   # "add" | "update" | "remove"
+    action: str                                   # "add" | "update" | "remove" | "invalidate"
     match_id: str
     market: str = "h2h"
     pick: Optional[Any] = None                    # Required for add/update
     displayed_odds: Optional[float] = None        # Required for h2h/totals add/update
+    reason: Optional[str] = None                  # Optional for invalidate
 
 
 class BankrollBetRequest(BaseModel):

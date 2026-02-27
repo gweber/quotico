@@ -72,15 +72,6 @@ const isStale = computed(() => {
 
 const cards = ref<ModuleCard[]>([
   {
-    key: "ingest",
-    to: "/admin/ingest",
-    labelKey: "admin.dashboard.modules.ingest",
-    icon: "⚙️",
-    status: "active",
-    healthEndpoint: "/admin/ingest/discovery",
-    health: "ok",
-  },
-  {
     key: "dataAudit",
     to: "/admin/data-audit",
     labelKey: "admin.dashboard.modules.dataAudit",
@@ -153,6 +144,24 @@ const cards = ref<ModuleCard[]>([
     health: "ok",
   },
   {
+    key: "referees",
+    to: "/admin/referees",
+    labelKey: "admin.dashboard.modules.referees",
+    icon: "🧑‍⚖️",
+    status: "active",
+    healthEndpoint: "/admin/referees",
+    health: "ok",
+  },
+  {
+    key: "oddsMonitor",
+    to: "/admin/odds-monitor",
+    labelKey: "admin.dashboard.modules.oddsMonitor",
+    icon: "📈",
+    status: "active",
+    healthEndpoint: "/admin/odds/anomalies",
+    health: "ok",
+  },
+  {
     key: "qbotLab",
     to: "/admin/qbot-lab",
     labelKey: "admin.dashboard.modules.qbotLab",
@@ -181,13 +190,12 @@ const cards = ref<ModuleCard[]>([
     health: "ok",
   },
   {
-    key: "leagues",
-    to: "/admin/leagues",
-    labelKey: "admin.dashboard.modules.leagues",
+    key: "leagueControl",
+    to: "/admin/league-control",
+    labelKey: "admin.dashboard.modules.leagueControl",
     icon: "🏟️",
-    status: "deprecated",
-    reasonKey: "admin.dashboard.deprecatedReason.leagues",
-    healthEndpoint: "/admin/leagues",
+    status: "active",
+    healthEndpoint: "/admin/ingest/metrics/league-dashboard",
     health: "ok",
   },
 ]);

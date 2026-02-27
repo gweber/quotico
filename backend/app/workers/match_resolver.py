@@ -2,42 +2,82 @@
 backend/app/workers/match_resolver.py
 
 Purpose:
-    Match resolution worker. Pulls provider scores, finalizes matches, resolves
-    betting slips, and captures odds_meta closing lines once.
+    Match resolution worker. Picks up matches finalized by Sportmonks ingest,
+    resolves betting slips, and awards points.
 
 Dependencies:
     - app.database
-    - app.providers.odds_api
-    - app.services.odds_service
+    - app.services.match_service
 """
 
 import logging
 from datetime import datetime, timedelta
-from typing import Optional
-
 from bson import ObjectId
 
 import app.database as _db
-from app.providers.odds_api import SUPPORTED_SPORTS, odds_provider
-from app.providers.football_data import (
-    SPORT_TO_COMPETITION,
-    football_data_provider,
-)
-from app.providers.openligadb import openligadb_provider, SPORT_TO_LEAGUE
 from app.services.match_service import _MAX_DURATION, _DEFAULT_DURATION
 from app.services.matchday_service import calculate_points, is_match_locked
 from app.services.fantasy_service import calculate_fantasy_points
 from app.services.odds_meta_service import get_current_market
-from app.services.odds_service import odds_service
-from app.utils.team_matching import teams_match
-from app.utils import ensure_utc, parse_utc, utcnow
+from app.utils import ensure_utc, utcnow
 from app.workers._state import recently_synced, set_synced
 
 logger = logging.getLogger("quotico.match_resolver")
 
-BUNDESLIGA = "soccer_germany_bundesliga"
-BUNDESLIGA2 = "soccer_germany_bundesliga2"
-GERMAN_LEAGUES = {BUNDESLIGA, BUNDESLIGA2}
+
+def _match_team_id(match: dict, side: str) -> int | None:
+    teams = (match or {}).get("teams")
+    if not isinstance(teams, dict):
+        return None
+    node = teams.get(side)
+    if not isinstance(node, dict):
+        return None
+    value = node.get("sm_id")
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _match_team_name(match: dict, side: str) -> str:
+    teams = (match or {}).get("teams")
+    if not isinstance(teams, dict):
+        return "?"
+    node = teams.get(side)
+    if not isinstance(node, dict):
+        return "?"
+    return str(node.get("name") or "?")
+
+
+def _extract_scores(match: dict) -> tuple[int | None, int | None]:
+    teams = (match or {}).get("teams")
+    home_score = None
+    away_score = None
+    if isinstance(teams, dict):
+        home_node = teams.get("home")
+        away_node = teams.get("away")
+        if isinstance(home_node, dict):
+            home_score = home_node.get("score")
+        if isinstance(away_node, dict):
+            away_score = away_node.get("score")
+    scores = (match or {}).get("scores")
+    if (home_score is None or away_score is None) and isinstance(scores, dict):
+        full_time = scores.get("full_time")
+        if isinstance(full_time, dict):
+            if home_score is None:
+                home_score = full_time.get("home")
+            if away_score is None:
+                away_score = full_time.get("away")
+    try:
+        parsed_home = int(home_score) if home_score is not None else None
+    except (TypeError, ValueError):
+        parsed_home = None
+    try:
+        parsed_away = int(away_score) if away_score is not None else None
+    except (TypeError, ValueError):
+        parsed_away = None
+    return parsed_home, parsed_away
+
 
 
 # ---------- Universal Resolver Functions ----------
@@ -84,8 +124,8 @@ def resolve_selection(
 
     elif market == "survivor_pick":
         team_id = sel.get("team_id")
-        home_team_id = match.get("home_team_id")
-        away_team_id = match.get("away_team_id")
+        home_team_id = _match_team_id(match, "home")
+        away_team_id = _match_team_id(match, "away")
         if not team_id or not home_team_id or not away_team_id:
             logger.error("Survivor selection identity missing for match %s", match.get("_id"))
             sel["match_result"] = "lost"
@@ -116,8 +156,8 @@ def resolve_selection(
 
     elif market == "fantasy_pick":
         team_id = sel.get("team_id")
-        home_team_id = match.get("home_team_id")
-        away_team_id = match.get("away_team_id")
+        home_team_id = _match_team_id(match, "home")
+        away_team_id = _match_team_id(match, "away")
         if not team_id or not home_team_id or not away_team_id:
             logger.error("Fantasy selection identity missing for match %s", match.get("_id"))
             return sel
@@ -346,37 +386,42 @@ async def cleanup_stale_drafts() -> None:
 async def resolve_matches() -> None:
     """Check for completed matches and resolve pending bets.
 
-    Smart sleep: skips sports with no started-but-unresolved matches.
-    Safety margin: polls each sport at least once every 6 hours.
+    Legacy provider-based resolution has been removed. Match resolution now
+    relies on Sportmonks ingest updating match status to 'final' with scores.
+    This worker picks up those finalized matches and resolves slips.
     """
     now = utcnow()
 
-    for sport_key in SUPPORTED_SPORTS:
-        has_work = await _db.db.matches.find_one({
-            "sport_key": sport_key,
-            "$or": [
-                {"status": {"$in": ["scheduled", "live"]}, "match_date": {"$lte": now}},
-                {"status": "final", "result.outcome": None},
-            ],
-        })
+    active_leagues = await _db.db.league_registry_v3.find(
+        {"is_active": True}, {"_id": 1, "league_id": 1}
+    ).to_list(100)
+    active_league_ids = [int(l["_id"]) for l in active_leagues if l.get("_id") is not None]
 
-        if not has_work:
-            state_key = f"resolver:{sport_key}"
-            if await recently_synced(state_key, timedelta(hours=6)):
-                logger.debug("Smart sleep: %s has no unresolved matches, skipping", sport_key)
+    for league_id in active_league_ids:
+        # Find matches marked FINISHED by Sportmonks ingest but with unresolved slips.
+        unresolved = await _db.db.matches_v3.find({
+            "league_id": int(league_id),
+            "status": "FINISHED",
+            "teams.home.score": {"$ne": None},
+            "teams.away.score": {"$ne": None},
+        }).to_list(length=200)
+
+        for match in unresolved:
+            home_score, away_score = _extract_scores(match)
+            if home_score is None or away_score is None:
                 continue
-            logger.info("Smart sleep safety: %s >6h since last resolve, polling anyway", sport_key)
-
-        try:
-            if sport_key in GERMAN_LEAGUES:
-                await _resolve_german_league(sport_key)
-            elif sport_key in SPORT_TO_COMPETITION:
-                await _resolve_via_football_data(sport_key)
+            if home_score > away_score:
+                outcome = "1"
+            elif away_score > home_score:
+                outcome = "2"
             else:
-                await _resolve_via_odds_api(sport_key)
-            await set_synced(f"resolver:{sport_key}")
-        except Exception as e:
-            logger.error("Resolution failed for %s: %s", sport_key, e)
+                outcome = "X"
+            try:
+                await _resolve_match(match, outcome, home_score, away_score)
+            except Exception as e:
+                logger.error("Resolution failed for match %s: %s", str(match["_id"]), e)
+
+        await set_synced(f"resolver:{int(league_id)}")
 
     await _auto_close_stale_matches(now)
     await cleanup_stale_drafts()
@@ -387,27 +432,35 @@ async def resolve_matches() -> None:
 
 async def _auto_close_stale_matches(now: datetime) -> None:
     """Auto-close matches stuck as 'live' or 'scheduled' past their expected duration."""
-    for sport_key in SUPPORTED_SPORTS:
-        max_dur = _MAX_DURATION.get(sport_key, _DEFAULT_DURATION)
+    active_leagues = await _db.db.league_registry_v3.find(
+        {"is_active": True}, {"_id": 1, "league_id": 1}
+    ).to_list(100)
+    active_leagues_by_id = {
+        int(l["_id"]): str(l.get("league_id") or "")
+        for l in active_leagues
+        if l.get("_id") is not None
+    }
+
+    for league_id, league_id in active_leagues_by_id.items():
+        max_dur = _MAX_DURATION.get(league_id, _DEFAULT_DURATION)
         cutoff = now - max_dur
 
-        stale = await _db.db.matches.find({
-            "sport_key": sport_key,
-            "status": {"$in": ["scheduled", "live"]},
-            "match_date": {"$lte": cutoff},
+        stale = await _db.db.matches_v3.find({
+            "league_id": int(league_id),
+            "status": {"$in": ["SCHEDULED", "LIVE"]},
+            "start_at": {"$lte": cutoff},
         }).to_list(length=100)
 
         for match in stale:
-            update: dict = {"status": "final", "updated_at": now}
-            await _db.db.matches.update_one(
+            update: dict = {"status": "FINISHED", "updated_at": now}
+            await _db.db.matches_v3.update_one(
                 {"_id": match["_id"]},
                 {"$set": update},
             )
-            await odds_service.set_closing_from_current(match["_id"])
             match_id = str(match["_id"])
             logger.warning(
                 "Auto-closed stale match %s (%s vs %s, %s) — no provider result, needs admin review",
-                match_id, match.get("home_team"), match.get("away_team"), sport_key,
+                match_id, _match_team_name(match, "home"), _match_team_name(match, "away"), league_id,
             )
 
 
@@ -424,20 +477,21 @@ async def _resolve_match(
     now = utcnow()
     match_id = str(match["_id"])
 
-    await _db.db.matches.update_one(
+    await _db.db.matches_v3.update_one(
         {"_id": match["_id"]},
         {
             "$set": {
-                "status": "final",
-                "result.outcome": result,
-                "result.home_score": home_score,
-                "result.away_score": away_score,
+                "status": "FINISHED",
+                "teams.home.score": home_score,
+                "teams.away.score": away_score,
+                "scores.full_time.home": home_score,
+                "scores.full_time.away": away_score,
+                "resolution.outcome_1x2": result,
                 "updated_at": now,
+                "updated_at_utc": now,
             }
         },
     )
-    await odds_service.set_closing_from_current(match["_id"])
-
     # Find all slips with selections on this match (pending, partial, or draft with locked legs)
     affected_slips = await _db.db.betting_slips.find({
         "selections.match_id": match_id,
@@ -541,7 +595,7 @@ async def _resolve_match(
 
     logger.info(
         "Resolved %s (%s vs %s): %s %d-%d | %d slips affected, %d awarded",
-        match_id, match.get("home_team", "?"), match.get("away_team", "?"),
+        match_id, _match_team_name(match, "home"), _match_team_name(match, "away"),
         result, home_score, away_score,
         resolved_count, awarded_count,
     )
@@ -563,7 +617,7 @@ async def _resolve_match(
         )
 
 
-async def resolve_single_match(match_id: ObjectId | str) -> None:
+async def resolve_single_match(match_id: int | str) -> None:
     """Resolve one finalized match on demand from event handlers.
 
     Idempotent behavior:
@@ -572,15 +626,15 @@ async def resolve_single_match(match_id: ObjectId | str) -> None:
     - skips if already resolved and no unresolved dependent slips remain
     """
     try:
-        oid = match_id if isinstance(match_id, ObjectId) else ObjectId(str(match_id))
-    except Exception:
+        fixture_id = int(match_id)
+    except (TypeError, ValueError):
         return
 
-    match = await _db.db.matches.find_one({"_id": oid})
+    match = await _db.db.matches_v3.find_one({"_id": fixture_id})
     if not match:
         return
 
-    match_id_str = str(oid)
+    match_id_str = str(fixture_id)
     unresolved = await _db.db.betting_slips.find_one(
         {
             "selections.match_id": match_id_str,
@@ -588,23 +642,14 @@ async def resolve_single_match(match_id: ObjectId | str) -> None:
         },
         {"_id": 1},
     )
-    if not unresolved and match.get("result", {}).get("outcome"):
+    if not unresolved and (match.get("resolution") or {}).get("outcome_1x2"):
         return
 
-    result_obj = match.get("result") if isinstance(match.get("result"), dict) else {}
-    score_obj = match.get("score") if isinstance(match.get("score"), dict) else {}
-    full_time = score_obj.get("full_time") if isinstance(score_obj.get("full_time"), dict) else {}
-
-    home_score = result_obj.get("home_score")
-    away_score = result_obj.get("away_score")
-    if home_score is None:
-        home_score = full_time.get("home")
-    if away_score is None:
-        away_score = full_time.get("away")
+    home_score, away_score = _extract_scores(match)
     if home_score is None or away_score is None:
         return
 
-    outcome = result_obj.get("outcome")
+    outcome = ((match.get("resolution") or {}).get("outcome_1x2"))
     if not outcome:
         if int(home_score) > int(away_score):
             outcome = "1"
@@ -614,141 +659,3 @@ async def resolve_single_match(match_id: ObjectId | str) -> None:
             outcome = "X"
 
     await _resolve_match(match, str(outcome), int(home_score), int(away_score))
-
-
-async def _find_match_by_team(
-    sport_key: str, score_data: dict
-) -> Optional[dict]:
-    """Find an unresolved match in our DB by team name + date."""
-    utc_date = score_data["utc_date"]
-    try:
-        match_time = parse_utc(utc_date)
-    except (ValueError, TypeError, AttributeError):
-        return None
-
-    candidates = await _db.db.matches.find({
-        "sport_key": sport_key,
-        "$or": [
-            {"status": {"$ne": "final"}},
-            {"status": "final", "result.outcome": None},
-        ],
-        "match_date": {
-            "$gte": match_time - timedelta(hours=6),
-            "$lte": match_time + timedelta(hours=6),
-        },
-    }).to_list(length=100)
-
-    for candidate in candidates:
-        if teams_match(candidate.get("home_team", ""), score_data["home_team"]):
-            return candidate
-
-    return None
-
-
-# ---------- German leagues: OpenLigaDB + football-data.org cross-validation ----------
-
-async def _resolve_german_league(sport_key: str) -> None:
-    primary = await openligadb_provider.get_finished_scores(sport_key)
-    secondary = await football_data_provider.get_finished_scores(sport_key)
-
-    if not primary:
-        if secondary:
-            logger.info("%s: OpenLigaDB empty, using football-data.org alone", sport_key)
-            for score in secondary:
-                match = await _find_match_by_team(sport_key, score)
-                if match:
-                    await _resolve_match(
-                        match, score["result"],
-                        score["home_score"], score["away_score"],
-                    )
-        return
-
-    for p_score in primary:
-        match = await _find_match_by_team(sport_key, p_score)
-        if not match:
-            continue
-
-        validated = _cross_validate(p_score, secondary)
-        if validated is False:
-            logger.warning(
-                "RESULT MISMATCH for %s vs %s: OpenLigaDB=%s, football-data=%s — SKIPPING",
-                p_score["home_team"], p_score["away_team"],
-                f"{p_score['home_score']}-{p_score['away_score']}",
-                "see logs",
-            )
-            continue
-
-        if validated is True:
-            logger.info(
-                "VALIDATED %s vs %s: %d-%d (both providers agree)",
-                p_score["home_team"], p_score["away_team"],
-                p_score["home_score"], p_score["away_score"],
-            )
-
-        await _resolve_match(
-            match, p_score["result"],
-            p_score["home_score"], p_score["away_score"],
-        )
-
-
-def _cross_validate(
-    primary_score: dict, secondary_scores: list[dict]
-) -> Optional[bool]:
-    for s in secondary_scores:
-        if not teams_match(primary_score["home_team"], s["home_team"]):
-            continue
-
-        if (
-            primary_score["home_score"] == s["home_score"]
-            and primary_score["away_score"] == s["away_score"]
-        ):
-            return True
-
-        logger.warning(
-            "Score mismatch: %s vs %s — OpenLigaDB: %d-%d, football-data: %d-%d",
-            primary_score["home_team"], primary_score["away_team"],
-            primary_score["home_score"], primary_score["away_score"],
-            s["home_score"], s["away_score"],
-        )
-        return False
-
-    return None
-
-
-# ---------- Other soccer: football-data.org ----------
-
-async def _resolve_via_football_data(sport_key: str) -> None:
-    scores = await football_data_provider.get_finished_scores(sport_key)
-    for score in scores:
-        match = await _find_match_by_team(sport_key, score)
-        if match:
-            await _resolve_match(
-                match, score["result"],
-                score["home_score"], score["away_score"],
-            )
-
-
-# ---------- Fallback: TheOddsAPI (costs credits) ----------
-
-async def _resolve_via_odds_api(sport_key: str) -> None:
-    scores = await odds_provider.get_scores(sport_key)
-    for score_data in scores:
-        if not score_data.get("completed"):
-            continue
-
-        theoddsapi_id = score_data["external_id"]
-        match = await _db.db.matches.find_one({
-            "metadata.theoddsapi_id": theoddsapi_id,
-            "$or": [
-                {"status": {"$ne": "final"}},
-                {"status": "final", "result.outcome": None},
-            ],
-        })
-        if not match:
-            continue
-
-        await _resolve_match(
-            match, score_data["result"],
-            score_data.get("home_score", 0),
-            score_data.get("away_score", 0),
-        )

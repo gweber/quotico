@@ -26,7 +26,7 @@ export interface WarRoomConsensus {
 
 export interface WarRoomMatch {
   id: string;
-  sport_key: string;
+  league_id: number;
   home_team: string;
   away_team: string;
   match_date: string;

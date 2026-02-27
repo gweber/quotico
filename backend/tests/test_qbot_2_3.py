@@ -114,7 +114,7 @@ def test_decision_trace_inclusion():
         "_id": "test_strategy",
         "version": "v1",
         "generation": 1,
-        "sport_key": "all",
+        "league_id": None,
         "is_active": True,
         "is_shadow": False,
         "dna": {

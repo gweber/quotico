@@ -125,13 +125,13 @@ async def test_admin_matches_list_cache_hit_and_miss(monkeypatch):
                 {
                     "_id": match_id,
                     "league_id": league_id,
-                    "sport_key": "soccer_germany_bundesliga",
+                    "league_id": 82,
                     "home_team": "Bayern Munich",
                     "away_team": "RB Leipzig",
                     "match_date": datetime(2025, 8, 22, tzinfo=timezone.utc),
                     "status": "final",
                     "result": {"home_score": 2, "away_score": 1, "outcome": "1"},
-                    "odds_meta": {"updated_at": datetime(2025, 8, 21, tzinfo=timezone.utc)},
+                    "odds_meta": {"updated_at": datetime(2025, 8, 21, tzinfo=timezone.utc)},  # FIXME: ODDS_V3_BREAK — test uses odds_meta no longer produced by connector
                 }
             ]
         ),
@@ -213,7 +213,7 @@ async def test_override_logs_before_after(monkeypatch):
     match_doc = {
         "_id": match_id,
         "league_id": league_id,
-        "sport_key": "soccer_germany_bundesliga",
+        "league_id": 82,
         "home_team": "Bayern Munich",
         "away_team": "RB Leipzig",
         "match_date": datetime(2025, 8, 22, tzinfo=timezone.utc),

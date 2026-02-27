@@ -61,7 +61,7 @@ async def test_navigation_reads_from_league_registry_v3(monkeypatch):
             [
                 {
                     "_id": 1,
-                    "sport_key": "soccer_germany_bundesliga",
+                    "league_id": 82,
                     "name": "Bundesliga",
                     "country": "Germany",
                     "country_code": "DE",
@@ -71,7 +71,7 @@ async def test_navigation_reads_from_league_registry_v3(monkeypatch):
                 },
                 {
                     "_id": 2,
-                    "sport_key": "soccer_england_premier_league",
+                    "league_id": 8,
                     "name": "Premier League",
                     "country": "England",
                     "country_code": "GB",
@@ -81,7 +81,7 @@ async def test_navigation_reads_from_league_registry_v3(monkeypatch):
                 },
                 {
                     "_id": 3,
-                    "sport_key": "soccer_spain_la_liga",
+                    "league_id": 564,
                     "name": "La Liga",
                     "country": "Spain",
                     "country_code": "ES",
@@ -98,5 +98,5 @@ async def test_navigation_reads_from_league_registry_v3(monkeypatch):
     items = await league_service.get_active_navigation()
 
     assert len(items) == 1
-    assert items[0]["sport_key"] == "soccer_germany_bundesliga"
+    assert items[0]["league_id"] == "82"
     assert items[0]["name"] == "Bundesliga"

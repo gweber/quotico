@@ -10,7 +10,7 @@ export interface QTipOverall {
 }
 
 export interface QTipSportBreakdown {
-  sport_key: string;
+  league_id: number;
   total: number;
   correct: number;
   win_rate: number;
@@ -35,7 +35,7 @@ export interface QTipSignalBreakdown {
 
 export interface QTipResolvedTip {
   match_id: string;
-  sport_key: string;
+  league_id: number;
   home_team: string;
   away_team: string;
   match_date: string;
@@ -65,7 +65,7 @@ export function useQTipPerformance() {
     error.value = false;
     try {
       const url = sportKey
-        ? `/quotico-tips/public-performance?sport_key=${encodeURIComponent(sportKey)}`
+        ? `/quotico-tips/public-performance?league_id=${encodeURIComponent(sportKey)}`
         : "/quotico-tips/public-performance";
       data.value = await api.get<QTipPerformanceData>(url);
     } catch {

@@ -20,7 +20,7 @@ export interface QBotBet {
   match_id: string;
   home_team: string;
   away_team: string;
-  sport_key: string;
+  league_id: number;
   match_date: string;
   selection: string;
   locked_odds: number;
@@ -32,7 +32,7 @@ export interface QBotBet {
 }
 
 export interface QBotSportPerformance {
-  sport_key: string;
+  league_id: number;
   total: number;
   won: number;
   win_rate: number;
@@ -49,7 +49,7 @@ export interface QBotCandidate {
   match_id: string;
   home_team: string;
   away_team: string;
-  sport_key: string;
+  league_id: number;
   match_date: string;
   recommended_selection: string;
   confidence: number;

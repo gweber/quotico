@@ -24,7 +24,7 @@ interface LeagueFeatures {
 
 interface LeagueItem {
   id: string;
-  sport_key: string;
+  league_id: number;
   display_name: string;
   structure_type: "league" | "cup" | "tournament";
   season_start_month: number;
@@ -34,9 +34,6 @@ interface LeagueItem {
   is_active: boolean;
   features: LeagueFeatures;
   external_ids: Record<string, string>;
-  football_data_last_import_at: string | null;
-  football_data_last_import_season: string | null;
-  football_data_last_import_by: string | null;
 }
 
 interface LeagueListResponse {
@@ -44,10 +41,7 @@ interface LeagueListResponse {
 }
 
 type UnifiedIngestSource =
-  | "football_data_uk"
-  | "football_data"
-  | "openligadb"
-  | "theoddsapi"
+  | "sportmonks"
   | "matchday_sync"
   | "xg_enrichment";
 type AdminJobStatus = "queued" | "running" | "succeeded" | "failed" | "canceled";
@@ -62,7 +56,7 @@ interface UnifiedIngestState {
 interface UnifiedMatchIngestJobStartResponse {
   accepted: boolean;
   job_id: string;
-  league_id: string;
+  league_id: number;
   source: UnifiedIngestSource;
   season: string | number | null;
   dry_run: boolean;
@@ -135,10 +129,7 @@ const editState = reactive({
     odds_sync: false,
   } as LeagueFeatures,
   external_ids: {
-    theoddsapi: "",
-    openligadb: "",
-    football_data: "",
-    football_data_uk: "",
+    sportmonks: "",
     understat: "",
   },
 });
@@ -240,12 +231,9 @@ function importStatusLabel(status: AdminJobStatus): string {
 
 function unifiedSources(): Array<{ value: UnifiedIngestSource; label: string }> {
   return [
+    { value: "sportmonks", label: t("admin.leagues.unified_ingest.sources.sportmonks") },
     { value: "matchday_sync", label: t("admin.leagues.unified_ingest.sources.matchday_sync") },
     { value: "xg_enrichment", label: t("admin.leagues.unified_ingest.sources.xg_enrichment") },
-    { value: "football_data", label: t("admin.leagues.unified_ingest.sources.football_data") },
-    { value: "openligadb", label: t("admin.leagues.unified_ingest.sources.openligadb") },
-    { value: "football_data_uk", label: t("admin.leagues.unified_ingest.sources.football_data_uk") },
-    { value: "theoddsapi", label: t("admin.leagues.unified_ingest.sources.theoddsapi") },
   ];
 }
 
@@ -254,40 +242,23 @@ function defaultUnifiedSeason(league: LeagueItem): string {
 }
 
 function defaultUnifiedSource(league: LeagueItem): UnifiedIngestSource {
-  if (league.external_ids.football_data) return "football_data";
-  if (league.external_ids.openligadb) return "openligadb";
-  if (league.external_ids.football_data_uk) return "football_data_uk";
-  return "theoddsapi";
+  if (league.external_ids.sportmonks) return "sportmonks";
+  return "matchday_sync";
 }
 
 function sourceNeedsSeason(source: UnifiedIngestSource): boolean {
-  return source === "football_data" || source === "openligadb" || source === "football_data_uk" || source === "matchday_sync" || source === "xg_enrichment";
+  return source === "sportmonks" || source === "matchday_sync" || source === "xg_enrichment";
 }
 
 function sourceSeasonPlaceholder(source: UnifiedIngestSource): string {
-  if (source === "football_data_uk") return "2025 or 2526";
   if (source === "xg_enrichment") return "2025 or 2024-2025";
   return "2025";
 }
 
-function normalizeFootballDataUkSeason(input: string): string | null {
-  const raw = (input || "").trim();
-  if (!/^\d{4}$/.test(raw)) return null;
-  const year = Number(raw);
-  if (year >= 1900 && year <= 2100) {
-    const yy = String(year % 100).padStart(2, "0");
-    const yyNext = String((year + 1) % 100).padStart(2, "0");
-    return `${yy}${yyNext}`;
-  }
-  return raw;
-}
-
 function canUseUnifiedSource(league: LeagueItem, source: UnifiedIngestSource): boolean {
+  if (source === "sportmonks") return true;
   if (source === "matchday_sync") return true;
   if (source === "xg_enrichment") return isXgEligible(league);
-  if (source === "football_data") return Boolean(league.external_ids.football_data);
-  if (source === "openligadb") return Boolean(league.external_ids.openligadb);
-  if (source === "football_data_uk") return Boolean(league.external_ids.football_data_uk);
   return false;
 }
 
@@ -303,7 +274,6 @@ function unifiedSeasonPayload(league: LeagueItem): number | string | null {
   const seasonRaw = (state.seasonInput || "").trim();
   if (!seasonRaw) return null;
   if (source === "xg_enrichment") return seasonRaw;
-  if (source === "football_data_uk") return normalizeFootballDataUkSeason(seasonRaw);
   const parsed = Number(seasonRaw);
   if (!Number.isFinite(parsed)) return null;
   return Math.trunc(parsed);
@@ -315,7 +285,6 @@ function isUnifiedSeasonValid(league: LeagueItem): boolean {
   if (!sourceNeedsSeason(state.source)) return true;
   const seasonRaw = (state.seasonInput || "").trim();
   if (state.source === "xg_enrichment") return /^\d{4}(-\d{4})?$/.test(seasonRaw);
-  if (state.source === "football_data_uk") return /^\d{4}$/.test(seasonRaw);
   return /^\d{4}$/.test(seasonRaw);
 }
 
@@ -439,7 +408,7 @@ async function runUnifiedMatchIngest(league: LeagueItem, dryRun: boolean): Promi
       const start = await api.post<{ job_id: string }>(
         "/admin/enrich-xg/async",
         {
-          sport_key: league.sport_key,
+          league_id: league.league_id,
           season,
           dry_run: dryRun,
           force: false,
@@ -624,10 +593,7 @@ function openEditModal(league: LeagueItem): void {
     odds_sync: league.features.odds_sync,
   };
   editState.external_ids = {
-    theoddsapi: league.external_ids.theoddsapi || "",
-    openligadb: league.external_ids.openligadb || "",
-    football_data: league.external_ids.football_data || "",
-    football_data_uk: league.external_ids.football_data_uk || "",
+    sportmonks: league.external_ids.sportmonks || "",
     understat: league.external_ids.understat || "",
   };
   editOpen.value = true;
@@ -716,7 +682,7 @@ onUnmounted(() => {
                 <p class="text-xs text-text-muted">{{ league.country_code || t("admin.leagues.unknownCountry") }}</p>
               </td>
               <td class="px-3 py-3">
-                <span class="font-mono text-xs text-text-secondary">{{ league.sport_key }}</span>
+                <span class="font-mono text-xs text-text-secondary">{{ league.league_id }}</span>
               </td>
               <td class="px-3 py-3 text-text-primary">{{ league.current_season }}</td>
               <td class="px-3 py-3">
@@ -978,7 +944,7 @@ onUnmounted(() => {
       <div class="w-full max-w-2xl rounded-card border border-surface-3 bg-surface-0 p-5">
         <h2 class="text-lg font-semibold text-text-primary">{{ t("admin.leagues.modal.title") }}</h2>
         <p class="text-xs text-text-muted mt-1">
-          {{ selectedLeague?.sport_key }}
+          {{ selectedLeague?.league_id }}
         </p>
 
         <div class="grid md:grid-cols-3 gap-3 mt-4">
@@ -1071,33 +1037,9 @@ onUnmounted(() => {
           <h3 class="text-sm font-medium text-text-primary">{{ t("admin.leagues.modal.external_ids") }}</h3>
           <div class="grid md:grid-cols-4 gap-2 mt-2">
             <label class="text-xs text-text-secondary">
-              {{ t("admin.leagues.providers.theoddsapi") }}
+              {{ t("admin.leagues.providers.sportmonks") }}
               <input
-                v-model="editState.external_ids.theoddsapi"
-                type="text"
-                class="mt-1 w-full rounded-card border border-surface-3 bg-surface-1 px-3 py-2 text-sm text-text-primary"
-              />
-            </label>
-            <label class="text-xs text-text-secondary">
-              {{ t("admin.leagues.providers.openligadb") }}
-              <input
-                v-model="editState.external_ids.openligadb"
-                type="text"
-                class="mt-1 w-full rounded-card border border-surface-3 bg-surface-1 px-3 py-2 text-sm text-text-primary"
-              />
-            </label>
-            <label class="text-xs text-text-secondary">
-              {{ t("admin.leagues.providers.football_data") }}
-              <input
-                v-model="editState.external_ids.football_data"
-                type="text"
-                class="mt-1 w-full rounded-card border border-surface-3 bg-surface-1 px-3 py-2 text-sm text-text-primary"
-              />
-            </label>
-            <label class="text-xs text-text-secondary">
-              {{ t("admin.leagues.providers.football_data_uk") }}
-              <input
-                v-model="editState.external_ids.football_data_uk"
+                v-model="editState.external_ids.sportmonks"
                 type="text"
                 class="mt-1 w-full rounded-card border border-surface-3 bg-surface-1 px-3 py-2 text-sm text-text-primary"
               />

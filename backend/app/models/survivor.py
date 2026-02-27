@@ -19,7 +19,7 @@ class SurvivorEntryInDB(BaseModel):
     """One entry per user per squad per sport per season."""
     user_id: str
     squad_id: str
-    sport_key: str
+    league_id: int
     season: int
     status: str = "alive"  # alive | eliminated
     picks: list[SurvivorPick] = []

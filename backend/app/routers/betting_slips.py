@@ -69,7 +69,7 @@ async def create_draft(
         slip_type=body.type.value,
         squad_id=body.squad_id,
         matchday_id=body.matchday_id,
-        sport_key=body.sport_key,
+        league_id=body.league_id,
         funding=body.funding,
     )
     return slip_to_response(slip)
@@ -91,6 +91,7 @@ async def edit_selection(
         market=body.market,
         pick=body.pick,
         displayed_odds=body.displayed_odds,
+        reason=body.reason,
     )
     return slip_to_response(slip)
 

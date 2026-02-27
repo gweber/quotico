@@ -146,7 +146,7 @@ class _FakeAliasSuggestionsCollection:
 @pytest.fixture
 def registry_factory(monkeypatch):
     def _make(seed_docs):
-        async def _fake_get_league(_sport_key):
+        async def _fake_get_league(_league_id):
             return None
 
         fake_db = SimpleNamespace(teams=_FakeTeamsCollection(seed_docs))
@@ -222,19 +222,19 @@ async def test_sport_scoped_hit(registry_factory):
             "_id": arsenal_id,
             "normalized_name": normalize_team_name("Arsenal"),
             "display_name": "Arsenal",
-            "sport_key": "soccer_epl",
+            "league_id": 8,
             "aliases": [
                 {
                     "name": "Arsenal FC",
                     "normalized": normalize_team_name("Arsenal FC"),
-                    "sport_key": "soccer_epl",
+                    "league_id": 8,
                     "source": "seed",
                 }
             ],
         }
     ])
     await registry.initialize()
-    team_id = await registry.resolve("Arsenal FC", "soccer_epl")
+    team_id = await registry.resolve("Arsenal FC", "8")
     assert team_id == arsenal_id
 
 
@@ -246,19 +246,19 @@ async def test_global_unambiguous_hit(registry_factory):
             "_id": arsenal_id,
             "normalized_name": normalize_team_name("Arsenal"),
             "display_name": "Arsenal",
-            "sport_key": "soccer_epl",
+            "league_id": 8,
             "aliases": [
                 {
                     "name": "Arsenal FC",
                     "normalized": normalize_team_name("Arsenal FC"),
-                    "sport_key": "soccer_epl",
+                    "league_id": 8,
                     "source": "seed",
                 }
             ],
         }
     ])
     await registry.initialize()
-    team_id = await registry.resolve("Arsenal FC", "soccer_unknown_league")
+    team_id = await registry.resolve("Arsenal FC", "999999")
     assert team_id == arsenal_id
 
 
@@ -271,23 +271,23 @@ async def test_global_ambiguous_creates_review(registry_factory):
             "_id": madrid_id,
             "normalized_name": normalize_team_name("Real Madrid"),
             "display_name": "Real Madrid",
-            "sport_key": "soccer_spain_la_liga",
+            "league_id": 564,
             "aliases": [
-                {"name": "Real", "normalized": "real", "sport_key": "soccer_spain_la_liga", "source": "seed"}
+                {"name": "Real", "normalized": "real", "league_id": 564, "source": "seed"}
             ],
         },
         {
             "_id": sociedad_id,
             "normalized_name": normalize_team_name("Real Sociedad"),
             "display_name": "Real Sociedad",
-            "sport_key": "soccer_spain_la_liga",
+            "league_id": 564,
             "aliases": [
-                {"name": "Real", "normalized": "real", "sport_key": "soccer_spain_la_liga", "source": "seed"}
+                {"name": "Real", "normalized": "real", "league_id": 564, "source": "seed"}
             ],
         },
     ])
     await registry.initialize()
-    team_id = await registry.resolve("Real", "soccer_epl")
+    team_id = await registry.resolve("Real", "8")
     assert team_id not in (madrid_id, sociedad_id)
 
     team = await fake_db.teams.find_one({"_id": team_id})
@@ -301,8 +301,8 @@ async def test_global_ambiguous_creates_review(registry_factory):
 async def test_auto_create_idempotent(registry_factory):
     registry, _ = registry_factory([])
     await registry.initialize()
-    id1 = await registry.resolve("Unknown FC", "soccer_epl")
-    id2 = await registry.resolve("Unknown FC", "soccer_epl")
+    id1 = await registry.resolve("Unknown FC", "8")
+    id2 = await registry.resolve("Unknown FC", "8")
     assert id1 == id2
 
 
@@ -310,7 +310,7 @@ async def test_auto_create_idempotent(registry_factory):
 async def test_resolve_without_create_returns_none_on_miss(registry_factory):
     registry, fake_db = registry_factory([])
     await registry.initialize()
-    team_id = await registry.resolve("Unknown FC", "soccer_epl", create_if_missing=False)
+    team_id = await registry.resolve("Unknown FC", "8", create_if_missing=False)
     assert team_id is None
     assert len(fake_db.teams.docs) == 0
 
@@ -319,9 +319,9 @@ async def test_resolve_without_create_returns_none_on_miss(registry_factory):
 async def test_auto_create_updates_in_memory_index(registry_factory):
     registry, _ = registry_factory([])
     await registry.initialize()
-    team_id = await registry.resolve("Unknown FC", "soccer_epl")
+    team_id = await registry.resolve("Unknown FC", "8")
     normalized = normalize_team_name("Unknown FC")
-    assert registry.lookup_by_sport[(normalized, "soccer_epl")] == team_id
+    assert registry.lookup_by_league[(normalized, "8")] == team_id
 
 
 @pytest.mark.asyncio
@@ -332,7 +332,7 @@ async def test_resolve_by_external_id_hit(registry_factory):
             "_id": team_id,
             "normalized_name": normalize_team_name("Bayern Munich"),
             "display_name": "Bayern Munich",
-            "sport_key": "soccer_germany_bundesliga",
+            "league_id": 82,
             "aliases": [],
             "external_ids": {"openligadb": "40"},
         }
@@ -342,7 +342,7 @@ async def test_resolve_by_external_id_hit(registry_factory):
         source="openligadb",
         external_id="40",
         name="FC Bayern München",
-        sport_key="soccer_germany_bundesliga",
+        league_id=82,
     )
     assert resolved == team_id
 
@@ -355,7 +355,7 @@ async def test_resolve_by_external_id_conflict_returns_none(registry_factory):
             "_id": team_id,
             "normalized_name": normalize_team_name("Borussia Dortmund"),
             "display_name": "Borussia Dortmund",
-            "sport_key": "soccer_germany_bundesliga",
+            "league_id": 82,
             "aliases": [],
             "external_ids": {"openligadb": "7"},
         }
@@ -365,7 +365,7 @@ async def test_resolve_by_external_id_conflict_returns_none(registry_factory):
         source="openligadb",
         external_id="7",
         name="Bayern Munich",
-        sport_key="soccer_germany_bundesliga",
+        league_id=82,
         create_if_missing=True,
     )
     assert resolved is None
@@ -379,7 +379,7 @@ async def test_resolve_by_external_id_name_fallback_backfills_id(registry_factor
             "_id": team_id,
             "normalized_name": normalize_team_name("Bayern Munich"),
             "display_name": "Bayern Munich",
-            "sport_key": "soccer_germany_bundesliga",
+            "league_id": 82,
             "aliases": [],
         }
     ])
@@ -388,7 +388,7 @@ async def test_resolve_by_external_id_name_fallback_backfills_id(registry_factor
         source="openligadb",
         external_id="40",
         name="Bayern Munich",
-        sport_key="soccer_germany_bundesliga",
+        league_id=82,
         create_if_missing=True,
     )
     assert resolved == team_id
@@ -405,14 +405,14 @@ async def test_add_alias_adds_and_is_idempotent(registry_factory):
             "_id": team_id,
             "normalized_name": normalize_team_name("Arsenal"),
             "display_name": "Arsenal",
-            "sport_key": "soccer_epl",
+            "league_id": 8,
             "aliases": [],
         }
     ])
     await registry.initialize()
-    created = await registry.add_alias(team_id, "Arsenal FC", sport_key="soccer_epl", refresh_cache=False)
+    created = await registry.add_alias(team_id, "Arsenal FC", league_id=8, refresh_cache=False)
     assert created is True
-    created_again = await registry.add_alias(team_id, "Arsenal FC", sport_key="soccer_epl", refresh_cache=False)
+    created_again = await registry.add_alias(team_id, "Arsenal FC", league_id=8, refresh_cache=False)
     assert created_again is False
     updated = await fake_db.teams.find_one({"_id": team_id})
     assert updated is not None
@@ -438,7 +438,6 @@ async def test_record_alias_suggestion_dedupes_and_increments(monkeypatch, regis
     first_id = await registry.record_alias_suggestion(
         source="openligadb",
         raw_team_name="FC Pauli",
-        sport_key="soccer_germany_bundesliga",
         league_id=league_id,
         reason="unresolved_team",
         sample_ref={"match_external_id": "123", "side": "home"},
@@ -446,7 +445,6 @@ async def test_record_alias_suggestion_dedupes_and_increments(monkeypatch, regis
     second_id = await registry.record_alias_suggestion(
         source="openligadb",
         raw_team_name="FC Pauli",
-        sport_key="soccer_germany_bundesliga",
         league_id=league_id,
         reason="unresolved_team",
         sample_ref={"match_external_id": "456", "side": "away"},

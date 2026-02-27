@@ -20,7 +20,7 @@ from app.models.common import PyObjectId
 
 class TeamAlias(BaseModel):
     name: str
-    sport_key: str | None = None
+    league_id: int | None = None
 
 
 class Team(BaseModel):

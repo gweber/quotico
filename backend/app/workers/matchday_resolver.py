@@ -47,8 +47,8 @@ async def _inject_auto_bets(matchday: dict) -> None:
         return
 
     # Get all matches
-    matches = await _db.db.matches.find(
-        {"_id": {"$in": [ObjectId(mid) for mid in match_ids]}}
+    matches = await _db.db.matches_v3.find(
+        {"_id": {"$in": [int(mid) for mid in match_ids]}}
     ).to_list(length=len(match_ids))
 
     matches_by_id = {str(m["_id"]): m for m in matches}
@@ -156,5 +156,5 @@ async def _inject_auto_bets(matchday: dict) -> None:
     if injected_count > 0:
         logger.info(
             "Auto-bet injected %d predictions for %s (%s)",
-            injected_count, matchday.get("label"), matchday.get("sport_key"),
+            injected_count, matchday.get("label"), matchday.get("league_id"),
         )

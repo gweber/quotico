@@ -43,7 +43,7 @@ async def resolve_survivor_picks() -> None:
             if pick["result"] != "pending":
                 continue
 
-            match = await _db.db.matches.find_one({"_id": ObjectId(pick["match_id"])})
+            match = await _db.db.matches_v3.find_one({"_id": int(pick["match_id"])})
             if not match or match["status"] != "final" or not match.get("result", {}).get("outcome"):
                 continue
 

@@ -24,7 +24,6 @@ from pydantic import BaseModel
 import app.database as _db
 from app.services.historical_service import (
     build_match_context,
-    sport_keys_for,
 )
 from app.services.odds_meta_service import get_current_market
 from app.services.shared_gate_logic import can_signal_be_emitted
@@ -72,16 +71,7 @@ ALPHA_WEIGHT_FLOOR = 0.05    # Minimum weight — prevents blind start after sum
 DIXON_COLES_RHO_DEFAULT = -0.08  # Fallback rho for unlisted leagues
 
 # Per-league rho: defensive/tactical leagues need stronger (more negative) correction
-LEAGUE_RHO: dict[str, float] = {
-    "soccer_italy_serie_a":       -0.13,  # Tactical, many low-scoring draws
-    "soccer_spain_la_liga":       -0.10,  # Moderate defensive tendency
-    "soccer_epl":                 -0.07,  # Attacking, fewer 0-0s
-    "soccer_germany_bundesliga":  -0.08,  # Balanced
-    "soccer_germany_bundesliga2": -0.09,  # Slightly more defensive than BL1
-    "soccer_france_ligue_one":    -0.09,  # Defensive mid-table, similar to BL2
-    "soccer_netherlands_eredivisie": -0.06, # Attacking, open play
-    "soccer_portugal_primeira_liga": -0.10, # Moderate defensive tendency
-}
+LEAGUE_RHO: dict[int, float] = {}
 
 # Dixon-Coles stability — hard safety floor (not optimized)
 DIXON_COLES_ADJ_FLOOR = 0.10    # Correction factor never drops below this
@@ -113,12 +103,12 @@ def blend_goals(actual: float, xg: float | None, weight: float = XG_BLEND_WEIGHT
 # Engine config cache — calibrated params from optimizer (DB-backed)
 # ---------------------------------------------------------------------------
 
-_engine_config_cache: dict[str, dict] = {}
+_engine_config_cache: dict[int, dict] = {}
 _engine_config_expires: float = 0.0
 _ENGINE_CONFIG_TTL = 3600  # 1 hour
 
 
-async def _get_engine_params(sport_key: str) -> dict:
+async def _get_engine_params(league_id: int) -> dict:
     """Load calibrated parameters from DB, with in-memory cache + fallback.
 
     Returns dict with keys: rho, alpha_time_decay, alpha_weight_floor,
@@ -140,9 +130,9 @@ async def _get_engine_params(sport_key: str) -> dict:
             # Keep stale cache — connection errors are recoverable
         _engine_config_expires = now + _ENGINE_CONFIG_TTL
 
-    cfg = _engine_config_cache.get(sport_key, {})
+    cfg = _engine_config_cache.get(league_id, {})
     return {
-        "rho": cfg.get("rho", LEAGUE_RHO.get(sport_key, DIXON_COLES_RHO_DEFAULT)),
+        "rho": cfg.get("rho", LEAGUE_RHO.get(league_id, DIXON_COLES_RHO_DEFAULT)),
         "alpha_time_decay": cfg.get("alpha_time_decay", ALPHA_TIME_DECAY),
         "alpha_weight_floor": cfg.get("alpha_weight_floor", ALPHA_WEIGHT_FLOOR),
         "reliability": cfg.get("reliability"),
@@ -155,7 +145,7 @@ async def _get_engine_params(sport_key: str) -> dict:
 
 class QuoticoTipResponse(BaseModel):
     match_id: str
-    sport_key: str
+    league_id: int
     home_team: str
     away_team: str
     match_date: datetime
@@ -204,12 +194,12 @@ def _no_signal_bet(
 
     tip = {
         "match_id": str(match["_id"]),
-        "sport_key": match["sport_key"],
+        "league_id": match["league_id"],
         "home_team": match["home_team"],
         "away_team": match["away_team"],
         "home_team_id": match.get("home_team_id"),
         "away_team_id": match.get("away_team_id"),
-        "match_date": match["match_date"],
+        "start_at": match["start_at"],
         "recommended_selection": "-",
         "confidence": 0.0,
         "edge_pct": 0.0,
@@ -355,20 +345,20 @@ def compute_player_prediction(poisson: dict) -> dict:
 
 async def _get_rest_days(team_id: str, match_date: datetime) -> int:
     """Compute days since last competitive match (across ALL competitions)."""
-    last_match = await _db.db.matches.find_one(
+    last_match = await _db.db.matches_v3.find_one(
         {
             "$or": [{"home_team_id": team_id}, {"away_team_id": team_id}],
-            "status": "final",
-            "match_date": {"$lt": ensure_utc(match_date)},
+            "status": "FINISHED",
+            "start_at": {"$lt": ensure_utc(match_date)},
         },
-        {"match_date": 1},
-        sort=[("match_date", -1)],
+        {"start_at": 1},
+        sort=[("start_at", -1)],
     )
 
     if not last_match:
         return REST_DEFAULT_DAYS
 
-    delta = ensure_utc(match_date) - ensure_utc(last_match["match_date"])
+    delta = ensure_utc(match_date) - ensure_utc(last_match["start_at"])
     return max(delta.days, 0)
 
 
@@ -393,23 +383,23 @@ def _calculate_fatigue_penalty(home_rest: int, away_rest: int) -> tuple[float, f
 
 
 async def _get_league_averages(
-    sport_key: str,
-    related_keys: list[str],
+    league_id: int,
+    related_keys: list[int],
     *,
     before_date: datetime | None = None,
 ) -> tuple[float, float] | None:
     """Compute league average home/away goals from last 2 seasons of historical data.
 
-    Uses exact sport_key first (each league has different scoring patterns).
+    Uses exact league_id first (each league has different scoring patterns).
     Falls back to related_keys if the single league has < 50 matches.
     """
-    for filter_keys in ([sport_key], related_keys):
-        match_filter: dict = {"sport_key": {"$in": filter_keys}, "status": "final"}
+    for filter_keys in ([league_id], related_keys):
+        match_filter: dict = {"league_id": {"$in": filter_keys}, "status": "FINISHED"}
         if before_date:
-            match_filter["match_date"] = {"$lt": before_date}
+            match_filter["start_at"] = {"$lt": before_date}
         pipeline = [
             {"$match": match_filter},
-            {"$sort": {"match_date": -1}},
+            {"$sort": {"start_at": -1}},
             {"$limit": 1000},  # ~2 seasons of top-flight football
             {"$group": {
                 "_id": None,
@@ -418,7 +408,7 @@ async def _get_league_averages(
                 "count": {"$sum": 1},
             }},
         ]
-        results = await _db.db.matches.aggregate(pipeline).to_list(length=1)
+        results = await _db.db.matches_v3.aggregate(pipeline).to_list(length=1)
         if results and results[0]["count"] >= 50:
             count = results[0]["count"]
             return (
@@ -430,40 +420,40 @@ async def _get_league_averages(
 
 
 async def _get_team_home_matches(
-    team_id: str, related_keys: list[str], limit: int = N_TEAM_MATCHES,
+    team_id: str, related_keys: list[int], limit: int = N_TEAM_MATCHES,
     *, before_date: datetime | None = None,
 ) -> list[dict]:
     """Fetch team's last N home matches (goals scored/conceded)."""
-    query: dict = {"home_team_id": team_id, "sport_key": {"$in": related_keys}, "status": "final"}
+    query: dict = {"home_team_id": team_id, "league_id": {"$in": related_keys}, "status": "FINISHED"}
     if before_date:
-        query["match_date"] = {"$lt": before_date}
-    return await _db.db.matches.find(
+        query["start_at"] = {"$lt": before_date}
+    return await _db.db.matches_v3.find(
         query,
         {"_id": 0, "result.home_score": 1, "result.away_score": 1,
-         "result.home_xg": 1, "result.away_xg": 1, "match_date": 1},
-    ).sort("match_date", -1).to_list(length=limit)
+         "result.home_xg": 1, "result.away_xg": 1, "start_at": 1},
+    ).sort("start_at", -1).to_list(length=limit)
 
 
 async def _get_team_away_matches(
-    team_id: str, related_keys: list[str], limit: int = N_TEAM_MATCHES,
+    team_id: str, related_keys: list[int], limit: int = N_TEAM_MATCHES,
     *, before_date: datetime | None = None,
 ) -> list[dict]:
     """Fetch team's last N away matches (goals scored/conceded)."""
-    query: dict = {"away_team_id": team_id, "sport_key": {"$in": related_keys}, "status": "final"}
+    query: dict = {"away_team_id": team_id, "league_id": {"$in": related_keys}, "status": "FINISHED"}
     if before_date:
-        query["match_date"] = {"$lt": before_date}
-    return await _db.db.matches.find(
+        query["start_at"] = {"$lt": before_date}
+    return await _db.db.matches_v3.find(
         query,
         {"_id": 0, "result.home_score": 1, "result.away_score": 1,
-         "result.home_xg": 1, "result.away_xg": 1, "match_date": 1},
-    ).sort("match_date", -1).to_list(length=limit)
+         "result.home_xg": 1, "result.away_xg": 1, "start_at": 1},
+    ).sort("start_at", -1).to_list(length=limit)
 
 
 async def compute_poisson_probabilities(
     home_team_id: str,
     away_team_id: str,
-    sport_key: str,
-    related_keys: list[str],
+    league_id: int,
+    related_keys: list[int],
     *,
     match_date: datetime,
     h2h_lambdas: dict | None = None,
@@ -475,9 +465,9 @@ async def compute_poisson_probabilities(
     rest days, and rho used — or None if insufficient data.
     """
     # Load calibrated (or default) parameters for this league
-    params = await _get_engine_params(sport_key)
+    params = await _get_engine_params(league_id)
 
-    league_avgs = await _get_league_averages(sport_key, related_keys, before_date=before_date)
+    league_avgs = await _get_league_averages(league_id, related_keys, before_date=before_date)
     if not league_avgs:
         return None
 
@@ -501,12 +491,12 @@ async def compute_poisson_probabilities(
     # Home team attack/defense (from their home matches) — time-weighted, xG-blended
     home_goals_scored = [blend_goals(m["result"]["home_score"], m["result"].get("home_xg")) for m in home_home_matches]
     home_goals_conceded = [blend_goals(m["result"]["away_score"], m["result"].get("away_xg")) for m in home_home_matches]
-    home_match_dates = [m["match_date"] for m in home_home_matches]
+    home_match_dates = [m["start_at"] for m in home_home_matches]
 
     # Away team attack/defense (from their away matches) — time-weighted, xG-blended
     away_goals_scored = [blend_goals(m["result"]["away_score"], m["result"].get("away_xg")) for m in away_away_matches]
     away_goals_conceded = [blend_goals(m["result"]["home_score"], m["result"].get("home_xg")) for m in away_away_matches]
-    away_match_dates = [m["match_date"] for m in away_away_matches]
+    away_match_dates = [m["start_at"] for m in away_away_matches]
 
     home_attack = _time_weighted_average(
         home_goals_scored, home_match_dates, reference_date,
@@ -685,7 +675,7 @@ def compute_edge(true_prob: float, implied_prob: float) -> float:
 async def compute_momentum_score(
     team_id: str,
     form_matches: list[dict],
-    related_keys: list[str],
+    related_keys: list[int],
     *,
     before_date: datetime | None = None,
 ) -> dict:
@@ -728,7 +718,7 @@ async def compute_momentum_score(
 
 
 async def _get_opponent_strength_weight(
-    match: dict, team_id: str, related_keys: list[str],
+    match: dict, team_id: str, related_keys: list[int],
     *, before_date: datetime | None = None,
 ) -> float:
     """Estimate opponent strength from their historical odds."""
@@ -740,17 +730,17 @@ async def _get_opponent_strength_weight(
 
     # Look up the opponent's recent average odds (as home favorite indicator)
     opp_query: dict = {
-        "sport_key": {"$in": related_keys},
-        "status": "final",
+        "league_id": {"$in": related_keys},
+        "status": "FINISHED",
         "$or": [{"home_team_id": opponent_key}, {"away_team_id": opponent_key}],
         "odds_meta.markets.h2h.current": {"$exists": True, "$ne": {}},
     }
     if before_date:
-        opp_query["match_date"] = {"$lt": before_date}
-    recent = await _db.db.matches.find_one(
+        opp_query["start_at"] = {"$lt": before_date}
+    recent = await _db.db.matches_v3.find_one(
         opp_query,
         {"odds_meta.markets.h2h.current": 1},
-        sort=[("match_date", -1)],
+        sort=[("start_at", -1)],
     )
 
     if not recent:
@@ -793,9 +783,13 @@ async def detect_sharp_movement(
         "snapshot_count": 0,
     }
 
-    from bson import ObjectId
+    try:
+        fixture_id = int(match_id)
+    except (TypeError, ValueError):
+        default["snapshot_count"] = 0
+        return default
 
-    snap_query: dict = {"match_id": ObjectId(match_id), "market": "h2h"}
+    snap_query: dict = {"match_id": int(fixture_id), "market": "h2h"}
     if before_date:
         snap_query["snapshot_at"] = {"$lt": before_date}
     events = await _db.db.odds_events.find(
@@ -1017,7 +1011,7 @@ async def compute_kings_choice(match_id: str, *, before_date: datetime | None = 
 
 async def compute_team_evd(
     team_id: str,
-    related_keys: list[str],
+    related_keys: list[int],
     n: int = N_TEAM_MATCHES,
     *,
     before_date: datetime | None = None,
@@ -1037,21 +1031,21 @@ async def compute_team_evd(
             {"home_team_id": team_id},
             {"away_team_id": team_id},
         ],
-        "sport_key": {"$in": related_keys},
-        "status": "final",
+        "league_id": {"$in": related_keys},
+        "status": "FINISHED",
         "odds_meta.markets.h2h.current": {"$exists": True, "$ne": {}},
     }
     if before_date:
-        query["match_date"] = {"$lt": before_date}
+        query["start_at"] = {"$lt": before_date}
 
-    matches = await _db.db.matches.find(
+    matches = await _db.db.matches_v3.find(
         query,
         {
             "_id": 0, "home_team_id": 1, "away_team_id": 1,
             "result.home_score": 1, "result.away_score": 1, "result.outcome": 1,
             "odds_meta.markets.h2h.current": 1,
         },
-    ).sort("match_date", -1).to_list(length=n * 2)  # fetch extra, filter below
+    ).sort("start_at", -1).to_list(length=n * 2)  # fetch extra, filter below
 
     edges: list[float] = []
     btb_count = 0
@@ -1312,22 +1306,24 @@ def _build_justification(
 
 async def generate_quotico_tip(match: dict, *, before_date: datetime | None = None) -> dict:
     """Generate a QuoticoTip for a single match."""
-    sport_key = match["sport_key"]
+    league_id = match.get("league_id")
+    if not isinstance(league_id, int):
+        return _no_signal_bet(match, "league_id must be int")
     current_odds = get_current_market(match, "h2h")
 
     # Load engine params (includes reliability if analyzed)
-    engine_params = await _get_engine_params(sport_key)
+    engine_params = await _get_engine_params(league_id)
     # Reliability only for live tips, not backfill (prevents circular dependency)
     reliability = engine_params.get("reliability") if before_date is None else None
 
-    related_keys = sport_keys_for(sport_key)
+    related_keys = [league_id]
     home_team = match["home_team"]
     away_team = match["away_team"]
     match_id = str(match["_id"])
 
     team_registry = TeamRegistry.get()
-    home_team_id = match.get("home_team_id") or await team_registry.resolve(home_team, sport_key)
-    away_team_id = match.get("away_team_id") or await team_registry.resolve(away_team, sport_key)
+    home_team_id = match.get("home_team_id") or await team_registry.resolve(home_team, league_id)
+    away_team_id = match.get("away_team_id") or await team_registry.resolve(away_team, league_id)
     if not home_team_id or not away_team_id:
         missing = []
         if not home_team_id:
@@ -1337,7 +1333,12 @@ async def generate_quotico_tip(match: dict, *, before_date: datetime | None = No
         return _no_signal_bet(match, f"Team not resolved: {', '.join(missing)}")
 
     # Fetch H2H + form data (needed for both Poisson blend and momentum)
-    context = await build_match_context(home_team, away_team, sport_key, h2h_limit=10, form_limit=5, before_date=before_date)
+    context = await build_match_context(
+        int(home_team_id),
+        int(away_team_id),
+        h2h_limit=10,
+        form_limit=5,
+    )
     h2h_data = context.get("h2h")
     h2h_summary = h2h_data["summary"] if h2h_data else None
     h2h_matches = h2h_data["matches"] if h2h_data else []
@@ -1347,8 +1348,8 @@ async def generate_quotico_tip(match: dict, *, before_date: datetime | None = No
 
     # Tier 1: Dixon-Coles Poisson (with H2H blend + rest advantage)
     poisson = await compute_poisson_probabilities(
-        home_team_id, away_team_id, sport_key, related_keys,
-        match_date=match["match_date"], h2h_lambdas=h2h_lambdas, before_date=before_date,
+        home_team_id, away_team_id, league_id, related_keys,
+        match_date=match["start_at"], h2h_lambdas=h2h_lambdas, before_date=before_date,
     )
     if not poisson:
         return _no_signal_bet(match, "Insufficient historical data for Poisson model")
@@ -1384,7 +1385,7 @@ async def generate_quotico_tip(match: dict, *, before_date: datetime | None = No
     momentum_gap = abs(home_momentum["momentum_score"] - away_momentum["momentum_score"])
 
     # Tier 3: Sharp Movement
-    commence_time = match.get("match_date")
+    commence_time = match.get("start_at")
     sharp = await detect_sharp_movement(match_id, commence_time, before_date=before_date)
 
     # Bonus: King's Choice
@@ -1477,12 +1478,12 @@ async def generate_quotico_tip(match: dict, *, before_date: datetime | None = No
 
     return {
         "match_id": match_id,
-        "sport_key": sport_key,
+        "league_id": league_id,
         "home_team": match["home_team"],
         "away_team": match["away_team"],
         "home_team_id": match.get("home_team_id"),
         "away_team_id": match.get("away_team_id"),
-        "match_date": match["match_date"],
+        "start_at": match["start_at"],
         "recommended_selection": best_outcome,
         "confidence": round(confidence, 3),
         "raw_confidence": round(raw_confidence, 3),

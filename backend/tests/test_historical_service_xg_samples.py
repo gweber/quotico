@@ -44,8 +44,8 @@ class _MatchesCollection:
 
     @staticmethod
     def _matches_query(row: dict, query: dict) -> bool:
-        sport_filter = query.get("sport_key", {}).get("$in")
-        if sport_filter and row.get("sport_key") not in sport_filter:
+        sport_filter = query.get("league_id", {}).get("$in")
+        if sport_filter and row.get("league_id") not in sport_filter:
             return False
         if query.get("status") and row.get("status") != query.get("status"):
             return False
@@ -89,7 +89,7 @@ def _make_match(
         "away_team": "Away FC",
         "home_team_id": home_id,
         "away_team_id": away_id,
-        "sport_key": "soccer_germany_bundesliga",
+        "league_id": 82,
         "status": "final",
         "result": result,
     }
@@ -117,7 +117,7 @@ async def test_h2h_summary_includes_xg_samples_used_and_total(monkeypatch):
     monkeypatch.setattr(historical_service._db, "db", fake_db, raising=False)
 
     class _Registry:
-        async def resolve(self, name: str, _sport_key: str):
+        async def resolve(self, name: str, _league_id: str):
             return home_id if "Home" in name else away_id
 
     monkeypatch.setattr(historical_service.TeamRegistry, "get", staticmethod(lambda: _Registry()))
@@ -126,7 +126,7 @@ async def test_h2h_summary_includes_xg_samples_used_and_total(monkeypatch):
     result = await historical_service.build_match_context(
         home_team="Home FC",
         away_team="Away FC",
-        sport_key="soccer_germany_bundesliga",
+        league_id=82,
         h2h_limit=20,
         form_limit=5,
     )
@@ -150,7 +150,7 @@ async def test_h2h_summary_reports_zero_xg_samples_without_avg_fields(monkeypatc
     monkeypatch.setattr(historical_service._db, "db", fake_db, raising=False)
 
     class _Registry:
-        async def resolve(self, name: str, _sport_key: str):
+        async def resolve(self, name: str, _league_id: str):
             return home_id if "Home" in name else away_id
 
     monkeypatch.setattr(historical_service.TeamRegistry, "get", staticmethod(lambda: _Registry()))
@@ -159,7 +159,7 @@ async def test_h2h_summary_reports_zero_xg_samples_without_avg_fields(monkeypatc
     result = await historical_service.build_match_context(
         home_team="Home FC",
         away_team="Away FC",
-        sport_key="soccer_germany_bundesliga",
+        league_id=82,
         h2h_limit=20,
         form_limit=5,
     )

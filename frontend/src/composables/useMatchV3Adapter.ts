@@ -40,6 +40,7 @@ function statusIsFinal(value: unknown): boolean {
   return status === "FINAL" || status === "FINISHED" || status === "FT";
 }
 
+// FIXME: ODDS_V3_BREAK — reads summary_1x2 and updated_at from odds_meta which are no longer produced by connector
 export function toOddsSummary(match: MatchV3): OddsButtonVM[] {
   const summary = match.odds_meta?.summary_1x2;
   const mapFromSummary = (key: OddsButtonKey): OddsButtonVM => {

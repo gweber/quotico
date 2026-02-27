@@ -1,3 +1,10 @@
+<!--
+frontend/src/views/TeamDetailView.vue
+
+Purpose:
+    Public team profile detail including form, season stats, recent results, and
+    upcoming fixture odds context.
+-->
 <script setup lang="ts">
 import { onMounted, computed, ref } from "vue";
 import { useRoute, useRouter, RouterLink } from "vue-router";
@@ -7,7 +14,7 @@ import { useOddsTimeline, type OddsTimelineResponse } from "@/composables/useOdd
 import OddsTimelineChart from "@/components/OddsTimelineChart.vue";
 import { sportLabel } from "@/types/sports";
 
-const { t } = useI18n();
+const { t, locale } = useI18n();
 
 const route = useRoute();
 const router = useRouter();
@@ -29,13 +36,13 @@ function formColor(result: string): string {
 }
 
 function formLabel(result: string): string {
-  if (result === "W") return "Sieg";
-  if (result === "D") return "Unentschieden";
-  return "Niederlage";
+  if (result === "W") return t("teams.form.win");
+  if (result === "D") return t("teams.form.draw");
+  return t("teams.form.loss");
 }
 
 function formatDate(dateStr: string): string {
-  return new Date(dateStr).toLocaleDateString("de-DE", {
+  return new Date(dateStr).toLocaleDateString(locale.value, {
     day: "2-digit",
     month: "2-digit",
     year: "2-digit",
@@ -43,7 +50,7 @@ function formatDate(dateStr: string): string {
 }
 
 function formatDateTime(dateStr: string): string {
-  return new Date(dateStr).toLocaleString("de-DE", {
+  return new Date(dateStr).toLocaleString(locale.value, {
     weekday: "short",
     day: "2-digit",
     month: "2-digit",
@@ -55,7 +62,7 @@ function formatDateTime(dateStr: string): string {
 // Result indicator for a match relative to this team
 function matchResult(m: { home_team_id?: string; result: { home_score: number; away_score: number } }): string {
   if (!team.value) return "";
-  const isHome = m.home_team_id === team.value.team_key;
+  const isHome = m.home_team_id === team.value.team_id;
   const hg = m.result.home_score;
   const ag = m.result.away_score;
   if (hg === ag) return "D";
@@ -65,11 +72,11 @@ function matchResult(m: { home_team_id?: string; result: { home_score: number; a
 
 function opponent(m: { home_team?: string; away_team?: string; home_team_id?: string }): string {
   if (!team.value) return "";
-  return m.home_team_id === team.value.team_key ? (m.away_team || "") : (m.home_team || "");
+  return m.home_team_id === team.value.team_id ? (m.away_team || "") : (m.home_team || "");
 }
 
 function isHome(m: { home_team_id?: string }): boolean {
-  return m.home_team_id === team.value?.team_key;
+  return m.home_team_id === team.value?.team_id;
 }
 
 function opponentSlug(m: { home_team?: string; away_team?: string; home_team_id?: string }): string {
@@ -245,7 +252,7 @@ function getOddsEntries(m: { home_team: string; away_team: string; odds: Record<
               {{ matchResult(m) }}
             </span>
             <span class="text-text-muted w-16 shrink-0 tabular-nums">{{ formatDate(m.match_date) }}</span>
-            <span class="text-text-muted/60 w-3 shrink-0 text-center">{{ isHome(m) ? 'H' : 'A' }}</span>
+            <span class="text-text-muted/60 w-3 shrink-0 text-center">{{ isHome(m) ? t('teams.homeShort') : t('teams.awayShort') }}</span>
             <RouterLink
               :to="{ name: 'team-detail', params: { teamSlug: opponentSlug(m) } }"
               class="flex-1 truncate text-text-secondary hover:text-primary transition-colors"

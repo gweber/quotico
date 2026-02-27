@@ -6,7 +6,7 @@ from pydantic import BaseModel
 
 class LeagueConfig(BaseModel):
     """A single league configuration within a squad."""
-    sport_key: str
+    league_id: int
     game_mode: str  # classic | bankroll | survivor | over_under | fantasy | matchday
     config: Dict[str, Any] = {}
     activated_at: datetime
@@ -48,7 +48,7 @@ class SquadJoin(BaseModel):
 
 class LeagueConfigResponse(BaseModel):
     """League configuration returned to the client."""
-    sport_key: str
+    league_id: int
     game_mode: str
     config: Dict[str, Any] = {}
     activated_at: datetime
@@ -115,7 +115,7 @@ class WarRoomMember(BaseModel):
 
 class WarRoomMatch(BaseModel):
     id: str
-    sport_key: str
+    league_id: int
     home_team: str
     away_team: str
     match_date: datetime

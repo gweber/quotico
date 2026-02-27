@@ -9,11 +9,12 @@ import OddsButton from "./OddsButton.vue";
 import MatchHistory from "./MatchHistory.vue";
 import OddsTimelineToggle from "./OddsTimelineToggle.vue";
 import QuoticoTipBadge from "./QuoticoTipBadge.vue";
-import { useQuoticoTip } from "@/composables/useQuoticoTip";
+import type { QuoticoTip } from "@/composables/useQuoticoTip";
 import { getCachedUserBet } from "@/composables/useUserBets";
 import { countryFlag } from "@/types/sports";
 import { toOddsSummary, toOddsBadge, oddsValueBySelection, computeJusticeDiff } from "@/composables/useMatchV3Adapter";
 import type { MatchV3, OddsButtonKey } from "@/types/MatchV3";
+import type { MatchQtipSummary } from "@/types/persona";
 
 const { t, locale } = useI18n();
 const localeTag = computed(() => (locale.value === "en" ? "en-US" : "de-DE"));
@@ -21,8 +22,6 @@ const localeTag = computed(() => (locale.value === "en" ? "en-US" : "de-DE"));
 const props = defineProps<{
   match: Match;
 }>();
-
-const { data: quoticoTip, fetch: fetchTip } = useQuoticoTip();
 
 const auth = useAuthStore();
 const betslip = useBetSlipStore();
@@ -59,6 +58,11 @@ const awayScore = computed(
   () => liveScore.value?.away_score ?? props.match.result.away_score ?? 0
 );
 const liveMinute = computed(() => liveScore.value?.minute);
+const halfTime = computed(() => {
+  const ht = props.match.scores?.half_time;
+  if (ht?.home == null || ht?.away == null) return null;
+  return { home: ht.home, away: ht.away };
+});
 
 const countdown = computed(() => {
   if (!isUpcoming.value) return null;
@@ -76,7 +80,6 @@ const countdown = computed(() => {
 });
 
 onMounted(() => {
-  fetchTip(props.match.id);
   if (isUpcoming.value) {
     timer = setInterval(() => {
       now.value = Date.now();
@@ -140,6 +143,7 @@ const buttonsDisabled = computed(() => !isUpcoming.value || isExpired.value || !
 
 // Justice diff value indicator
 const justiceDiff = computed(() => computeJusticeDiff(props.match as unknown as MatchV3));
+// FIXME: ODDS_V3_BREAK — reads summary_1x2.home/away.avg for justice tooltips which is no longer produced by connector
 const justiceTooltipHome = computed(() => {
   const m = props.match as unknown as MatchV3;
   const xgH = m.teams?.home?.xg;
@@ -184,7 +188,7 @@ const formattedDate = computed(() => {
     minute: "2-digit",
   });
 });
-const leagueLabel = computed(() => props.match.league_name || props.match.sport_key);
+const leagueLabel = computed(() => props.match.league_name || props.match.league_id);
 const leagueFlag = computed(() => countryFlag(props.match.league_country));
 
 const statusLabel = computed(() => {
@@ -199,6 +203,18 @@ const statusClass = computed(() => {
   if (isLive.value) return "bg-danger-muted/20 text-danger animate-pulse";
   if (isPast.value) return "bg-surface-3 text-text-muted";
   return "bg-primary-muted/20 text-primary";
+});
+
+const qtipSummary = computed<MatchQtipSummary | null>(() => {
+  if (props.match.qtip_output_level !== "summary" || !props.match.qtip) return null;
+  return props.match.qtip as MatchQtipSummary;
+});
+
+const qtipFull = computed<QuoticoTip | null>(() => {
+  if (!props.match.qtip || (props.match.qtip_output_level !== "full" && props.match.qtip_output_level !== "experimental")) {
+    return null;
+  }
+  return props.match.qtip as unknown as QuoticoTip;
 });
 </script>
 
@@ -277,6 +293,9 @@ const statusClass = computed(() => {
         >
           <p class="text-sm">{{ homeScore }}</p>
           <p class="text-sm mt-1">{{ awayScore }}</p>
+          <p v-if="isCompleted && halfTime" class="text-[10px] text-text-muted mt-0.5">
+            ( {{ halfTime.home }}:{{ halfTime.away }} )
+          </p>
         </div>
       </div>
 
@@ -392,11 +411,19 @@ const statusClass = computed(() => {
 
     <!-- QuoticoTip value bet recommendation -->
     <QuoticoTipBadge
-      v-if="quoticoTip"
-      :tip="quoticoTip"
+      v-if="qtipFull"
+      :tip="qtipFull"
       :home-team="match.home_team"
       :away-team="match.away_team"
     />
+    <div
+      v-else-if="qtipSummary"
+      class="mt-2 rounded-lg border border-surface-3/60 bg-surface-2/60 px-2 py-1.5 text-xs text-text-secondary"
+    >
+      <span class="font-semibold text-primary">Q-Tip</span>
+      <span class="ml-2">{{ qtipSummary.recommended_selection }}</span>
+      <span class="ml-1 text-text-muted">({{ Math.round(qtipSummary.confidence * 100) }}%)</span>
+    </div>
     <p
       v-if="auth.isAdmin"
       class="absolute bottom-2 left-2 rounded border border-surface-3/70 bg-surface-2/80 px-1.5 py-0.5 text-[10px] font-mono text-text-muted"

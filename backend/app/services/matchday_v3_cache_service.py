@@ -21,8 +21,8 @@ from app.utils import ensure_utc, utcnow
 _COLLECTION = "v3_query_cache"
 
 
-def build_matchday_cache_key(*, sport_key: str, season_id: int | str) -> str:
-    return f"matchday:list:{str(sport_key).strip()}:{int(season_id)}"
+def build_matchday_cache_key(*, league_id: int, season_id: int | str) -> str:
+    return f"matchday:list:{int(league_id)}:{int(season_id)}"
 
 
 async def get_matchday_list_cache(*, cache_key: str) -> list[dict[str, Any]] | None:
@@ -68,4 +68,3 @@ async def invalidate_matchday_list_cache_for_season(*, season_id: int) -> int:
         {"kind": "matchday_list", "_id": {"$regex": f":{int(season_id)}$"}}
     )
     return int(result.deleted_count or 0)
-

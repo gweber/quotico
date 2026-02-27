@@ -15,16 +15,16 @@ leakage.  The live ``engine_config`` document is never modified.
 
 Usage:
     # Single league, monthly snapshots:
-    python -m tools.engine_time_machine --sport soccer_germany_bundesliga
+    python -m tools.engine_time_machine --league-id 82
 
     # All leagues, quarterly, with reliability:
     python -m tools.engine_time_machine --interval-days 90 --with-reliability
 
     # Resume an interrupted run (auto-detects last snapshot):
-    python -m tools.engine_time_machine --sport soccer_germany_bundesliga
+    python -m tools.engine_time_machine --league-id 82
 
     # Dry run (no DB writes):
-    python -m tools.engine_time_machine --sport soccer_germany_bundesliga --dry-run
+    python -m tools.engine_time_machine --league-id 82 --dry-run
 """
 
 import argparse
@@ -84,10 +84,10 @@ def _get_rbs(snapshot: dict | None) -> float | None:
     return float(val) if val is not None else None
 
 
-def _snapshot_match_query(sport_key: str, step_date: datetime, window_days: int) -> dict:
+def _snapshot_match_query(league_id: int, step_date: datetime, window_days: int) -> dict:
     """Strict temporal-safe match query for snapshot analytics."""
     return {
-        "sport_key": sport_key,
+        "league_id": league_id,
         "status": "FINISHED",
         "start_at": {
             "$gte": step_date - timedelta(days=window_days),
@@ -274,7 +274,7 @@ def _extract_market_uncertainty(match: dict) -> float | None:
 
 
 def _build_snapshot_doc(
-    sport_key: str,
+    league_id: int,
     step_date: datetime,
     *,
     source: str,
@@ -301,7 +301,7 @@ def _build_snapshot_doc(
     if extra_meta:
         meta.update(extra_meta)
     return {
-        "sport_key": sport_key,
+        "league_id": league_id,
         "snapshot_date": step_date,
         "params": params,
         "scores": scores,
@@ -314,14 +314,14 @@ def _build_snapshot_doc(
 async def _load_snapshot_matches(
     db,
     *,
-    sport_key: str,
+    league_id: int,
     step_date: datetime,
     window_days: int,
 ) -> list[dict]:
-    query = _snapshot_match_query(sport_key, step_date, window_days)
+    query = _snapshot_match_query(league_id, step_date, window_days)
     projection = {
         "_id": 1,
-        "sport_key": 1,
+        "league_id": 1,
         "start_at": 1,
         "updated_at_utc": 1,
         "referee_id": 1,
@@ -714,7 +714,7 @@ def _build_xp_table(matches: list[dict]) -> dict:
 async def _export_justice_table_to_mongo(
     db,
     *,
-    sport_key: str,
+    league_id: int,
     step_date: datetime,
     window_days: int,
     matches: list[dict],
@@ -726,7 +726,7 @@ async def _export_justice_table_to_mongo(
     if dry_run:
         return False
     doc = {
-        "sport_key": sport_key,
+        "league_id": league_id,
         "snapshot_date": step_date,
         "window_start": step_date - timedelta(days=window_days),
         "window_end": step_date,
@@ -739,18 +739,18 @@ async def _export_justice_table_to_mongo(
         },
     }
     await db.engine_time_machine_justice.update_one(
-        {"sport_key": sport_key, "snapshot_date": step_date},
+        {"league_id": league_id, "snapshot_date": step_date},
         {"$set": doc},
         upsert=True,
     )
     return True
 
 
-async def _find_earliest_match(db, sport_key: str) -> datetime | None:
+async def _find_earliest_match(db, league_id: int) -> datetime | None:
     """Find the earliest resolved match with odds for a league."""
     earliest = await db.matches_v3.find_one(
         {
-            "sport_key": sport_key,
+            "league_id": league_id,
             "status": "FINISHED",
             "odds_meta.markets.h2h.current.1": {"$gt": 0},
             "odds_meta.markets.h2h.current.X": {"$gt": 0},
@@ -766,11 +766,11 @@ async def _find_earliest_match(db, sport_key: str) -> datetime | None:
     return None
 
 
-async def _find_latest_snapshot(db, sport_key: str) -> datetime | None:
+async def _find_latest_snapshot(db, league_id: int) -> datetime | None:
     """Find the most recent snapshot date for resume logic."""
     latest = await db.engine_config_history.find_one(
         {
-            "sport_key": sport_key,
+            "league_id": league_id,
             "$or": [
                 {"meta.source": {"$in": ["time_machine", "time_machine_carry_forward"]}},
                 {"meta.is_retroactive": True},
@@ -787,13 +787,13 @@ async def _find_latest_snapshot(db, sport_key: str) -> datetime | None:
 
 async def _clear_retro_snapshots(
     db,
-    sport_key: str,
+    league_id: int,
     *,
     dry_run: bool,
 ) -> int:
     """Delete only retro time-machine snapshots for a league."""
     query = {
-        "sport_key": sport_key,
+        "league_id": league_id,
         "$or": [
             {"meta.source": {"$in": ["time_machine", "time_machine_carry_forward"]}},
             {"meta.is_retroactive": True},
@@ -806,7 +806,7 @@ async def _clear_retro_snapshots(
 
 
 async def _process_league_inner(
-    sport_key: str,
+    league_id: int,
     interval_days: int,
     mode: str,
     dry_run: bool,
@@ -830,28 +830,28 @@ async def _process_league_inner(
     now = utcnow()
 
     # Determine start date
-    earliest = await _find_earliest_match(db, sport_key)
+    earliest = await _find_earliest_match(db, league_id)
     if not earliest:
-        log.warning("  %s: no eligible matches found — skipping", sport_key)
-        return {"sport_key": sport_key, "status": "no_data"}
+        log.warning("  %s: no eligible matches found — skipping", league_id)
+        return {"league_id": league_id, "status": "no_data"}
 
     # Need at least 1 year of data for the first calibration window
     first_viable = earliest + timedelta(days=365)
     if first_viable >= now:
         log.warning("  %s: not enough history (earliest=%s) — skipping",
-                    sport_key, earliest.strftime("%Y-%m-%d"))
-        return {"sport_key": sport_key, "status": "insufficient_history",
+                    league_id, earliest.strftime("%Y-%m-%d"))
+        return {"league_id": league_id, "status": "insufficient_history",
                 "earliest": earliest.isoformat()}
 
     # Resume from last snapshot if available
-    latest_snapshot = await _find_latest_snapshot(db, sport_key)
+    latest_snapshot = await _find_latest_snapshot(db, league_id)
     if latest_snapshot:
         if interval_days == 30:
             start = _month_start(_add_months(latest_snapshot, 1))
         else:
             start = latest_snapshot + timedelta(days=interval_days)
         log.info("  %s: resuming from %s (last snapshot: %s)",
-                 sport_key, start.strftime("%Y-%m-%d"),
+                 league_id, start.strftime("%Y-%m-%d"),
                  latest_snapshot.strftime("%Y-%m-%d"))
     else:
         if interval_days == 30:
@@ -861,7 +861,7 @@ async def _process_league_inner(
         else:
             start = first_viable
         log.info("  %s: starting from %s (earliest match: %s)",
-                 sport_key, start.strftime("%Y-%m-%d"),
+                 league_id, start.strftime("%Y-%m-%d"),
                  earliest.strftime("%Y-%m-%d"))
 
     # Generate date steps
@@ -878,14 +878,14 @@ async def _process_league_inner(
             current += timedelta(days=interval_days)
 
     if not steps:
-        log.info("  %s: already up to date", sport_key)
-        return {"sport_key": sport_key, "status": "up_to_date",
+        log.info("  %s: already up to date", league_id)
+        return {"league_id": league_id, "status": "up_to_date",
                 "last_snapshot": latest_snapshot.isoformat() if latest_snapshot else None}
     if max_snapshots and max_snapshots > 0:
         steps = steps[:max_snapshots]
 
     log.info("  %s: %d snapshots to compute (%s → %s)",
-             sport_key, len(steps),
+             league_id, len(steps),
              steps[0].strftime("%Y-%m-%d"),
              steps[-1].strftime("%Y-%m-%d"))
 
@@ -897,7 +897,7 @@ async def _process_league_inner(
 
     existing_snapshots = await db.engine_config_history.find(
         {
-            "sport_key": sport_key,
+            "league_id": league_id,
             "$or": [
                 {"meta.source": {"$in": ["time_machine", "time_machine_carry_forward"]}},
                 {"meta.is_retroactive": True},
@@ -932,14 +932,14 @@ async def _process_league_inner(
 
             try:
                 result = await asyncio.wait_for(
-                    calibrate_league(sport_key, mode=effective_mode, before_date=step_date),
+                    calibrate_league(league_id, mode=effective_mode, before_date=step_date),
                     timeout=300,
                 )
             except asyncio.TimeoutError:
                 errors += 1
                 log.error(
                     "  [%d/%d] %s @ %s: TIMEOUT (300s)",
-                    i, len(steps), sport_key, step_date.strftime("%Y-%m-%d"),
+                    i, len(steps), league_id, step_date.strftime("%Y-%m-%d"),
                 )
                 continue
 
@@ -948,7 +948,7 @@ async def _process_league_inner(
                 carried = False
                 if prev_snapshot:
                     carry_doc = _build_snapshot_doc(
-                        sport_key,
+                        league_id,
                         step_date,
                         source="time_machine_carry_forward",
                         status=f"carry_forward_{status}",
@@ -962,7 +962,7 @@ async def _process_league_inner(
                     )
                     if not dry_run:
                         await db.engine_config_history.update_one(
-                            {"sport_key": sport_key, "snapshot_date": step_date},
+                            {"league_id": league_id, "snapshot_date": step_date},
                             {"$set": carry_doc},
                             upsert=True,
                         )
@@ -973,7 +973,7 @@ async def _process_league_inner(
                     snapshots_skipped += 1
                 log.info(
                     "  [%d/%d] %s @ %s: %s (N=%s)%s",
-                    i, len(steps), sport_key, step_date.strftime("%Y-%m-%d"),
+                    i, len(steps), league_id, step_date.strftime("%Y-%m-%d"),
                     status.upper(),
                     result.get("matches") or result.get("data_points") or "?",
                     " [carried]" if carried else "",
@@ -995,7 +995,7 @@ async def _process_league_inner(
 
             if quality_reject and prev_snapshot:
                 carry_doc = _build_snapshot_doc(
-                    sport_key,
+                    league_id,
                     step_date,
                     source="time_machine_carry_forward",
                     status="carry_forward_quality_gate",
@@ -1016,7 +1016,7 @@ async def _process_league_inner(
                 )
                 if not dry_run:
                     await db.engine_config_history.update_one(
-                        {"sport_key": sport_key, "snapshot_date": step_date},
+                        {"league_id": league_id, "snapshot_date": step_date},
                         {"$set": carry_doc},
                         upsert=True,
                     )
@@ -1024,7 +1024,7 @@ async def _process_league_inner(
                 snapshots_carried += 1
                 log.info(
                     "  [%d/%d] %s @ %s: QUALITY-GATE (%s) [carried]",
-                    i, len(steps), sport_key, step_date.strftime("%Y-%m-%d"), quality_reason,
+                    i, len(steps), league_id, step_date.strftime("%Y-%m-%d"), quality_reason,
                 )
                 continue
 
@@ -1040,7 +1040,7 @@ async def _process_league_inner(
             if with_market_beat or with_xg_justice or export_justice_table:
                 window_matches = await _load_snapshot_matches(
                     db,
-                    sport_key=sport_key,
+                    league_id=league_id,
                     step_date=step_date,
                     window_days=CALIBRATION_WINDOW_DAYS,
                 )
@@ -1068,7 +1068,7 @@ async def _process_league_inner(
                     team_efficiency_dna = _compute_team_efficiency_dna(window_matches)
 
             snapshot = _build_snapshot_doc(
-                sport_key,
+                league_id,
                 step_date,
                 source="time_machine",
                 status="calibrated",
@@ -1121,7 +1121,7 @@ async def _process_league_inner(
                 try:
                     from app.services.reliability_service import analyze_engine_reliability
                     rel = await analyze_engine_reliability(
-                        sport_key, before_date=step_date,
+                        league_id, before_date=step_date,
                     )
                     if rel:
                         snapshot["reliability"] = {
@@ -1132,18 +1132,18 @@ async def _process_league_inner(
                         }
                 except Exception:
                     log.debug("  Reliability analysis failed for %s @ %s",
-                              sport_key, step_date.strftime("%Y-%m-%d"))
+                              league_id, step_date.strftime("%Y-%m-%d"))
 
             if not dry_run:
                 await db.engine_config_history.update_one(
-                    {"sport_key": sport_key, "snapshot_date": step_date},
+                    {"league_id": league_id, "snapshot_date": step_date},
                     {"$set": snapshot},
                     upsert=True,
                 )
                 if export_justice_table:
                     exported = await _export_justice_table_to_mongo(
                         db,
-                        sport_key=sport_key,
+                        league_id=league_id,
                         step_date=step_date,
                         window_days=CALIBRATION_WINDOW_DAYS,
                         matches=window_matches,
@@ -1151,7 +1151,7 @@ async def _process_league_inner(
                     )
                     if exported:
                         await db.engine_config_history.update_one(
-                            {"sport_key": sport_key, "snapshot_date": step_date},
+                            {"league_id": league_id, "snapshot_date": step_date},
                             {"$set": {"meta.justice_exported": True}},
                         )
                         snapshot["meta"]["justice_exported"] = True
@@ -1171,7 +1171,7 @@ async def _process_league_inner(
             log.info(
                 "  [%d/%d] %s @ %s: ρ=%.2f α=%.3f floor=%.2f  "
                 "BS=%.4f%s%s  (N=%d, %.1fs)%s [mode=%s]",
-                i, len(steps), sport_key,
+                i, len(steps), league_id,
                 step_date.strftime("%Y-%m-%d"),
                 result["rho"], result["alpha"], result["floor"],
                 result["pure_brier"],
@@ -1185,15 +1185,15 @@ async def _process_league_inner(
             step_elapsed = time.monotonic() - step_t0
             errors += 1
             log.error("  [%d/%d] %s @ %s: ERROR: %s (%.1fs)",
-                      i, len(steps), sport_key,
+                      i, len(steps), league_id,
                       step_date.strftime("%Y-%m-%d"), e, step_elapsed)
 
     total_elapsed = time.monotonic() - t0
     log.info("  %s: done — %d written, %d carried, %d skipped, %d errors (%.1fs total)",
-             sport_key, snapshots_written, snapshots_carried, snapshots_skipped, errors, total_elapsed)
+             league_id, snapshots_written, snapshots_carried, snapshots_skipped, errors, total_elapsed)
 
     return {
-        "sport_key": sport_key,
+        "league_id": league_id,
         "status": "completed",
         "snapshots_written": snapshots_written,
         "snapshots_carried": snapshots_carried,
@@ -1204,7 +1204,7 @@ async def _process_league_inner(
 
 
 def _process_league_sync(
-    sport_key: str,
+    league_id: int,
     interval_days: int,
     mode: str,
     dry_run: bool,
@@ -1224,7 +1224,7 @@ def _process_league_sync(
         try:
             result = loop.run_until_complete(
                 _process_league_inner(
-                    sport_key=sport_key,
+                    league_id=league_id,
                     interval_days=interval_days,
                     mode=mode,
                     dry_run=dry_run,
@@ -1245,7 +1245,7 @@ def _process_league_sync(
 
 
 async def run_time_machine(
-    sport_key: str | None,
+    league_id: int | None,
     interval_days: int,
     mode: str,
     dry_run: bool,
@@ -1259,13 +1259,13 @@ async def run_time_machine(
     max_snapshots: int,
 ) -> None:
     import app.database as _db
-    from app.services.optimizer_service import CALIBRATED_LEAGUES
+    from app.services.optimizer_service import _get_calibrated_league_ids
 
     await _db.connect_db()
     try:
         log.info("Connected to MongoDB: %s", _db.db.name)
 
-        target_leagues = [sport_key] if sport_key else CALIBRATED_LEAGUES
+        target_leagues = [league_id] if league_id is not None else await _get_calibrated_league_ids()
         if len(target_leagues) != len(set(target_leagues)):
             log.warning("Duplicate leagues detected in target set — de-duplicating")
         target_leagues = list(dict.fromkeys(target_leagues))
@@ -1364,8 +1364,17 @@ def main():
     parser = argparse.ArgumentParser(
         description="Engine Time Machine — retroactive calibration across historical data",
     )
-    parser.add_argument("--sport", type=str, default=None,
-                        help="Filter to one sport_key (default: all calibrated leagues)")
+    if "--sport" in sys.argv:
+        parser.error(
+            "Error: --sport is deprecated. Use --league-id <int>. "
+            "Example: --league-id 82 (Bundesliga)."
+        )
+    parser.add_argument(
+        "--league-id",
+        type=int,
+        default=None,
+        help="Filter to one league_id (int, Sportmonks league id)",
+    )
     parser.add_argument("--interval-days", type=int, default=30,
                         help="Step size in days (default: 30 = monthly)")
     parser.add_argument("--mode", type=str, default=DEFAULT_MODE,
@@ -1393,7 +1402,7 @@ def main():
     args = parser.parse_args()
 
     asyncio.run(run_time_machine(
-        sport_key=args.sport,
+        league_id=args.league_id,
         interval_days=args.interval_days,
         mode=args.mode,
         dry_run=args.dry_run,

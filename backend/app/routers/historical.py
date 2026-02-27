@@ -89,7 +89,7 @@ class MatchStats(BaseModel):
 
 
 class HistoricalMatch(BaseModel):
-    sport_key: str
+    league_id: int
     league_code: str
     season: str
     season_label: str
@@ -119,7 +119,7 @@ class ImportResult(BaseModel):
 
 
 class TeamAlias(BaseModel):
-    sport_key: str
+    league_id: int
     team_name: str
 
 
@@ -142,6 +142,9 @@ async def import_matches(batch: ImportBatch, _=Depends(verify_import_key)):
 
     for m in batch.matches:
         doc = m.model_dump(exclude_none=True)
+        if not isinstance(doc.get("league_id"), int):
+            logger.warning("Historical import rejected non-int league_id: value=%r", doc.get("league_id"))
+            raise HTTPException(status_code=400, detail="league_id must be int.")
 
         home_goals = doc.pop("home_goals", 0)
         away_goals = doc.pop("away_goals", 0)
@@ -177,16 +180,16 @@ async def import_matches(batch: ImportBatch, _=Depends(verify_import_key)):
             doc["over_under_odds"] = {bk: dict(v) for bk, v in doc["over_under_odds"].items()}
 
         doc["updated_at"] = now
-        doc["match_date_hour"] = _normalize_match_date(doc["match_date"])
+        doc["match_date_hour"] = _normalize_match_date(doc["start_at"])
 
-        home_team_id = await registry.resolve(doc["home_team"], doc["sport_key"])
-        away_team_id = await registry.resolve(doc["away_team"], doc["sport_key"])
+        home_team_id = await registry.resolve(doc["home_team"], doc["league_id"])
+        away_team_id = await registry.resolve(doc["away_team"], doc["league_id"])
         doc["home_team_id"] = home_team_id
         doc["away_team_id"] = away_team_id
 
         ops.append(UpdateOne(
             {
-                "sport_key": doc["sport_key"],
+                "league_id": doc["league_id"],
                 "season": doc["season"],
                 "home_team_id": home_team_id,
                 "away_team_id": away_team_id,
@@ -202,7 +205,7 @@ async def import_matches(batch: ImportBatch, _=Depends(verify_import_key)):
     if not ops:
         return ImportResult(received=0, upserted=0, modified=0)
 
-    result = await _db.db.matches.bulk_write(ops, ordered=False)
+    result = await _db.db.matches_v3.bulk_write(ops, ordered=False)
     logger.info(
         "Historical import: %d received, %d upserted, %d modified",
         len(batch.matches), result.upserted_count, result.modified_count,
@@ -230,14 +233,14 @@ async def import_aliases(batch: AliasBatch, _=Depends(verify_import_key)):
         if not normalized_name:
             continue
         ops.append(UpdateOne(
-            {"normalized_name": normalized_name, "sport_key": alias.sport_key},
+            {"normalized_name": normalized_name, "league_id": alias.league_id},
             {
                 "$addToSet": {
-                    "aliases": {"name": alias.team_name, "sport_key": alias.sport_key},
+                    "aliases": {"name": alias.team_name, "league_id": alias.league_id},
                 },
                 "$setOnInsert": {
                     "normalized_name": normalized_name,
-                    "sport_key": alias.sport_key,
+                    "league_id": alias.league_id,
                     "display_name": alias.team_name,
                     "needs_review": False,
                     "created_at": now,

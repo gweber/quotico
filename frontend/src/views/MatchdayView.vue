@@ -5,9 +5,11 @@ import { useRoute, useRouter } from "vue-router";
 import { useMatchdayStore } from "@/stores/matchday";
 import { useAuthStore } from "@/stores/auth";
 import { useSquadsStore, type Squad } from "@/stores/squads";
+import { useLeagueStore } from "@/stores/leagues";
 import { useWalletStore } from "@/stores/wallet";
 import { useSurvivorStore } from "@/stores/survivor";
 import { useFantasyStore } from "@/stores/fantasy";
+import { useToast } from "@/composables/useToast";
 import { refreshQuoticoTips } from "@/composables/useQuoticoTip";
 import MatchdayMatchCard from "@/components/MatchdayMatchCard.vue";
 import SeasonTrack from "@/components/SeasonTrack.vue";
@@ -32,19 +34,26 @@ const router = useRouter();
 const matchday = useMatchdayStore();
 const auth = useAuthStore();
 const squadsStore = useSquadsStore();
+const leagueStore = useLeagueStore();
 const walletStore = useWalletStore();
 const survivorStore = useSurvivorStore();
 const fantasyStore = useFantasyStore();
+const toast = useToast();
 
 import { SPORT_LABELS } from "@/types/sports";
 import { GAME_MODE_I18N_KEYS } from "@/types/league";
 
 const sportLabels = SPORT_LABELS;
+const globalSports = computed(() =>
+  leagueStore.navigation.map((item) => ({
+    league_id: item.league_id,
+    label: item.name,
+    matchdays_per_season: 0,
+  }))
+);
 
 // Sport selector
-const selectedSport = ref(
-  (route.params.sport as string) || "soccer_germany_bundesliga"
-);
+const selectedSport = ref<number>(Number(route.params.leagueId) || 0);
 
 // Squad selector
 const selectedSquad = ref<Squad | null>(null);
@@ -72,15 +81,20 @@ const matchdaySquads = computed(() =>
 
 // Filter sports to only those configured in the selected squad
 const availableSports = computed(() => {
-  if (!selectedSquad.value?.league_configs?.length) return matchday.sports;
+  if (!selectedSquad.value?.league_configs?.length) return globalSports.value;
   const configured = new Set(
     selectedSquad.value.league_configs
       .filter((lc) => !lc.deactivated_at)
-      .map((lc) => lc.sport_key)
+      .map((lc) => lc.league_id)
   );
-  if (configured.size === 0) return matchday.sports;
-  return matchday.sports.filter((s) => configured.has(s.sport_key));
+  if (configured.size === 0) return globalSports.value;
+  return globalSports.value.filter((s) => configured.has(s.league_id));
 });
+
+const hasGlobalLeagues = computed(() => globalSports.value.length > 0);
+const hasSquadFilteredLeagues = computed(() =>
+  !selectedSquad.value || availableSports.value.length > 0
+);
 
 // Determine which matchday is selected
 const selectedMatchdayId = ref<string | null>(null);
@@ -101,7 +115,7 @@ const refreshingTips = ref(false);
 async function handleRefreshTips() {
   refreshingTips.value = true;
   try {
-    await refreshQuoticoTips(selectedSport.value);
+    await refreshQuoticoTips(selectedSport.value || undefined);
   } finally {
     refreshingTips.value = false;
   }
@@ -119,11 +133,48 @@ const parlayAvailable = computed(() =>
 );
 
 const totalMatchdays = computed(() => {
-  const sport = matchday.sports.find((s) => s.sport_key === selectedSport.value);
+  const sport = availableSports.value.find((s) => s.league_id === selectedSport.value);
   return sport?.matchdays_per_season ?? matchday.matchdays.length;
 });
 
-async function loadSport(sport: string, fromRoute = false) {
+async function ensureValidLeagueSelection(toastOnRedirect = false): Promise<boolean> {
+  const allowed = availableSports.value;
+  if (allowed.length === 0) {
+    selectedSport.value = 0;
+    selectedMatchdayId.value = null;
+    matchday.currentMatchday = null;
+    matchday.matchdays = [];
+    matchday.matches = [];
+    return false;
+  }
+
+  const currentLeagueId = Number(selectedSport.value);
+  const nextLeagueId = allowed.some((item) => item.league_id === currentLeagueId)
+    ? currentLeagueId
+    : allowed[0].league_id;
+
+  const routeLeagueId = Number(route.params.leagueId);
+  const shouldReplace =
+    !Number.isFinite(routeLeagueId) ||
+    routeLeagueId <= 0 ||
+    routeLeagueId !== nextLeagueId;
+
+  selectedSport.value = nextLeagueId;
+  if (shouldReplace) {
+    await router.replace({
+      params: {
+        leagueId: String(nextLeagueId),
+        matchday: route.params.matchday ? String(route.params.matchday) : undefined,
+      },
+    });
+    if (toastOnRedirect) {
+      toast.info(t("matchday.leagueSwitchedBySquadFilter"));
+    }
+  }
+  return true;
+}
+
+async function loadSport(sport: number, fromRoute = false) {
   selectedSport.value = sport;
   matchday.setSport(sport);
   await matchday.fetchMatchdays(sport);
@@ -170,7 +221,7 @@ async function selectMatchday(id: string) {
     if (md) {
       router.replace({
         params: {
-          sport: selectedSport.value,
+          leagueId: String(selectedSport.value),
           matchday: String(md.matchday_number),
         },
       });
@@ -186,7 +237,7 @@ async function loadGameModeData(matchdayId: string) {
   const mode = activeGameMode.value;
 
   if (mode === "bankroll" || mode === "over_under") {
-    await walletStore.fetchWallet(squad.id, selectedSport.value);
+    await walletStore.fetchWallet(squad.id, Number(selectedSport.value));
     if (mode === "bankroll") {
       await walletStore.fetchBets(squad.id, matchdayId);
     } else {
@@ -194,13 +245,13 @@ async function loadGameModeData(matchdayId: string) {
     }
     await walletStore.fetchParlay(squad.id, matchdayId);
   } else if (mode === "survivor") {
-    await survivorStore.fetchStatus(squad.id, selectedSport.value);
+    await survivorStore.fetchStatus(squad.id, Number(selectedSport.value));
   } else if (mode === "fantasy") {
     const md = matchday.currentMatchday;
     if (md) {
       await fantasyStore.fetchPick(
         squad.id,
-        selectedSport.value,
+        Number(selectedSport.value),
         md.season ?? new Date().getFullYear(),
         md.matchday_number
       );
@@ -217,11 +268,24 @@ async function loadGameModeData(matchdayId: string) {
 }
 
 async function selectSquad(squad: Squad | null) {
+  const previousLeagueId = selectedSport.value;
   selectedSquad.value = squad;
+  if ((squadsStore.currentSquad?.id ?? null) !== (squad?.id ?? null)) {
+    squadsStore.setCurrentSquad(squad);
+  }
   matchday.setSquadContext(squad?.id ?? null);
   walletStore.reset();
   survivorStore.reset();
   fantasyStore.reset();
+
+  const hasAllowedLeague = await ensureValidLeagueSelection(false);
+  if (!hasAllowedLeague) return;
+
+  if (selectedSport.value !== previousLeagueId) {
+    toast.info(t("matchday.leagueSwitchedBySquadFilter"));
+    await loadSport(selectedSport.value, true);
+    return;
+  }
 
   // Reset auto-tipp strategy if blocked in new squad
   if (squad?.auto_bet_blocked) {
@@ -271,11 +335,22 @@ function onDisclaimerAccepted() {
 async function reload() {
   error.value = false;
   try {
-    const sportsPromise = matchday.fetchSports();
+    const loads: Promise<unknown>[] = [
+      leagueStore.fetchNavigation(true),
+      matchday.fetchSports(),
+    ];
     if (auth.isLoggedIn) {
-      await squadsStore.fetchMySquads();
+      loads.push(squadsStore.fetchMySquads());
     }
-    await sportsPromise;
+    await Promise.all(loads);
+
+    const routeLeagueId = Number(route.params.leagueId);
+    selectedSport.value = Number.isFinite(routeLeagueId) && routeLeagueId > 0 ? routeLeagueId : 0;
+
+    const hasAllowedLeague = await ensureValidLeagueSelection(false);
+    if (!hasAllowedLeague) {
+      return;
+    }
     await loadSport(selectedSport.value, true);
   } catch {
     error.value = true;
@@ -292,10 +367,31 @@ onBeforeUnmount(() => {
   matchday.flushPending();
 });
 
-// React to sport changes
-watch(selectedSport, (sport) => {
-  loadSport(sport);
-});
+watch(
+  () => [route.params.leagueId, route.params.matchday],
+  async () => {
+    const routeLeagueId = Number(route.params.leagueId);
+    if (!Number.isFinite(routeLeagueId) || routeLeagueId <= 0) return;
+    if (routeLeagueId === selectedSport.value) return;
+
+    selectedSport.value = routeLeagueId;
+    const hasAllowedLeague = await ensureValidLeagueSelection(false);
+    if (hasAllowedLeague) {
+      await loadSport(selectedSport.value, true);
+    }
+  }
+);
+
+watch(
+  () => squadsStore.currentSquad?.id ?? null,
+  async (squadId) => {
+    if ((selectedSquad.value?.id ?? null) === squadId) return;
+    const nextSquad = squadId
+      ? (squadsStore.squads.find((item) => item.id === squadId) ?? null)
+      : null;
+    await selectSquad(nextSquad);
+  }
+);
 </script>
 
 <template>
@@ -365,20 +461,20 @@ watch(selectedSport, (sport) => {
     <div class="flex gap-2 overflow-x-auto pb-1">
       <button
         v-for="sport in availableSports"
-        :key="sport.sport_key"
+        :key="sport.league_id"
         class="shrink-0 px-4 py-2 rounded-lg text-sm font-medium transition-colors"
         :class="
-          selectedSport === sport.sport_key
+          selectedSport === sport.league_id
             ? 'bg-primary text-surface-0'
             : 'bg-surface-1 text-text-secondary hover:bg-surface-2 border border-surface-3'
         "
-        @click="selectedSport = sport.sport_key"
+        @click="loadSport(sport.league_id)"
       >
-        {{ sportLabels[sport.sport_key] || sport.sport_key }}
+        {{ sportLabels[String(sport.league_id)] || sport.league_id }}
         <span
           v-if="selectedSquad?.league_configs?.length"
           class="text-[10px] opacity-60 ml-0.5"
-        >({{ $t(GAME_MODE_I18N_KEYS[squadsStore.getGameModeForSport(selectedSquad.id, sport.sport_key)]) }})</span>
+        >({{ $t(GAME_MODE_I18N_KEYS[squadsStore.getGameModeForSport(selectedSquad.id, sport.league_id)]) }})</span>
       </button>
     </div>
 
@@ -418,6 +514,32 @@ watch(selectedSport, (sport) => {
     </div>
 
     <!-- Empty state -->
+    <div
+      v-else-if="!hasGlobalLeagues"
+      class="flex flex-col items-center justify-center py-16"
+    >
+      <span class="text-4xl mb-4" aria-hidden="true">📋</span>
+      <h2 class="text-lg font-semibold text-text-primary mb-2">
+        {{ $t('matchday.noMatchdays') }}
+      </h2>
+      <p class="text-sm text-text-secondary text-center max-w-xs">
+        {{ $t('matchday.noGlobalLeagues') }}
+      </p>
+    </div>
+
+    <div
+      v-else-if="!hasSquadFilteredLeagues"
+      class="flex flex-col items-center justify-center py-16"
+    >
+      <span class="text-4xl mb-4" aria-hidden="true">📋</span>
+      <h2 class="text-lg font-semibold text-text-primary mb-2">
+        {{ $t('matchday.noMatchdays') }}
+      </h2>
+      <p class="text-sm text-text-secondary text-center max-w-xs">
+        {{ $t('matchday.noSquadLeagues') }}
+      </p>
+    </div>
+
     <div
       v-else-if="matchday.matches.length === 0 && !matchday.loading"
       class="flex flex-col items-center justify-center py-16"
@@ -481,7 +603,7 @@ watch(selectedSport, (sport) => {
             v-for="match in matchday.matches"
             :key="match.id"
             :match="match"
-            :sport-key="selectedSport"
+            :sport-key="String(selectedSport)"
           />
         </div>
 
@@ -524,7 +646,7 @@ watch(selectedSport, (sport) => {
             v-for="match in matchday.matches"
             :key="match.id"
             :match="match"
-            :sport-key="selectedSport"
+            :sport-key="String(selectedSport)"
           />
         </div>
       </template>
@@ -541,7 +663,7 @@ watch(selectedSport, (sport) => {
         <BankrollLeaderboard
           v-if="selectedSquad"
           :squad-id="selectedSquad.id"
-          :sport-key="selectedSport"
+          :league-id="selectedSport"
         />
       </template>
 
@@ -558,7 +680,7 @@ watch(selectedSport, (sport) => {
         <SurvivorStandings
           v-if="selectedSquad"
           :squad-id="selectedSquad.id"
-          :sport-key="selectedSport"
+          :league-id="selectedSport"
         />
       </template>
 
@@ -569,13 +691,13 @@ watch(selectedSport, (sport) => {
             v-for="match in matchday.matches"
             :key="match.id"
             :match="match"
-            :sport-key="selectedSport"
+            :sport-key="String(selectedSport)"
           />
         </div>
         <OverUnderLeaderboard
           v-if="selectedSquad"
           :squad-id="selectedSquad.id"
-          :sport-key="selectedSport"
+          :league-id="selectedSport"
         />
       </template>
 
@@ -592,7 +714,7 @@ watch(selectedSport, (sport) => {
         <FantasyStandings
           v-if="selectedSquad"
           :squad-id="selectedSquad.id"
-          :sport-key="selectedSport"
+          :league-id="selectedSport"
         />
       </template>
 
@@ -622,12 +744,12 @@ watch(selectedSport, (sport) => {
       <template v-if="activeGameMode === 'classic'">
         <MatchdayLeaderboard
           v-if="matchday.currentMatchday?.all_resolved && selectedMatchdayId"
-          :sport-key="selectedSport"
+          :league-id="selectedSport"
           :matchday-id="selectedMatchdayId"
           mode="matchday"
         />
         <MatchdayLeaderboard
-          :sport-key="selectedSport"
+          :league-id="selectedSport"
           mode="season"
         />
       </template>

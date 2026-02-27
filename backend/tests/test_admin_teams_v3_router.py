@@ -141,7 +141,7 @@ class _FakeDB:
                             "name": "Bayern München",
                             "normalized": "bayern munchen",
                             "source": "provider_unknown",
-                            "sport_key": None,
+                            "league_id": None,
                             "alias_key": "bayern munchen|*|provider_unknown",
                             "is_default": True,
                         }
@@ -212,7 +212,7 @@ async def test_alias_impact_returns_usage(monkeypatch):
             "name": "Bayern",
             "normalized": "bayern",
             "source": "manual",
-            "sport_key": None,
+            "league_id": None,
             "alias_key": "bayern|*|manual",
             "is_default": False,
         }
@@ -224,3 +224,82 @@ async def test_alias_impact_returns_usage(monkeypatch):
         admin={"_id": "admin"},
     )
     assert result["usage_30d"] == 1
+
+
+@pytest.mark.asyncio
+async def test_list_alias_suggestions_v3(monkeypatch):
+    fake = _FakeDB()
+    fake.team_alias_suggestions_v3.docs = [
+        {
+            "_id": "s1",
+            "status": "pending",
+            "source": "provider_unknown",
+            "league_id": 82,
+            "raw_team_name": "Bayern Muenchen",
+            "normalized_name": "bayern munchen",
+            "confidence_score": 0.91,
+            "candidate_team_id": 1,
+        }
+    ]
+    monkeypatch.setattr(teams_router._db, "db", fake, raising=False)
+    result = await teams_router.list_alias_suggestions_v3(
+        status="pending",
+        source=None,
+        league_id=None,
+        min_confidence=0.0,
+        q=None,
+        limit=200,
+        admin={"_id": "admin"},
+    )
+    assert result["total"] == 1
+    assert result["items"][0]["id"] == "s1"
+    assert result["items"][0]["suggested_team_name"] == "Bayern München"
+
+
+@pytest.mark.asyncio
+async def test_apply_alias_suggestions_v3(monkeypatch):
+    fake = _FakeDB()
+    fake.team_alias_suggestions_v3.docs = [
+        {
+            "_id": "s1",
+            "status": "pending",
+            "source": "manual",
+            "league_id": None,
+            "raw_team_name": "Bayern",
+            "candidate_team_id": 1,
+        }
+    ]
+    monkeypatch.setattr(teams_router._db, "db", fake, raising=False)
+    result = await teams_router.apply_alias_suggestions_v3(
+        body=teams_router.SuggestionApplyBody(items=[teams_router.SuggestionApplyItem(id="s1")]),
+        admin={"_id": "admin"},
+    )
+    assert result["applied"] == 1
+    doc = await fake.team_alias_suggestions_v3.find_one({"_id": "s1"})
+    assert doc["status"] == "applied"
+    aliases = fake.teams_v3.docs[0]["aliases"]
+    assert any(a.get("alias_key") == "bayern|*|manual" for a in aliases)
+
+
+@pytest.mark.asyncio
+async def test_reject_alias_suggestion_v3(monkeypatch):
+    fake = _FakeDB()
+    fake.team_alias_suggestions_v3.docs = [
+        {
+            "_id": "s1",
+            "status": "pending",
+            "source": "manual",
+            "league_id": None,
+            "raw_team_name": "Unknown FC",
+            "normalized_name": "unknown fc",
+        }
+    ]
+    monkeypatch.setattr(teams_router._db, "db", fake, raising=False)
+    result = await teams_router.reject_alias_suggestion_v3(
+        suggestion_id="s1",
+        body=teams_router.RejectSuggestionBody(reason="invalid"),
+        admin={"_id": "admin"},
+    )
+    assert result["ok"] is True
+    doc = await fake.team_alias_suggestions_v3.find_one({"_id": "s1"})
+    assert doc["status"] == "rejected"

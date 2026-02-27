@@ -7,7 +7,7 @@ export type GameModeType =
   | "moneyline";
 
 export interface LeagueConfig {
-  sport_key: string;
+  league_id: number;
   game_mode: GameModeType;
   config: Record<string, unknown>;
   activated_at: string;

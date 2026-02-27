@@ -30,12 +30,15 @@ logger = logging.getLogger("quotico.event_handlers.match")
 
 async def handle_match_finalized(event: BaseEvent) -> None:
     match_id = str(getattr(event, "match_id", "") or "")
-    sport_key = str(getattr(event, "sport_key", "") or "")
+    raw_league_id = getattr(event, "league_id", None)
+    league_id = int(raw_league_id) if isinstance(raw_league_id, int) else None
+    if raw_league_id is not None and not isinstance(raw_league_id, int):
+        logger.warning("Legacy event payload uses non-int league_id=%r", raw_league_id)
     season = getattr(event, "season", None)
     if not match_id:
         return
     try:
-        match_oid = ObjectId(match_id)
+        match_oid = int(match_id)
     except Exception:
         return
 
@@ -52,7 +55,7 @@ async def handle_match_finalized(event: BaseEvent) -> None:
 
     await materialize_leaderboard()
     await materialize_matchday_leaderboard(
-        sport_key=sport_key or None,
+        league_id=league_id,
         season=int(season) if isinstance(season, int) else None,
     )
     logger.info("Processed match.finalized event for match_id=%s", match_id)

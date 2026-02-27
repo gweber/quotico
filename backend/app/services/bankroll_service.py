@@ -43,8 +43,8 @@ async def place_bet(
     """
     now = utcnow()
 
-    # Validate match first (need sport_key for league config check)
-    match = await _db.db.matches.find_one({"_id": ObjectId(match_id)})
+    # Validate match first (need league_id for league config check)
+    match = await _db.db.matches_v3.find_one({"_id": int(match_id)})
     if not match:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Match not found.")
 
@@ -55,9 +55,9 @@ async def place_bet(
     if user_id not in squad.get("members", []):
         raise HTTPException(status.HTTP_403_FORBIDDEN, "You are not a member of this squad.")
     from app.services.squad_league_service import require_active_league_config
-    require_active_league_config(squad, match["sport_key"], "bankroll")
+    require_active_league_config(squad, match["league_id"], "bankroll")
 
-    commence = ensure_utc(match["match_date"])
+    commence = ensure_utc(match["start_at"])
     if commence <= now:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Match has already started.")
     if match["status"] != "scheduled":
@@ -84,9 +84,9 @@ async def place_bet(
         raise HTTPException(status.HTTP_400_BAD_REQUEST, f"Minimum stake: {min_bet} coins.")
 
     # Get/create wallet
-    sport_key = match["sport_key"]
+    league_id = match["league_id"]
     season = match.get("matchday_season") or now.year
-    wallet = await wallet_service.get_or_create_wallet(user_id, squad_id, sport_key, season)
+    wallet = await wallet_service.get_or_create_wallet(user_id, squad_id, league_id, season)
     wallet_id = str(wallet["_id"])
 
     # Check max bet percentage
@@ -108,7 +108,7 @@ async def place_bet(
     matchday_id = ""
     if match.get("matchday_number") and match.get("matchday_season"):
         md = await _db.db.matchdays.find_one({
-            "sport_key": sport_key,
+            "league_id": league_id,
             "season": match["matchday_season"],
             "matchday_number": match["matchday_number"],
         })

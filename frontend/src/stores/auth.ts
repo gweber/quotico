@@ -1,6 +1,14 @@
+/**
+ * frontend/src/stores/auth.ts
+ *
+ * Purpose:
+ * Auth/session state including persona-governance fields returned by /auth/me.
+ */
+
 import { defineStore } from "pinia";
 import { ref, computed } from "vue";
 import { useApi } from "@/composables/useApi";
+import type { TipPersona, TipPersonaSource } from "@/types/persona";
 
 export interface User {
   email: string;
@@ -12,6 +20,11 @@ export interface User {
   is_2fa_enabled: boolean;
   is_adult: boolean;
   terms_accepted_version: string | null;
+  tip_persona: TipPersona;
+  tip_persona_effective: TipPersona;
+  tip_persona_source: TipPersonaSource;
+  tip_persona_updated_at: string | null;
+  tip_override_persona: TipPersona | null;
   created_at: string;
 }
 
@@ -116,9 +129,14 @@ export const useAuthStore = defineStore("auth", () => {
     user.value = null;
   }
 
+  async function updateTipPersona(tip_persona: TipPersona) {
+    await api.patch("/user/tip-persona", { tip_persona });
+    await fetchUser();
+  }
+
   return {
     user, loading, initialized, initPromise,
     isLoggedIn, isAdmin, needsProfileCompletion,
-    fetchUser, login, login2fa, register, completeProfile, logout,
+    fetchUser, login, login2fa, register, completeProfile, logout, updateTipPersona,
   };
 });

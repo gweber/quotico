@@ -24,7 +24,7 @@ class AutoBetStrategy(str, Enum):
 
 class MatchdayInDB(BaseModel):
     """A single matchday in a league season."""
-    sport_key: str
+    league_id: int
     season: int
     matchday_number: int
     label: str                          # e.g. "Matchday 17"
@@ -53,7 +53,7 @@ class MatchdayPredictionInDB(BaseModel):
     user_id: str
     matchday_id: str
     squad_id: Optional[str] = None  # None = global (no squad context)
-    sport_key: str
+    league_id: int
     season: int
     matchday_number: int
     auto_bet_strategy: AutoBetStrategy = AutoBetStrategy.none
@@ -102,7 +102,7 @@ class AdminPredictionRequest(BaseModel):
 class MatchdayResponse(BaseModel):
     """Matchday data returned to the client."""
     id: str
-    sport_key: str
+    league_id: int
     season: int
     matchday_number: int
     label: str

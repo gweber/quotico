@@ -19,7 +19,7 @@ class WalletInDB(BaseModel):
     """Per-user per-squad per-season wallet."""
     user_id: str
     squad_id: str
-    sport_key: str
+    league_id: int
     season: int
     balance: float = 1000.0
     initial_balance: float = 1000.0
@@ -37,7 +37,7 @@ class WalletResponse(BaseModel):
     """Wallet data returned to the client."""
     id: str
     squad_id: str
-    sport_key: str
+    league_id: int
     season: int
     balance: float
     initial_balance: float
@@ -179,7 +179,7 @@ class FantasyPickInDB(BaseModel):
     """A fantasy team pick for a matchday."""
     user_id: str
     squad_id: str
-    sport_key: str
+    league_id: int
     season: int
     matchday_number: int
     team: str
@@ -224,7 +224,7 @@ class ParlayInDB(BaseModel):
     user_id: str
     squad_id: str
     matchday_id: str
-    sport_key: str
+    league_id: int
     season: int
     matchday_number: int
     legs: list[ParlayLeg]

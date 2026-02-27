@@ -22,7 +22,7 @@ from app.services import sportmonks_connector as connector_module
 
 class _FakeCollection:
     def __init__(self) -> None:
-        self.docs: dict[int, dict] = {}
+        self.docs: dict[object, dict] = {}
         self.calls: list[dict] = []
 
     @staticmethod
@@ -74,7 +74,11 @@ class _FakeCollection:
 
     async def update_one(self, query, update, upsert=False):
         self.calls.append({"query": query, "update": update, "upsert": upsert})
-        doc_id = int(query.get("_id"))
+        raw_id = query.get("_id")
+        try:
+            doc_id = int(raw_id)
+        except (TypeError, ValueError):
+            doc_id = raw_id
         existing = self.docs.get(doc_id)
         upserted_id = None
         if isinstance(update, list):
@@ -161,6 +165,11 @@ class _FakeCollection:
             inserted_ids.append(row_id)
         return type("InsertManyResult", (), {"inserted_ids": inserted_ids})()
 
+    async def insert_one(self, doc):
+        key = doc.get("_id", len(self.docs) + 1)
+        self.docs[key] = dict(doc)
+        return type("InsertOneResult", (), {"inserted_id": key})()
+
 
 class _FakeBulkCollection(_FakeCollection):
     def __init__(self) -> None:
@@ -182,6 +191,8 @@ class _FakeDB:
         self.persons = _FakeCollection()
         self.league_registry_v3 = _FakeCollection()
         self.teams_v3 = _FakeBulkCollection()
+        self.meta = _FakeCollection()
+        self.stats_api_usage = _FakeCollection()
 
 
 class _LeagueRegistryCollection(_FakeCollection):
@@ -244,7 +255,7 @@ async def test_sync_leagues_uses_lazy_global_db_resolution(monkeypatch):
     fake_db.league_registry_v3 = _LeagueRegistryCollection()
     fake_db.league_registry_v3.docs[301] = {
         "_id": 301,
-        "sport_key": "soccer_germany_bundesliga",
+        "league_id": 82,
         "is_active": True,
         "features": {"tipping": True, "match_load": True, "xg_sync": True, "odds_sync": True},
         "ui_order": 1,
@@ -273,6 +284,43 @@ async def test_sync_leagues_uses_lazy_global_db_resolution(monkeypatch):
     assert stored["name"] == "Bundesliga"
     assert stored["created_at"] == datetime(2026, 2, 26, 13, 0, tzinfo=timezone.utc)
     assert stored["updated_at"] == fixed_now
+
+
+@pytest.mark.asyncio
+async def test_sync_leagues_invalidates_navigation_cache_on_write(monkeypatch):
+    fake_db = _FakeDB()
+    fake_db.league_registry_v3 = _LeagueRegistryCollection()
+    fake_db.league_registry_v3.docs[301] = {
+        "_id": 301,
+        "league_id": 82,
+        "is_active": True,
+        "features": {"tipping": True, "match_load": True, "xg_sync": True, "odds_sync": True},
+        "ui_order": 1,
+        "available_seasons": [{"id": 25535, "name": "2024/2025"}],
+    }
+    connector = connector_module.SportmonksConnector(database=None)
+    monkeypatch.setattr(connector_module._db, "db", fake_db, raising=False)
+    invalidated = {"hit": False}
+
+    async def _invalidate():
+        invalidated["hit"] = True
+
+    monkeypatch.setattr(connector_module, "invalidate_navigation_cache", _invalidate)
+
+    result = await connector.sync_leagues_to_registry(
+        [
+            {
+                "_id": 301,
+                "name": "Bundesliga",
+                "country": "Germany",
+                "is_cup": False,
+                "available_seasons": [{"id": 25536, "name": "2025/2026"}],
+            }
+        ]
+    )
+
+    assert result == {"inserted": 0, "updated": 1, "rejected": 0}
+    assert invalidated["hit"] is True
 
 
 @pytest.mark.asyncio
@@ -362,11 +410,123 @@ async def test_sync_fixture_odds_summary_compacts_market_one(monkeypatch):
     ok = await connector.sync_fixture_odds_summary(19433656)
 
     assert ok is True
-    summary = fake_db.matches_v3.calls[-1]["update"]["$set"]["odds_meta.summary_1x2"]
+    summary_call = next(
+        call
+        for call in reversed(fake_db.matches_v3.calls)
+        if "odds_meta.summary_1x2" in call["update"].get("$set", {})
+    )
+    summary = summary_call["update"]["$set"]["odds_meta.summary_1x2"]
     assert summary["home"]["min"] == 3.1
     assert summary["home"]["max"] == 3.4
     assert summary["draw"]["count"] == 1
     assert "away" in summary
+
+
+@pytest.mark.asyncio
+async def test_sync_fixture_odds_summary_publishes_odds_ingested(monkeypatch):
+    fake_db = _FakeDB()
+    fake_db.matches_v3.docs[19433656] = {"_id": 19433656}
+    connector = connector_module.SportmonksConnector(database=fake_db)
+    published = []
+
+    async def _fixture_odds(_fixture_id: int):
+        return {
+            "payload": {
+                "data": [
+                    {"market_id": 1, "label": "Home", "value": "2.10", "probability": "47.6%"},
+                    {"market_id": 1, "label": "Draw", "value": "3.40", "probability": "29.4%"},
+                    {"market_id": 1, "label": "Away", "value": "3.20", "probability": "31.2%"},
+                ]
+            },
+            "remaining": 88,
+            "reset_at": 123456,
+        }
+
+    monkeypatch.setattr(connector_module.sportmonks_provider, "get_prematch_odds_by_fixture", _fixture_odds)
+    monkeypatch.setattr(connector_module.settings, "EVENT_BUS_ENABLED", True, raising=False)
+    monkeypatch.setattr(connector_module.event_bus, "publish", lambda event: published.append(event))
+
+    ok = await connector.sync_fixture_odds_summary(19433656, source="heartbeat_closing")
+
+    assert ok is True
+    assert len(published) == 1
+    event = published[0]
+    assert event.event_type == "odds.ingested"
+    assert event.provider == "heartbeat_closing"
+    assert event.match_ids == ["19433656"]
+
+
+@pytest.mark.asyncio
+async def test_sync_round_odds_summary_publishes_single_batch_event(monkeypatch):
+    fake_db = _FakeDB()
+    fake_db.matches_v3.docs[19433656] = {"_id": 19433656}
+    fake_db.matches_v3.docs[19433657] = {"_id": 19433657}
+    connector = connector_module.SportmonksConnector(database=fake_db)
+    published = []
+
+    async def _round_fixtures(_round_id: int):
+        return {
+            "payload": {
+                "data": [
+                    {
+                        "id": 19433656,
+                        "odds": [
+                            {"market_id": 1, "label": "Home", "value": "2.10", "probability": "47.6%"},
+                            {"market_id": 1, "label": "Draw", "value": "3.40", "probability": "29.4%"},
+                            {"market_id": 1, "label": "Away", "value": "3.20", "probability": "31.2%"},
+                        ],
+                    },
+                    {
+                        "id": 19433657,
+                        "odds": [
+                            {"market_id": 1, "label": "Home", "value": "1.80", "probability": "55.6%"},
+                            {"market_id": 1, "label": "Draw", "value": "3.80", "probability": "26.3%"},
+                            {"market_id": 1, "label": "Away", "value": "4.60", "probability": "21.7%"},
+                        ],
+                    },
+                ]
+            },
+            "remaining": 77,
+            "reset_at": 123456,
+        }
+
+    monkeypatch.setattr(connector_module.sportmonks_provider, "get_round_fixtures", _round_fixtures)
+    monkeypatch.setattr(connector_module.settings, "EVENT_BUS_ENABLED", True, raising=False)
+    monkeypatch.setattr(connector_module.event_bus, "publish", lambda event: published.append(event))
+
+    result = await connector.sync_round_odds_summary(round_id=10, season_id=25536)
+
+    assert result["fixtures_processed"] == 2
+    assert len(published) == 1
+    event = published[0]
+    assert event.event_type == "odds.ingested"
+    assert sorted(event.match_ids) == ["19433656", "19433657"]
+
+
+@pytest.mark.asyncio
+async def test_upsert_match_v3_publishes_only_for_odds_payload(monkeypatch):
+    fake_db = _FakeDB()
+    connector = connector_module.SportmonksConnector(database=fake_db)
+    published = []
+
+    monkeypatch.setattr(connector_module.settings, "EVENT_BUS_ENABLED", True, raising=False)
+    monkeypatch.setattr(connector_module.event_bus, "publish", lambda event: published.append(event))
+
+    await connector.upsert_match_v3(1001, {"league_id": 5, "season_id": 2025, "status": "SCHEDULED"})
+    assert published == []
+
+    await connector.upsert_match_v3(
+        1001,
+        {
+            "league_id": 5,
+            "season_id": 2025,
+            "status": "SCHEDULED",
+            "odds_meta": {"summary_1x2": {"home": {"avg": 2.0}}},
+        },
+    )
+    assert len(published) == 1
+    assert published[0].event_type == "odds.ingested"
+    assert published[0].match_ids == ["1001"]
 
 
 @pytest.mark.asyncio
@@ -737,7 +897,7 @@ class TestManualCheckAutoHeal:
             "_id": 19433556,
             "manual_check_reasons": ["finished_without_odds"],
             "manual_check_required": False,
-            "odds_timeline": [],
+            "odds_timeline": [],  # FIXME: ODDS_V3_BREAK — test uses odds_timeline no longer produced by connector
         }
         c = connector_module.SportmonksConnector(database=fake_db)
 
@@ -757,7 +917,12 @@ class TestManualCheckAutoHeal:
         monkeypatch.setattr(connector_module.sportmonks_provider, "get_prematch_odds_by_fixture", _valid_odds)
         ok = await c.sync_fixture_odds_summary(19433556)
         assert ok is True
-        update_set = fake_db.matches_v3.calls[-1]["update"]["$set"]
+        update_call = next(
+            call
+            for call in reversed(fake_db.matches_v3.calls)
+            if "manual_check_reasons" in call["update"].get("$set", {})
+        )
+        update_set = update_call["update"]["$set"]
         assert update_set["manual_check_reasons"] == []
         assert update_set["manual_check_required"] is False
 

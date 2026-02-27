@@ -21,8 +21,6 @@ from collections.abc import Callable
 from datetime import datetime, timedelta
 from typing import Any
 
-from bson import ObjectId
-
 import app.database as _db
 from app.config import settings
 from app.services.event_bus import event_bus
@@ -50,12 +48,7 @@ logger = logging.getLogger("quotico.match_ingest_service")
 _IDENTITY_WINDOW = timedelta(hours=24)
 _PREVIEW_LIMIT = 100
 _CONFLICT_PREVIEW_LIMIT = 200
-_EVENT_PUBLISH_BY_SOURCE = {
-    "football_data": "EVENT_PUBLISH_FOOTBALL_DATA",
-    "openligadb": "EVENT_PUBLISH_OPENLIGADB",
-    "football_data_uk": "EVENT_PUBLISH_FOOTBALL_DATA_UK",
-    "theoddsapi": "EVENT_PUBLISH_THEODDSAPI",
-}
+_EVENT_PUBLISH_BY_SOURCE: dict[str, str] = {}
 
 
 def _status_final_from_score(score: dict[str, Any] | None) -> bool:
@@ -82,48 +75,11 @@ def _generic_status_mapper(raw_status: str | None, match: MatchData) -> str:
     if raw in {"timed", "scheduled"}:
         return "scheduled"
 
-    return "scheduled" if ensure_utc(match["match_date"]) > utcnow() else "live"
-
-
-def _football_data_status_mapper(raw_status: str | None, match: MatchData) -> str:
-    status = (raw_status or "").strip().upper()
-    if _status_final_from_score(match.get("score")):
-        return "final"
-    mapping = {
-        "FINISHED": "final",
-        "SCHEDULED": "scheduled",
-        "TIMED": "scheduled",
-        "IN_PLAY": "live",
-        "PAUSED": "live",
-        "POSTPONED": "postponed",
-        "SUSPENDED": "postponed",
-        "CANCELLED": "canceled",
-    }
-    if status in mapping:
-        return mapping[status]
-    return _generic_status_mapper(raw_status, match)
-
-
-def _openligadb_status_mapper(raw_status: str | None, match: MatchData) -> str:
-    status = (raw_status or "").strip().lower()
-    if status in {"finished", "is_finished", "final"}:
-        return "final"
-    return _generic_status_mapper(raw_status, match)
-
-
-def _football_data_uk_status_mapper(raw_status: str | None, match: MatchData) -> str:
-    return _generic_status_mapper(raw_status, match)
-
-
-def _theoddsapi_status_mapper(raw_status: str | None, match: MatchData) -> str:
-    return _generic_status_mapper(raw_status, match)
+    return "scheduled" if ensure_utc(match["start_at"]) > utcnow() else "live"
 
 
 STATUS_MAPPERS: dict[str, Callable[[str | None, MatchData], str]] = {
-    "football_data": _football_data_status_mapper,
-    "openligadb": _openligadb_status_mapper,
-    "football_data_uk": _football_data_uk_status_mapper,
-    "theoddsapi": _theoddsapi_status_mapper,
+    "sportmonks": _generic_status_mapper,
 }
 
 
@@ -147,7 +103,7 @@ class MatchIngestService:
         self,
         matches: list[MatchData],
         *,
-        league_id: ObjectId | None = None,
+        league_id: int | None = None,
         dry_run: bool = False,
         status_mapper: Callable[[str | None, MatchData], str] | None = None,
         hooks: MatchIngestHooks | None = None,
@@ -181,7 +137,7 @@ class MatchIngestService:
                 if not src or not external_id:
                     raise ValueError("source and external_id are required")
 
-                match_date = item.get("match_date")
+                match_date = item.get("start_at")
                 if isinstance(match_date, str):
                     match_date = parse_utc(match_date)
                 elif isinstance(match_date, datetime):
@@ -204,14 +160,14 @@ class MatchIngestService:
                             "message": "League mapping missing for source/external id.",
                             "detail": {
                                 "league_external_id": str(item.get("league_external_id") or ""),
-                                "sport_key": str(item.get("sport_key") or ""),
+                                "league_id": item.get("league_id") if isinstance(item.get("league_id"), int) else None,
                             },
                         },
                     )
                     self._append_preview(result, "skip", src, external_id, None, "unresolved_league")
                     continue
 
-                sport_key = str(item.get("sport_key") or "").strip()
+                item_league_id = int(item.get("league_id") or resolved_league_id)
                 home_team = item.get("home_team") or {}
                 away_team = item.get("away_team") or {}
                 home_name = str(home_team.get("name") or "").strip()
@@ -223,14 +179,14 @@ class MatchIngestService:
                     source=src,
                     external_id=str(home_team.get("external_id") or "").strip(),
                     name=home_name,
-                    sport_key=sport_key,
+                    league_id=item_league_id,
                     create_if_missing=not dry_run,
                 )
                 away_team_id = await team_registry.resolve_by_external_id_or_name(
                     source=src,
                     external_id=str(away_team.get("external_id") or "").strip(),
                     name=away_name,
-                    sport_key=sport_key,
+                    league_id=item_league_id,
                     create_if_missing=not dry_run,
                 )
 
@@ -239,7 +195,6 @@ class MatchIngestService:
                     await self._record_alias_suggestions_for_unresolved_teams(
                         team_registry=team_registry,
                         source=src,
-                        sport_key=sport_key,
                         league_id=resolved_league_id,
                         league_external_id=str(item.get("league_external_id") or "").strip() or None,
                         match_external_id=external_id,
@@ -259,7 +214,7 @@ class MatchIngestService:
                             "detail": {
                                 "home": home_team,
                                 "away": away_team,
-                                "sport_key": sport_key,
+                                "league_id": item_league_id,
                             },
                         },
                     )
@@ -286,13 +241,12 @@ class MatchIngestService:
                 score = item.get("score") or {}
                 set_fields: dict[str, Any] = {
                     "league_id": resolved_league_id,
-                    "sport_key": sport_key,
                     "season": int(item.get("season") or ensure_utc(match_date).year),
                     "home_team_id": home_team_id,
                     "away_team_id": away_team_id,
                     "home_team": home_name,
                     "away_team": away_name,
-                    "match_date": match_date,
+                    "start_at": match_date,
                     "match_date_hour": ensure_utc(match_date).replace(minute=0, second=0, microsecond=0),
                     "status": mapped_status,
                     "score": score,
@@ -302,10 +256,6 @@ class MatchIngestService:
                     f"external_ids.{src}": external_id,
                     f"metadata.providers.{src}": dict(item.get("metadata") or {}),
                 }
-                if src == "theoddsapi":
-                    # Temporary compatibility for workers still reading legacy metadata fields.
-                    set_fields["metadata.theoddsapi_id"] = external_id
-                    set_fields["metadata.source"] = "theoddsapi"
                 if item.get("matchday") is not None:
                     set_fields["matchday"] = int(item["matchday"])
                     set_fields["matchday_number"] = int(item["matchday"])
@@ -348,7 +298,7 @@ class MatchIngestService:
                         "odds_meta": {"updated_at": None, "version": 0, "markets": {}},
                     },
                 }
-                write_result = await _db.db.matches.update_one(query, update_doc, upsert=True)
+                write_result = await _db.db.matches_v3.update_one(query, update_doc, upsert=True)
                 if write_result.upserted_id is not None:
                     result["created"] += 1
                     match_oid = write_result.upserted_id
@@ -359,17 +309,16 @@ class MatchIngestService:
                         source=src,
                         external_id=external_id,
                         league_id=resolved_league_id,
-                        sport_key=sport_key,
                         season=int(item.get("season") or ensure_utc(match_date).year),
                         mapped_status=mapped_status,
                         previous_status=previous_status or None,
                         score=score,
-                        changed_fields=["status", "score", "matchday", "match_date"],
+                        changed_fields=["status", "score", "matchday", "start_at"],
                         correlation_id=str(item.get("correlation_id") or make_correlation_id()),
                     )
                     if hooks and hasattr(hooks, "on_match_created"):
                         try:
-                            created_doc = await _db.db.matches.find_one({"_id": match_oid}) or {"_id": match_oid}
+                            created_doc = await _db.db.matches_v3.find_one({"_id": match_oid}) or {"_id": match_oid}
                             await hooks.on_match_created(created_doc, context)
                         except Exception:
                             logger.warning("match ingest create hook failed source=%s external_id=%s", src, external_id, exc_info=True)
@@ -377,7 +326,7 @@ class MatchIngestService:
                     result["updated"] += 1
                     match_oid = existing_doc.get("_id") if existing_doc else None
                     if match_oid is None:
-                        resolved = await _db.db.matches.find_one(query, {"_id": 1})
+                        resolved = await _db.db.matches_v3.find_one(query, {"_id": 1})
                         match_oid = resolved.get("_id") if resolved else None
                     self._append_preview(result, "update", src, external_id, str(match_oid) if match_oid else None, None)
                     changed_fields = self._compute_changed_fields(
@@ -394,7 +343,6 @@ class MatchIngestService:
                             source=src,
                             external_id=external_id,
                             league_id=resolved_league_id,
-                            sport_key=sport_key,
                             season=int(item.get("season") or ensure_utc(match_date).year),
                             mapped_status=mapped_status,
                             previous_status=previous_status or None,
@@ -404,7 +352,7 @@ class MatchIngestService:
                         )
                     if hooks and hasattr(hooks, "on_match_updated"):
                         try:
-                            updated_doc = await _db.db.matches.find_one({"_id": match_oid}) if match_oid else None
+                            updated_doc = await _db.db.matches_v3.find_one({"_id": match_oid}) if match_oid else None
                             await hooks.on_match_updated(updated_doc or {"_id": match_oid}, context)
                         except Exception:
                             logger.warning("match ingest update hook failed source=%s external_id=%s", src, external_id, exc_info=True)
@@ -424,7 +372,7 @@ class MatchIngestService:
 
         if hooks and hasattr(hooks, "on_batch_completed"):
             try:
-                await hooks.on_batch_completed(result, {"league_id": str(league_id) if league_id else None, "dry_run": dry_run})
+                await hooks.on_batch_completed(result, {"league_id": league_id, "dry_run": dry_run})
             except Exception:
                 logger.warning("match ingest batch hook failed", exc_info=True)
 
@@ -435,57 +383,57 @@ class MatchIngestService:
         source: str,
         match: MatchData,
         *,
-        explicit_league_id: ObjectId | None,
-    ) -> ObjectId | None:
+        explicit_league_id: int | None,
+    ) -> int | None:
         if explicit_league_id is not None:
             return explicit_league_id
 
         league_external_id = str(match.get("league_external_id") or "").strip()
-        sport_key = str(match.get("sport_key") or "").strip()
+        league_id = int(match.get("league_id") or 0) or None
         if not league_external_id:
-            return None
+            return league_id
 
         query: dict[str, Any] = {f"external_ids.{source}": league_external_id}
-        if sport_key:
-            query["sport_key"] = sport_key
+        if league_id is not None:
+            query["_id"] = league_id
 
-        league = await _db.db.leagues.find_one(query, {"_id": 1})
+        league = await _db.db.league_registry_v3.find_one(query, {"_id": 1})
         if league:
-            return league["_id"]
+            return int(league["_id"])
 
-        league = await _db.db.leagues.find_one({f"external_ids.{source}": league_external_id}, {"_id": 1})
+        league = await _db.db.league_registry_v3.find_one({f"external_ids.{source}": league_external_id}, {"_id": 1})
         if league:
-            return league["_id"]
-        return None
+            return int(league["_id"])
+        return league_id
 
     async def _find_existing_match(
         self,
         *,
         src: str,
         external_id: str,
-        league_id: ObjectId,
-        home_team_id: ObjectId,
-        away_team_id: ObjectId,
+        league_id: int,
+        home_team_id: int,
+        away_team_id: int,
         match_date: datetime,
     ) -> tuple[dict[str, Any] | None, str | None]:
-        existing = await _db.db.matches.find_one(
+        existing = await _db.db.matches_v3.find_one(
             {f"external_ids.{src}": external_id},
-            {"_id": 1, "status": 1, "score": 1, "matchday": 1, "matchday_number": 1, "match_date": 1},
+            {"_id": 1, "status": 1, "score": 1, "matchday": 1, "matchday_number": 1, "start_at": 1},
         )
         if existing:
             return existing, "external"
 
-        existing = await _db.db.matches.find_one(
+        existing = await _db.db.matches_v3.find_one(
             {
                 "league_id": league_id,
                 "home_team_id": home_team_id,
                 "away_team_id": away_team_id,
-                "match_date": {
+                "start_at": {
                     "$gte": ensure_utc(match_date) - _IDENTITY_WINDOW,
                     "$lte": ensure_utc(match_date) + _IDENTITY_WINDOW,
                 },
             },
-            {"_id": 1, "status": 1, "score": 1, "matchday": 1, "matchday_number": 1, "match_date": 1},
+            {"_id": 1, "status": 1, "score": 1, "matchday": 1, "matchday_number": 1, "start_at": 1},
         )
         if existing:
             return existing, "identity"
@@ -496,14 +444,13 @@ class MatchIngestService:
         *,
         team_registry: TeamRegistry,
         source: str,
-        sport_key: str,
-        league_id: ObjectId | None,
+        league_id: int | None,
         league_external_id: str | None,
         match_external_id: str,
         home_team: dict[str, Any],
         away_team: dict[str, Any],
-        home_team_id: ObjectId | None,
-        away_team_id: ObjectId | None,
+        home_team_id: int | None,
+        away_team_id: int | None,
         reason: str,
     ) -> None:
         if home_team_id is None:
@@ -512,7 +459,6 @@ class MatchIngestService:
                 await team_registry.record_alias_suggestion(
                     source=source,
                     raw_team_name=home_name,
-                    sport_key=sport_key,
                     league_id=league_id,
                     league_external_id=league_external_id,
                     reason=reason,
@@ -528,7 +474,6 @@ class MatchIngestService:
                 await team_registry.record_alias_suggestion(
                     source=source,
                     raw_team_name=away_name,
-                    sport_key=sport_key,
                     league_id=league_id,
                     league_external_id=league_external_id,
                     reason=reason,
@@ -549,7 +494,7 @@ class MatchIngestService:
         matchday: Any,
     ) -> list[str]:
         if not existing_doc:
-            return ["status", "score", "matchday", "match_date"]
+            return ["status", "score", "matchday", "start_at"]
 
         changed: list[str] = []
         prev_status = str(existing_doc.get("status") or "")
@@ -560,13 +505,13 @@ class MatchIngestService:
         if prev_score != (score or {}):
             changed.append("score")
 
-        prev_match_date = existing_doc.get("match_date")
+        prev_match_date = existing_doc.get("start_at")
         try:
             prev_match_date = ensure_utc(prev_match_date) if prev_match_date is not None else None
         except Exception:
             prev_match_date = None
         if prev_match_date != ensure_utc(match_date):
-            changed.append("match_date")
+            changed.append("start_at")
 
         prev_matchday = existing_doc.get("matchday")
         if prev_matchday is None:
@@ -581,11 +526,10 @@ class MatchIngestService:
         self,
         *,
         action: str,
-        match_oid: ObjectId,
+        match_oid: int,
         source: str,
         external_id: str,
-        league_id: ObjectId,
-        sport_key: str,
+        league_id: int,
         season: int,
         mapped_status: str,
         previous_status: str | None,
@@ -597,13 +541,12 @@ class MatchIngestService:
             return
         try:
             if action == "create":
-                event_bus.publish(
+                await event_bus.publish(
                     MatchCreatedEvent(
                         source=source,
                         correlation_id=correlation_id,
-                        match_id=str(match_oid),
-                        league_id=str(league_id),
-                        sport_key=sport_key,
+                        match_id=match_oid,
+                        league_id=league_id,
                         season=int(season),
                         status=mapped_status,
                         ingest_source=source,
@@ -613,13 +556,12 @@ class MatchIngestService:
             else:
                 if not changed_fields:
                     return
-                event_bus.publish(
+                await event_bus.publish(
                     MatchUpdatedEvent(
                         source=source,
                         correlation_id=correlation_id,
-                        match_id=str(match_oid),
-                        league_id=str(league_id),
-                        sport_key=sport_key,
+                        match_id=match_oid,
+                        league_id=league_id,
                         season=int(season),
                         previous_status=previous_status,
                         new_status=mapped_status,
@@ -631,13 +573,12 @@ class MatchIngestService:
 
             if mapped_status == "final" and previous_status != "final":
                 ft = score.get("full_time") if isinstance(score, dict) and isinstance(score.get("full_time"), dict) else {}
-                event_bus.publish(
+                await event_bus.publish(
                     MatchFinalizedEvent(
                         source=source,
                         correlation_id=correlation_id,
-                        match_id=str(match_oid),
-                        league_id=str(league_id),
-                        sport_key=sport_key,
+                        match_id=match_oid,
+                        league_id=league_id,
                         season=int(season),
                         final_score={
                             "home": ft.get("home"),
@@ -646,24 +587,22 @@ class MatchIngestService:
                     )
                 )
             elif mapped_status == "postponed" and previous_status != "postponed":
-                event_bus.publish(
+                await event_bus.publish(
                     MatchPostponedEvent(
                         source=source,
                         correlation_id=correlation_id,
-                        match_id=str(match_oid),
-                        league_id=str(league_id),
-                        sport_key=sport_key,
+                        match_id=match_oid,
+                        league_id=league_id,
                         season=int(season),
                     )
                 )
             elif mapped_status == "canceled" and previous_status != "canceled":
-                event_bus.publish(
+                await event_bus.publish(
                     MatchCancelledEvent(
                         source=source,
                         correlation_id=correlation_id,
-                        match_id=str(match_oid),
-                        league_id=str(league_id),
-                        sport_key=sport_key,
+                        match_id=match_oid,
+                        league_id=league_id,
                         season=int(season),
                     )
                 )

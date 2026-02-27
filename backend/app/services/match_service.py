@@ -10,7 +10,6 @@ Purpose:
 Dependencies:
     - app.database
     - app.models.matches
-    - app.providers.odds_api
     - app.services.league_service
     - app.services.team_registry_service
     - app.utils
@@ -24,7 +23,6 @@ from typing import Any
 
 import app.database as _db
 from app.models.matches import MatchStatus
-from app.providers.odds_api import SUPPORTED_SPORTS, odds_provider
 from app.services.league_service import LeagueRegistry
 from app.services.match_ingest_service import match_ingest_service
 from app.services.match_ingest_types import MatchData
@@ -33,7 +31,7 @@ from app.utils import ensure_utc, parse_utc, utcnow
 
 logger = logging.getLogger("quotico.match_service")
 
-_MAX_DURATION: dict[str, timedelta] = {}
+_MAX_DURATION: dict[int, timedelta] = {}
 _DEFAULT_DURATION = timedelta(minutes=190)
 
 
@@ -171,7 +169,7 @@ def _extract_provider_match(
         raise ValueError("Provider match missing home/away team name.")
 
     match_date = _as_datetime(
-        match.get("match_date")
+        match.get("start_at")
         or match.get("commence_time")
         or match.get("utc_date")
     )
@@ -236,9 +234,13 @@ async def update_matches_from_provider(provider_name: str, provider_data: list[d
 
     for raw_match in provider_data:
         try:
-            sport_key = str(raw_match.get("sport_key") or "").strip()
-            if not sport_key:
-                raise ValueError("Provider match missing sport_key.")
+            league_raw = raw_match.get("league_id")
+            if not isinstance(league_raw, int):
+                logger.warning("Provider match rejected: non-int league_id value=%r type=%s", league_raw, type(league_raw).__name__)
+                raise ValueError("Provider match league_id must be int.")
+            league_id = league_raw
+            if league_id <= 0:
+                raise ValueError("Provider match missing league_id.")
 
             (
                 home_team,
@@ -269,9 +271,9 @@ async def update_matches_from_provider(provider_name: str, provider_data: list[d
                 {
                     "external_id": external_id,
                     "source": provider_name,  # type: ignore[typeddict-item]
-                    "league_external_id": sport_key,
+                    "league_external_id": str(league_id),
                     "season": int(raw_match.get("season") or _derive_season(match_date)),
-                    "sport_key": sport_key,
+                    "league_id": league_id,
                     "match_date": ensure_utc(match_date),
                     "home_team": {"external_id": None, "name": home_team},
                     "away_team": {"external_id": None, "name": away_team},
@@ -299,22 +301,23 @@ async def update_matches_from_provider(provider_name: str, provider_data: list[d
     }
 
 
-async def sports_with_live_action() -> set[str]:
+async def sports_with_live_action() -> set[int]:
     now = utcnow()
     live_states = [MatchStatus.LIVE.value, MatchStatus.SCHEDULED.value]
-    live_sports: set[str] = set()
+    live_leagues: set[int] = set()
 
-    for sport_key in SUPPORTED_SPORTS:
-        league = await LeagueRegistry.get().get_league(sport_key)
-        if not league or not league.get("is_active", False):
-            continue
+    active_leagues = await _db.db.league_registry_v3.find(
+        {"is_active": True}, {"league_id": 1}
+    ).to_list(100)
+    active_league_ids = [l["league_id"] for l in active_leagues if isinstance(l.get("league_id"), int)]
 
-        max_dur = _MAX_DURATION.get(sport_key, _DEFAULT_DURATION)
-        has_live = await _db.db.matches.find_one(
+    for league_id in active_league_ids:
+        max_dur = _MAX_DURATION.get(league_id, _DEFAULT_DURATION)
+        has_live = await _db.db.matches_v3.find_one(
             {
-                "sport_key": sport_key,
+                "league_id": league_id,
                 "status": {"$in": live_states},
-                "match_date": {
+                "start_at": {
                     "$lte": now,
                     "$gte": now - max_dur,
                 },
@@ -322,64 +325,43 @@ async def sports_with_live_action() -> set[str]:
             {"_id": 1},
         )
         if has_live:
-            live_sports.add(sport_key)
+            live_leagues.add(league_id)
 
-    return live_sports
+    return live_leagues
 
 
 async def next_kickoff_in() -> timedelta | None:
     now = utcnow()
-    nxt = await _db.db.matches.find_one(
+    nxt = await _db.db.matches_v3.find_one(
         {
             "status": MatchStatus.SCHEDULED.value,
-            "match_date": {"$gt": now},
+            "start_at": {"$gt": now},
         },
-        sort=[("match_date", 1)],
-        projection={"match_date": 1},
+        sort=[("start_at", 1)],
+        projection={"start_at": 1},
     )
     if nxt:
-        return ensure_utc(nxt["match_date"]) - now
+        return ensure_utc(nxt["start_at"]) - now
     return None
-
-
-async def sync_matches_for_sport(sport_key: str) -> dict[str, int]:
-    provider_payload = await odds_provider.get_odds(sport_key)
-    if not provider_payload:
-        return {
-            "processed": 0,
-            "created": 0,
-            "updated": 0,
-            "skipped": 0,
-            "matches": 0,
-            "odds_changed": 0,
-            "provider_payload": [],
-        }
-    result = await update_matches_from_provider("theoddsapi", provider_payload)
-    return {
-        **result,
-        "matches": result["processed"],
-        "odds_changed": result["updated"],
-        "provider_payload": provider_payload,
-    }
 
 
 async def get_match_by_id(match_id: str) -> dict | None:
     from bson import ObjectId
 
     try:
-        return await _db.db.matches.find_one({"_id": ObjectId(match_id)})
+        return await _db.db.matches_v3.find_one({"_id": int(match_id)})
     except Exception:
         return None
 
 
 async def get_matches(
-    sport_key: str | None = None,
+    league_id: int | None = None,
     status: str | None = None,
     limit: int = 50,
 ) -> list[dict]:
     query: dict[str, Any] = {}
-    if sport_key:
-        query["sport_key"] = sport_key
+    if league_id is not None:
+        query["league_id"] = league_id
 
     if status:
         normalized = status.strip().lower()
@@ -400,5 +382,5 @@ async def get_matches(
             ]
         }
 
-    cursor = _db.db.matches.find(query).sort("match_date", 1).limit(limit)
+    cursor = _db.db.matches_v3.find(query).sort("start_at", 1).limit(limit)
     return await cursor.to_list(length=limit)

@@ -5,14 +5,14 @@ import { populateTipCache, type QuoticoTip } from "@/composables/useQuoticoTip";
 import type { MatchV3, OddsMetaV3 } from "@/types/MatchV3";
 
 export interface MatchdaySport {
-  sport_key: string;
+  league_id: number;
   label: string;
   matchdays_per_season: number;
 }
 
 export interface Matchday {
   id: string;
-  sport_key: string;
+  league_id: number;
   season: number;
   matchday_number: number;
   label: string;
@@ -23,6 +23,7 @@ export interface Matchday {
   all_resolved: boolean;
 }
 
+// FIXME: ODDS_V3_BREAK — type includes odds_meta which is no longer produced by connector
 export interface MatchdayMatch {
   id: string;
   home_team: string;
@@ -91,6 +92,14 @@ interface SlipResponse {
   status: string;
 }
 
+interface LeagueNavigationResponse {
+  items: Array<{
+    league_id?: number;
+    id?: number;
+    name: string;
+  }>;
+}
+
 export const useMatchdayStore = defineStore("matchday", () => {
   const api = useApi();
 
@@ -115,7 +124,7 @@ export const useMatchdayStore = defineStore("matchday", () => {
 
   const loading = ref(false);
   const saving = ref(false);
-  const activeSport = ref<string>("soccer_germany_bundesliga");
+  const activeSport = ref<number>(0);
   const activeSquadId = ref<string | null>(null);
 
   // --- Per-match debounce timers ---
@@ -179,17 +188,23 @@ export const useMatchdayStore = defineStore("matchday", () => {
   async function fetchSports() {
     if (sports.value.length > 0) return; // static for the session
     try {
-      sports.value = await api.get<MatchdaySport[]>("/matchday/sports");
+      const response = await api.get<LeagueNavigationResponse>("/leagues/navigation");
+      sports.value = (response.items || []).map((item) => ({
+        league_id: Number(item.league_id ?? item.id),
+        label: String(item.name || ""),
+        matchdays_per_season: 0,
+      })).filter((item) => Number.isInteger(item.league_id) && item.league_id > 0);
     } catch {
       sports.value = [];
     }
   }
 
-  async function fetchMatchdays(sport?: string) {
-    const sportKey = sport || activeSport.value;
+  async function fetchMatchdays(sport?: number) {
+    const leagueId = sport ?? activeSport.value;
+    const cacheKey = String(leagueId);
 
     // Serve from cache if fresh (30 min TTL)
-    const cached = matchdaysCache.get(sportKey);
+    const cached = matchdaysCache.get(cacheKey);
     if (cached && Date.now() - cached.fetchedAt < 1_800_000) {
       matchdays.value = cached.data;
       return;
@@ -198,9 +213,9 @@ export const useMatchdayStore = defineStore("matchday", () => {
     loading.value = true;
     try {
       matchdays.value = await api.get<Matchday[]>("/matchday/matchdays", {
-        sport: sportKey,
+        league_id: String(leagueId),
       });
-      matchdaysCache.set(sportKey, { data: matchdays.value, fetchedAt: Date.now() });
+      matchdaysCache.set(cacheKey, { data: matchdays.value, fetchedAt: Date.now() });
     } catch {
       matchdays.value = [];
     } finally {
@@ -304,7 +319,7 @@ export const useMatchdayStore = defineStore("matchday", () => {
         type: "matchday_round",
         matchday_id: matchdayId,
         squad_id: squadId || null,
-        sport_key: activeSport.value,
+        league_id: activeSport.value,
       });
       slipId.value = slip.id;
 
@@ -624,7 +639,7 @@ export const useMatchdayStore = defineStore("matchday", () => {
     }
   }
 
-  function setSport(sport: string) {
+  function setSport(sport: number) {
     activeSport.value = sport;
     // Clear view state (caches are keyed separately and stay intact)
     currentMatchday.value = null;

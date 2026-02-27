@@ -162,7 +162,7 @@ export const useSquadsStore = defineStore("squads", () => {
 
   function getGameModeForSport(
     squadId: string,
-    sportKey: string
+    leagueId: number
   ): GameModeType {
     const squad = squads.value.find((s) => s.id === squadId);
     if (!squad) return "classic";
@@ -170,7 +170,7 @@ export const useSquadsStore = defineStore("squads", () => {
     // New system: league_configs has priority
     if (squad.league_configs && squad.league_configs.length > 0) {
       const config = squad.league_configs.find(
-        (lc) => lc.sport_key === sportKey && !lc.deactivated_at
+        (lc) => lc.league_id === leagueId && !lc.deactivated_at
       );
       if (config) return config.game_mode;
       return "classic";
@@ -188,13 +188,13 @@ export const useSquadsStore = defineStore("squads", () => {
 
   async function setLeagueConfig(
     squadId: string,
-    sportKey: string,
+    leagueId: number,
     gameMode: GameModeType,
     config?: Record<string, unknown>
   ) {
     try {
       await api.put(`/squads/${squadId}/league-config`, {
-        sport_key: sportKey,
+        league_id: leagueId,
         game_mode: gameMode,
         config: config ?? {},
       });
@@ -205,9 +205,9 @@ export const useSquadsStore = defineStore("squads", () => {
     }
   }
 
-  async function removeLeagueConfig(squadId: string, sportKey: string) {
+  async function removeLeagueConfig(squadId: string, leagueId: number) {
     try {
-      await api.del(`/squads/${squadId}/league-config/${sportKey}`);
+      await api.del(`/squads/${squadId}/league-config/${leagueId}`);
       await fetchMySquads();
     } catch (e) {
       toast.error(e instanceof Error ? e.message : "Fehler beim Entfernen.");

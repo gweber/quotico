@@ -19,7 +19,7 @@ from typing import Any, Literal, NotRequired, TypedDict
 from bson import ObjectId
 
 
-MatchIngestSource = Literal["football_data", "openligadb", "football_data_uk", "theoddsapi"]
+MatchIngestSource = Literal["sportmonks"]
 
 
 class TeamRef(TypedDict):
@@ -32,7 +32,7 @@ class MatchData(TypedDict):
     source: MatchIngestSource
     league_external_id: str
     season: int
-    sport_key: str
+    league_id: int
     match_date: datetime
     home_team: TeamRef
     away_team: TeamRef

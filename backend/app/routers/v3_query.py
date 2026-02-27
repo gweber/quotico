@@ -35,8 +35,9 @@ from app.models.v3_query_models import (
     StatsQueryResponse,
     V3ListMeta,
 )
-from app.services.auth_service import get_current_user
+from app.services.auth_service import get_current_user, get_optional_user
 from app.services.justice_service import JusticeService
+from app.services.persona_policy_service import OutputLevel, PersonaContext, get_persona_policy_service
 from app.utils import ensure_utc, utcnow
 
 logger = logging.getLogger("quotico.v3_query")
@@ -50,6 +51,122 @@ _JUSTICE_SERVICE = JusticeService()
 # In-memory league name cache: league_id → {name, country}
 _LEAGUE_NAME_CACHE: dict[int, dict[str, str]] = {}
 _LEAGUE_CACHE_TS: Any = None
+
+
+def _filter_qtip_payload(tip: dict[str, Any], level: OutputLevel) -> dict[str, Any] | None:
+    """Reduce qtip payload according to output-level contract."""
+    if level == "none":
+        return None
+    if level == "summary":
+        return {
+            "match_id": int(tip.get("match_id") or 0),
+            "recommended_selection": str(tip.get("recommended_selection") or "-"),
+            "confidence": float(tip.get("confidence") or 0.0),
+            "status": str(tip.get("status") or "active"),
+            "source_output_level": "summary",
+        }
+    full: dict[str, Any] = {
+        "match_id": int(tip.get("match_id") or 0),
+        "league_id": int(tip.get("league_id")) if isinstance(tip.get("league_id"), int) else None,
+        "home_team": str(tip.get("home_team") or ""),
+        "away_team": str(tip.get("away_team") or ""),
+        "match_date": ensure_utc(tip.get("match_date")).isoformat() if tip.get("match_date") else None,
+        "recommended_selection": str(tip.get("recommended_selection") or "-"),
+        "confidence": float(tip.get("confidence") or 0.0),
+        "raw_confidence": float(tip.get("raw_confidence")) if isinstance(tip.get("raw_confidence"), (int, float)) else None,
+        "edge_pct": float(tip.get("edge_pct") or 0.0),
+        "true_probability": float(tip.get("true_probability") or 0.0),
+        "implied_probability": float(tip.get("implied_probability") or 0.0),
+        "expected_goals_home": float(tip.get("expected_goals_home") or 0.0),
+        "expected_goals_away": float(tip.get("expected_goals_away") or 0.0),
+        "tier_signals": tip.get("tier_signals") if isinstance(tip.get("tier_signals"), dict) else {},
+        "justification": str(tip.get("justification") or ""),
+        "skip_reason": tip.get("skip_reason"),
+        "qbot_logic": tip.get("qbot_logic") if isinstance(tip.get("qbot_logic"), dict) else None,
+        "generated_at": ensure_utc(tip.get("generated_at")).isoformat() if tip.get("generated_at") else None,
+        "source_output_level": "full",
+    }
+    if level == "experimental":
+        full["decision_trace"] = tip.get("decision_trace") if isinstance(tip.get("decision_trace"), dict) else None
+        full["arena_metrics"] = tip.get("arena_metrics") if isinstance(tip.get("arena_metrics"), dict) else None
+        full["source_output_level"] = "experimental"
+    return full
+
+
+async def _get_league_tipping_flags(league_ids: set[int]) -> dict[int, bool]:
+    if not league_ids:
+        return {}
+    rows = await _db.db.league_registry_v3.find(
+        {"_id": {"$in": sorted(league_ids)}},
+        {"_id": 1, "is_active": 1, "features.tipping": 1},
+    ).to_list(length=max(50, len(league_ids)))
+    out: dict[int, bool] = {}
+    for row in rows:
+        lid = row.get("_id")
+        if not isinstance(lid, int):
+            continue
+        features = row.get("features") if isinstance(row.get("features"), dict) else {}
+        out[lid] = bool(row.get("is_active") is True and features.get("tipping") is True)
+    return out
+
+
+async def _attach_persona_qtips(
+    rows: list[dict[str, Any]],
+    *,
+    user: dict[str, Any] | None,
+) -> None:
+    """Embed qtip payloads per match after persona/policy evaluation."""
+    if not rows:
+        return
+    policy = get_persona_policy_service()
+    persona, _source = await policy.resolve_effective_persona(user)
+    is_admin = bool(isinstance(user, dict) and user.get("is_admin") is True)
+    is_authenticated = bool(isinstance(user, dict))
+    match_ids = [int(r.get("_id")) for r in rows if isinstance(r.get("_id"), int)]
+    if not match_ids:
+        return
+    league_ids = {int(r.get("league_id")) for r in rows if isinstance(r.get("league_id"), int)}
+    league_flags = await _get_league_tipping_flags(league_ids)
+
+    # Mixed data history: match_id may be int or str in quotico_tips.
+    match_id_keys: list[int | str] = []
+    for mid in match_ids:
+        match_id_keys.append(mid)
+        match_id_keys.append(str(mid))
+    tip_rows = await _db.db.quotico_tips.find(
+        {"match_id": {"$in": match_id_keys}},
+        {"_id": 0},
+    ).to_list(length=max(200, len(match_id_keys)))
+    tip_map: dict[int, dict[str, Any]] = {}
+    for tip in tip_rows:
+        raw_mid = tip.get("match_id")
+        try:
+            mid = int(raw_mid)
+        except Exception:
+            continue
+        tip_map[mid] = tip
+
+    for row in rows:
+        match_id = int(row.get("_id") or 0)
+        league_id = row.get("league_id")
+        league_enabled = bool(isinstance(league_id, int) and league_flags.get(int(league_id), False))
+        ctx: PersonaContext = {
+            "is_authenticated": is_authenticated,
+            "is_admin": is_admin,
+            "league_tipping_enabled": league_enabled,
+        }
+        level, _version = await policy.resolve_output_level(persona=persona, ctx=ctx)
+        tip = tip_map.get(match_id)
+        if tip is None:
+            row["qtip"] = None
+            row["qtip_output_level"] = "none"
+            continue
+        if level == "none":
+            row["qtip"] = None
+            row["qtip_output_level"] = "none"
+            continue
+        row["qtip"] = _filter_qtip_payload(tip, level)
+        row["qtip_output_level"] = level
 
 
 async def _get_league_names() -> dict[int, dict[str, str]]:
@@ -184,6 +301,7 @@ async def list_matches_v3(
     team_id: int | None = Query(default=None),
     limit: int = Query(default=50, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
+    user: dict[str, Any] | None = Depends(get_optional_user),
 ) -> MatchesListResponse:
     statuses = [status] if status else []
     # When no explicit filters: default to upcoming scheduled matches
@@ -203,6 +321,7 @@ async def list_matches_v3(
     total = await _db.db.matches_v3.count_documents(q)
     # Sort ascending (nearest kickoff first) so upcoming matches appear at top
     rows = await _db.db.matches_v3.find(q).sort("start_at", 1).skip(offset).limit(limit).to_list(length=limit)
+    await _attach_persona_qtips(rows, user=user)
     league_map = await _get_league_names()
     _enrich_with_league_names(rows, league_map)
     items = [MatchV3Out.model_validate(row) for row in rows]
@@ -210,15 +329,20 @@ async def list_matches_v3(
 
 
 @router.get("/matches/{match_id}", response_model=MatchV3Out)
-async def get_match_v3(match_id: int) -> MatchV3Out:
+async def get_match_v3(
+    match_id: int,
+    user: dict[str, Any] | None = Depends(get_optional_user),
+) -> MatchV3Out:
     row = await _db.db.matches_v3.find_one({"_id": int(match_id)})
     if not isinstance(row, dict):
         raise HTTPException(status_code=404, detail="Match not found.")
+    await _attach_persona_qtips([row], user=user)
     league_map = await _get_league_names()
     _enrich_with_league_names([row], league_map)
     return MatchV3Out.model_validate(row)
 
 
+# FIXME: ODDS_V3_BREAK — returns odds_timeline array no longer produced by connector
 @router.get("/matches/{match_id}/odds-timeline")
 async def get_match_odds_timeline_v3(match_id: int) -> dict[str, Any]:
     row = await _db.db.matches_v3.find_one({"_id": int(match_id)}, {"odds_timeline": 1})
@@ -229,13 +353,22 @@ async def get_match_odds_timeline_v3(match_id: int) -> dict[str, Any]:
 
 
 @router.post("/matches/query", response_model=MatchesListResponse)
-async def query_matches_v3(body: MatchesQueryRequest) -> MatchesListResponse:
+async def query_matches_v3(
+    body: MatchesQueryRequest,
+    user: dict[str, Any] | None = Depends(get_optional_user),
+) -> MatchesListResponse:
     ids = [int(x) for x in body.ids if isinstance(x, int)]
     max_ids = int(settings.V3_QUERY_MAX_IDS)
     if len(ids) > max_ids:
         raise HTTPException(status_code=422, detail=f"ids length exceeds limit ({max_ids}).")
 
     payload = body.model_dump(mode="json")
+    payload["persona_ctx"] = {
+        "uid": str(user.get("_id")) if isinstance(user, dict) and user.get("_id") else None,
+        "tp": str(user.get("tip_persona") or "") if isinstance(user, dict) else "",
+        "to": str(user.get("tip_override_persona") or "") if isinstance(user, dict) else "",
+        "adm": bool(user.get("is_admin")) if isinstance(user, dict) else False,
+    }
     key = _query_hash(payload)
     cached = _cache_get(key)
     if cached is not None:
@@ -268,6 +401,7 @@ async def query_matches_v3(body: MatchesQueryRequest) -> MatchesListResponse:
         # Fetch all qualifying matches, compute justice, filter, sort, paginate in Python
         all_rows = await _db.db.matches_v3.find(q).sort(sort_field, sort_dir).to_list(length=5000)
         _enrich_with_justice(all_rows)
+        await _attach_persona_qtips(all_rows, user=user)
         threshold = body.min_justice_diff or 0.0
         filtered = [r for r in all_rows if (r.get("justice") or {}).get("justice_diff", 0) >= threshold]
         # Sort by absolute justice_diff descending
@@ -282,6 +416,7 @@ async def query_matches_v3(body: MatchesQueryRequest) -> MatchesListResponse:
         total = await _db.db.matches_v3.count_documents(q)
         rows = await _db.db.matches_v3.find(q).sort(sort_field, sort_dir).skip(body.offset).limit(body.limit).to_list(length=body.limit)
         _enrich_with_justice(rows)
+        await _attach_persona_qtips(rows, user=user)
         data = {
             "items": rows,
             "meta": {"total": total, "limit": body.limit, "offset": body.offset, "query_hash": key, "source": "fresh"},
@@ -300,6 +435,7 @@ async def query_stats_v3(body: StatsQueryRequest) -> StatsQueryResponse:
     )
     total = await _db.db.matches_v3.count_documents(q)
     advanced = await _db.db.matches_v3.count_documents({**q, "has_advanced_stats": True})
+    # FIXME: ODDS_V3_BREAK — counts odds_meta.summary_1x2 no longer produced by connector
     odds_covered = await _db.db.matches_v3.count_documents(
         {
             **q,
@@ -332,7 +468,7 @@ async def query_qbot_tips_v3(body: QbotTipsQueryRequest) -> QbotTipsQueryRespons
             "start_at": 1,
             "status": 1,
             "teams": 1,
-            "odds_meta.summary_1x2": 1,
+            "odds_meta.summary_1x2": 1,  # FIXME: ODDS_V3_BREAK — projects stale summary_1x2
         },
     ).sort("start_at", -1).limit(body.limit).to_list(length=body.limit)
     meta = V3ListMeta(total=len(rows), limit=body.limit, offset=0)

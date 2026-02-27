@@ -9,8 +9,6 @@ Dependencies:
     - app.services.auth_service
     - app.services.websocket_manager
     - app.services.match_service
-    - app.providers.football_data
-    - app.providers.openligadb
 """
 
 from __future__ import annotations
@@ -28,16 +26,9 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 import app.database as _db
 from app.config import settings
-from app.utils import parse_utc
 from app.services.auth_service import decode_jwt
 from app.services.match_service import sports_with_live_action, next_kickoff_in
 from app.services.websocket_manager import websocket_manager
-from app.providers.football_data import (
-    SPORT_TO_COMPETITION,
-    football_data_provider,
-)
-from app.providers.openligadb import openligadb_provider, SPORT_TO_LEAGUE
-from app.utils.team_matching import teams_match
 
 logger = logging.getLogger("quotico.ws")
 
@@ -58,6 +49,10 @@ class LiveScoreManager:
         self.connections: list[WebSocket] = []
         self._last_scores: dict[str, dict] = {}
         self._poll_task: Optional[asyncio.Task] = None
+        self._odds_buffer_match_ids: set[str] = set()
+        self._odds_buffer_league_id: int | None = None
+        self._odds_buffer_count: int = 0
+        self._odds_flush_task: Optional[asyncio.Task] = None
 
     @property
     def is_full(self) -> bool:
@@ -120,38 +115,9 @@ class LiveScoreManager:
                 interval = _INTERVAL_LIVE
             await asyncio.sleep(interval)
 
-    async def _fetch_and_broadcast(self, live_sports: set[str]) -> None:
-        new_scores: dict[str, dict] = {}
-        for sport_key in live_sports:
-            live_data: list[dict] = []
-            try:
-                if sport_key in SPORT_TO_LEAGUE:
-                    live_data = await openligadb_provider.get_live_scores(sport_key)
-                    if not live_data:
-                        live_data = await football_data_provider.get_live_scores(sport_key)
-                elif sport_key in SPORT_TO_COMPETITION:
-                    live_data = await football_data_provider.get_live_scores(sport_key)
-            except Exception:
-                logger.warning("WS live score provider failed for %s", sport_key, exc_info=True)
-                continue
-
-            for score in live_data:
-                matched = await _match_to_db(sport_key, score)
-                if matched:
-                    new_scores[matched["match_id"]] = matched
-
-        changed = new_scores != self._last_scores
-        self._last_scores = new_scores
-        if changed and self.connections:
-            message = {"type": "live_scores", "data": list(new_scores.values())}
-            dead: list[WebSocket] = []
-            for ws in self.connections:
-                try:
-                    await ws.send_json(message)
-                except Exception:
-                    dead.append(ws)
-            for ws in dead:
-                self.disconnect(ws)
+    async def _fetch_and_broadcast(self, live_sports: set[int]) -> None:
+        # Legacy providers removed — live score polling disabled pending Sportmonks integration
+        pass
 
     async def _broadcast_empty(self) -> None:
         if not self.connections:
@@ -179,10 +145,23 @@ class LiveScoreManager:
         for ws in dead:
             self.disconnect(ws)
 
-    async def broadcast_odds_updated(self, sport_key: str, odds_changed: int) -> None:
+    async def _flush_odds_updates(self) -> None:
+        await asyncio.sleep(0.35)
         if not self.connections:
+            self._odds_buffer_match_ids.clear()
+            self._odds_buffer_league_id = None
+            self._odds_buffer_count = 0
+            self._odds_flush_task = None
             return
-        message = {"type": "odds_updated", "data": {"sport_key": sport_key, "odds_changed": odds_changed}}
+        match_ids = sorted(self._odds_buffer_match_ids)
+        message = {
+            "type": "odds_updated",
+            "data": {
+                "league_id": self._odds_buffer_league_id,
+                "odds_changed": self._odds_buffer_count if self._odds_buffer_count > 0 else len(match_ids),
+                "match_ids": match_ids,
+            },
+        }
         dead: list[WebSocket] = []
         for ws in self.connections:
             try:
@@ -191,37 +170,21 @@ class LiveScoreManager:
                 dead.append(ws)
         for ws in dead:
             self.disconnect(ws)
+        self._odds_buffer_match_ids.clear()
+        self._odds_buffer_league_id = None
+        self._odds_buffer_count = 0
+        self._odds_flush_task = None
 
-
-async def _match_to_db(sport_key: str, score: dict) -> Optional[dict]:
-    utc_date = score.get("utc_date", "")
-    if not isinstance(utc_date, str) or not utc_date:
-        return None
-    try:
-        match_time = parse_utc(utc_date)
-    except ValueError:
-        return None
-
-    candidates = await _db.db.matches.find(
-        {
-            "sport_key": sport_key,
-            "match_date": {
-                "$gte": match_time - timedelta(hours=6),
-                "$lte": match_time + timedelta(hours=6),
-            },
-        }
-    ).to_list(length=50)
-    for candidate in candidates:
-        home = candidate.get("home_team", "")
-        if teams_match(home, score.get("home_team", "")):
-            return {
-                "match_id": str(candidate["_id"]),
-                "home_score": score["home_score"],
-                "away_score": score["away_score"],
-                "minute": score.get("minute"),
-                "sport_key": sport_key,
-            }
-    return None
+    async def broadcast_odds_updated(self, league_id: int | None, odds_changed: int, match_ids: list[str] | None = None) -> None:
+        if not self.connections:
+            return
+        if league_id is not None:
+            self._odds_buffer_league_id = int(league_id)
+        self._odds_buffer_count += max(0, int(odds_changed))
+        if match_ids:
+            self._odds_buffer_match_ids.update(str(mid) for mid in match_ids if str(mid).strip())
+        if self._odds_flush_task is None or self._odds_flush_task.done():
+            self._odds_flush_task = asyncio.create_task(self._flush_odds_updates())
 
 
 def _token_from_ws(websocket: WebSocket) -> str | None:
@@ -344,4 +307,3 @@ async def websocket_event_stream(ws: WebSocket):
         await websocket_manager.disconnect(connection_id)
     except Exception:
         await websocket_manager.disconnect(connection_id)
-

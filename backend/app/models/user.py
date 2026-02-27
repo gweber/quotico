@@ -1,8 +1,10 @@
 from datetime import datetime
 from typing import Optional
+from typing import Literal
 
 from pydantic import BaseModel, EmailStr, field_validator
 
+TipPersona = Literal["casual", "pro", "silent", "experimental"]
 
 class UserInDB(BaseModel):
     """Full user document as stored in MongoDB."""
@@ -22,6 +24,10 @@ class UserInDB(BaseModel):
     birth_date_verified_at: Optional[datetime] = None
     terms_accepted_version: Optional[str] = None
     terms_accepted_at: Optional[datetime] = None
+    tip_persona: TipPersona = "casual"
+    tip_persona_updated_at: Optional[datetime] = None
+    tip_override_persona: Optional[TipPersona] = None
+    tip_override_updated_at: Optional[datetime] = None
     # Wallet compliance
     wallet_disclaimer_accepted_at: Optional[datetime] = None
     # Anti-abuse household clustering
@@ -58,6 +64,11 @@ class UserLogin(BaseModel):
 class AliasUpdate(BaseModel):
     """Request body for changing alias."""
     alias: str
+
+
+class TipPersonaUpdate(BaseModel):
+    """Request body for updating a user's preferred tip persona."""
+    tip_persona: TipPersona
 
 
 class SetPasswordRequest(BaseModel):
@@ -112,4 +123,9 @@ class UserResponse(BaseModel):
     google_linked: bool = False
     has_password: bool = True
     terms_accepted_version: Optional[str] = None
+    tip_persona: TipPersona = "casual"
+    tip_persona_effective: TipPersona = "casual"
+    tip_persona_source: Literal["default", "user", "override", "policy"] = "default"
+    tip_persona_updated_at: Optional[datetime] = None
+    tip_override_persona: Optional[TipPersona] = None
     created_at: datetime

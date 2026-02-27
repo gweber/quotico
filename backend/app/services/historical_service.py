@@ -18,29 +18,6 @@ import app.database as _db
 logger = logging.getLogger("quotico.historical_service")
 
 # ---------------------------------------------------------------------------
-# Legacy sport-key grouping — used by quotico_tip_service, optimizer_service,
-# team_service and quotico_tips router for cross-league queries on the
-# legacy `matches` collection.  Not part of the v3 H2H pipeline.
-# ---------------------------------------------------------------------------
-_ALL_SOCCER_KEYS = [
-    "soccer_germany_bundesliga",
-    "soccer_germany_bundesliga2",
-    "soccer_epl",
-    "soccer_spain_la_liga",
-    "soccer_italy_serie_a",
-    "soccer_france_ligue_one",
-    "soccer_netherlands_eredivisie",
-    "soccer_portugal_primeira_liga",
-]
-RELATED_SPORT_KEYS: dict[str, list[str]] = {k: _ALL_SOCCER_KEYS for k in _ALL_SOCCER_KEYS}
-
-
-def sport_keys_for(sport_key: str) -> list[str]:
-    """Return all related sport keys for cross-league queries."""
-    return RELATED_SPORT_KEYS.get(sport_key, [sport_key])
-
-
-# ---------------------------------------------------------------------------
 # v3 H2H cache
 # ---------------------------------------------------------------------------
 _context_cache: dict[str, tuple[float, dict]] = {}

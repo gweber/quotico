@@ -207,7 +207,7 @@ onMounted(load);
 
     <template v-else>
       <div class="bg-surface-1 rounded-card p-4 border border-surface-3/50">
-        <div class="text-xs text-text-muted">{{ sportLabel(detail.sport_key) }}</div>
+        <div class="text-xs text-text-muted">{{ sportLabel(detail.league_id) }}</div>
         <div class="text-sm text-text-primary font-medium mt-1">
           {{ detail.version }} · Gen {{ detail.generation }} · {{ identityLabel(detail.archetype || "standard") }}
         </div>

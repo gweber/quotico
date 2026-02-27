@@ -60,6 +60,7 @@ class _FakeWS:
         self.messages.append(payload)
 
 
+# FIXME: ODDS_V3_BREAK — tests OddsIngestedEvent which is no longer published by connector
 @pytest.mark.asyncio
 async def test_ws_pipeline_receives_filtered_odds_event(monkeypatch):
     league_id = ObjectId()
@@ -68,8 +69,8 @@ async def test_ws_pipeline_receives_filtered_odds_event(monkeypatch):
     fake_db = SimpleNamespace(
         matches=_FakeMatches(
             [
-                {"_id": m1, "league_id": league_id, "sport_key": "soccer_epl", "odds_meta": {}},
-                {"_id": m2, "league_id": league_id, "sport_key": "soccer_epl", "odds_meta": {}},
+                {"_id": m1, "league_id": league_id, "league_id": 8, "odds_meta": {}},
+                {"_id": m2, "league_id": league_id, "league_id": 8, "odds_meta": {}},
             ]
         ),
         leagues=_FakeLeagues([{"_id": league_id, "external_ids": {"openligadb": "bl1"}}]),

@@ -16,8 +16,6 @@ from __future__ import annotations
 
 from typing import Any
 
-from bson import ObjectId
-
 import app.database as _db
 from app.config import settings
 from app.services.encryption import CURRENT_KEY_VERSION, decrypt, encrypt
@@ -41,10 +39,7 @@ def _norm_scope(scope: str) -> str:
 
 def _env_key_for_provider(provider: str) -> str:
     mapping = {
-        "theoddsapi": "ODDSAPIKEY",
-        "football_data": "FOOTBALL_DATA_ORG_API_KEY",
-        "openligadb": "",
-        "football_data_uk": "",
+        "sportmonks": "SM_API_KEY",
         "understat": "",
     }
     return mapping.get(provider, "")
@@ -52,80 +47,25 @@ def _env_key_for_provider(provider: str) -> str:
 
 def _defaults(provider: str) -> dict[str, Any]:
     defaults: dict[str, dict[str, Any]] = {
-        "theoddsapi": {
+        "sportmonks": {
             "enabled": True,
-            "base_url": settings.THEODDSAPI_BASE_URL,
-            "timeout_seconds": 15.0,
+            "base_url": str(settings.SPORTMONKS_BASE_URL or ""),
+            "timeout_seconds": 90.0,
             "max_retries": 3,
-            "base_delay_seconds": 10.0,
-            "rate_limit_rpm": int(settings.THEODDSAPI_RATE_LIMIT_RPM),
+            "base_delay_seconds": 2.0,
+            "rate_limit_rpm": 180,
             "poll_interval_seconds": 900,
             "headers_override": {},
             "extra": {},
-        },
-        "football_data": {
-            "enabled": True,
-            "base_url": settings.FOOTBALL_DATA_ORG_BASE_URL,
-            "timeout_seconds": 15.0,
-            "max_retries": 3,
-            "base_delay_seconds": 10.0,
-            "rate_limit_rpm": int(settings.FOOTBALL_DATA_RATE_LIMIT_RPM),
-            "poll_interval_seconds": 1800,
-            "headers_override": {},
-            "extra": {},
-        },
-        "openligadb": {
-            "enabled": True,
-            "base_url": settings.OPENLIGADB_BASE_URL,
-            "timeout_seconds": 15.0,
-            "max_retries": 3,
-            "base_delay_seconds": 10.0,
-            "rate_limit_rpm": int(settings.OPENLIGADB_RATE_LIMIT_RPM),
-            "poll_interval_seconds": 1800,
-            "headers_override": {},
-            "extra": {},
-        },
-        "football_data_uk": {
-            "enabled": True,
-            "base_url": settings.FOOTBALL_DATA_UK_BASE_URL,
-            "timeout_seconds": 30.0,
-            "max_retries": 3,
-            "base_delay_seconds": 5.0,
-            "rate_limit_rpm": int(settings.FOOTBALL_DATA_UK_RATE_LIMIT_RPM),
-            "poll_interval_seconds": None,
-            "headers_override": {},
-            "extra": {},
-        },
-        "understat": {
-            "enabled": True,
-            "base_url": settings.UNDERSTAT_BASE_URL,
-            "timeout_seconds": 30.0,
-            "max_retries": 3,
-            "base_delay_seconds": 5.0,
-            "rate_limit_rpm": int(settings.UNDERSTAT_RATE_LIMIT_RPM),
-            "poll_interval_seconds": None,
-            "headers_override": {},
-            "extra": {},
-        },
+        }
     }
-    return dict(defaults.get(provider, defaults["openligadb"]))
+    return dict(defaults.get(provider, defaults["sportmonks"]))
 
 
 def _env_fallback(provider: str) -> dict[str, Any]:
     defaults = _defaults(provider)
-    base_url_map = {
-        "theoddsapi": settings.THEODDSAPI_BASE_URL,
-        "football_data": settings.FOOTBALL_DATA_ORG_BASE_URL,
-        "openligadb": settings.OPENLIGADB_BASE_URL,
-        "football_data_uk": settings.FOOTBALL_DATA_UK_BASE_URL,
-        "understat": settings.UNDERSTAT_BASE_URL,
-    }
-    rpm_map = {
-        "theoddsapi": settings.THEODDSAPI_RATE_LIMIT_RPM,
-        "football_data": settings.FOOTBALL_DATA_RATE_LIMIT_RPM,
-        "openligadb": settings.OPENLIGADB_RATE_LIMIT_RPM,
-        "football_data_uk": settings.FOOTBALL_DATA_UK_RATE_LIMIT_RPM,
-        "understat": settings.UNDERSTAT_RATE_LIMIT_RPM,
+    base_url_map: dict[str, str] = {
+        "sportmonks": str(settings.SPORTMONKS_BASE_URL or "")
     }
     defaults["base_url"] = base_url_map.get(provider, defaults["base_url"])
     defaults["rate_limit_rpm"] = int(rpm_map.get(provider, defaults["rate_limit_rpm"] or 0))
@@ -143,12 +83,11 @@ class ProviderSettingsService:
         self,
         provider: str,
         *,
-        sport_key: str | None = None,
-        league_id: str | ObjectId | None = None,
+        league_id: int | None = None,
         include_secret: bool = True,
     ) -> dict[str, Any]:
         provider_name = _norm_provider(provider)
-        lid = await self._resolve_league_id(sport_key=sport_key, league_id=league_id)
+        lid = await self._resolve_league_id(league_id=league_id)
         cache_key = f"{provider_name}:{lid or 'global'}:{'secret' if include_secret else 'nosecret'}"
         now_ts = utcnow().timestamp()
         ttl = max(0, int(settings.PROVIDER_SETTINGS_CACHE_TTL))
@@ -263,7 +202,7 @@ class ProviderSettingsService:
         provider: str,
         *,
         scope: Scope = _SCOPE_GLOBAL,
-        league_id: str | ObjectId | None = None,
+        league_id: int | None = None,
     ) -> dict[str, Any]:
         provider_name = _norm_provider(provider)
         normalized_scope = _norm_scope(scope)
@@ -293,7 +232,7 @@ class ProviderSettingsService:
         patch: dict[str, Any],
         *,
         scope: Scope = _SCOPE_GLOBAL,
-        league_id: str | ObjectId | None = None,
+        league_id: int | None = None,
         actor_id: str,
     ) -> dict[str, Any]:
         provider_name = _norm_provider(provider)
@@ -344,7 +283,7 @@ class ProviderSettingsService:
         *,
         api_key: str,
         scope: Scope = _SCOPE_GLOBAL,
-        league_id: str | ObjectId | None = None,
+        league_id: int | None = None,
         actor_id: str,
     ) -> dict[str, Any]:
         provider_name = _norm_provider(provider)
@@ -388,7 +327,7 @@ class ProviderSettingsService:
         provider: str,
         *,
         scope: Scope = _SCOPE_GLOBAL,
-        league_id: str | ObjectId | None = None,
+        league_id: int | None = None,
     ) -> dict[str, Any]:
         provider_name = _norm_provider(provider)
         normalized_scope = _norm_scope(scope)
@@ -406,14 +345,14 @@ class ProviderSettingsService:
             "configured": False,
         }
 
-    async def invalidate(self, *, provider: str | None = None, league_id: str | ObjectId | None = None) -> None:
+    async def invalidate(self, *, provider: str | None = None, league_id: int | None = None) -> None:
         provider_name = _norm_provider(provider or "") if provider else None
-        lid = str(league_id) if league_id is not None else None
+        lid = league_id
         keys = list(self._cache.keys())
         for key in keys:
             if provider_name and not key.startswith(f"{provider_name}:"):
                 continue
-            if lid and f":{lid}:" not in key:
+            if lid is not None and f":{lid}:" not in key:
                 continue
             self._cache.pop(key, None)
             self._cache_ts.pop(key, None)
@@ -421,19 +360,11 @@ class ProviderSettingsService:
     async def _resolve_league_id(
         self,
         *,
-        sport_key: str | None = None,
-        league_id: str | ObjectId | None = None,
-    ) -> str | None:
-        if league_id is not None:
-            return str(league_id)
-        if sport_key:
-            try:
-                league = await _db.db.leagues.find_one({"sport_key": str(sport_key).strip().lower()}, {"_id": 1})
-            except Exception:
-                league = None
-            if league:
-                return str(league.get("_id"))
-        return None
+        league_id: int | None = None,
+    ) -> int | None:
+        if league_id is None:
+            return None
+        return int(league_id)
 
 
 provider_settings_service = ProviderSettingsService()

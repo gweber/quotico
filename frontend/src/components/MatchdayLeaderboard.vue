@@ -3,7 +3,7 @@ import { ref, watch } from "vue";
 import { useApi } from "@/composables/useApi";
 
 const props = defineProps<{
-  sportKey: string;
+  leagueId: number;
   season?: number;
   matchdayId?: string;
   mode: "season" | "matchday";
@@ -32,7 +32,7 @@ async function load() {
         `/matchday/matchdays/${props.matchdayId}/leaderboard`
       );
     } else {
-      const params: Record<string, string> = { sport: props.sportKey };
+      const params: Record<string, string> = { league_id: String(props.leagueId) };
       if (props.season) params.season = String(props.season);
       entries.value = await api.get<LeaderboardEntry[]>(
         "/matchday/leaderboard",
@@ -47,7 +47,7 @@ async function load() {
 }
 
 watch(
-  () => [props.sportKey, props.season, props.matchdayId, props.mode],
+  () => [props.leagueId, props.season, props.matchdayId, props.mode],
   () => load(),
   { immediate: true }
 );

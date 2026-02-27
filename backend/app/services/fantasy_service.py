@@ -47,8 +47,8 @@ async def make_pick(
     """Make a fantasy team pick for a matchday."""
     now = utcnow()
 
-    # Validate match first (need sport_key for league config check)
-    match = await _db.db.matches.find_one({"_id": ObjectId(match_id)})
+    # Validate match first (need league_id for league config check)
+    match = await _db.db.matches_v3.find_one({"_id": int(match_id)})
     if not match:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Match not found.")
 
@@ -59,7 +59,7 @@ async def make_pick(
     if user_id not in squad.get("members", []):
         raise HTTPException(status.HTTP_403_FORBIDDEN, "You are not a member of this squad.")
     from app.services.squad_league_service import require_active_league_config
-    require_active_league_config(squad, match["sport_key"], "fantasy")
+    require_active_league_config(squad, match["league_id"], "fantasy")
     if is_match_locked(match):
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Match is locked.")
 
@@ -69,11 +69,11 @@ async def make_pick(
         raise HTTPException(status.HTTP_409_CONFLICT, "Match team identity not initialized yet.")
 
     registry = TeamRegistry.get()
-    team_id = await registry.resolve(team, match["sport_key"])
+    team_id = await registry.resolve(team, match["league_id"])
     if team_id not in (home_team_id, away_team_id):
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Team not in this match.")
 
-    sport_key = match["sport_key"]
+    league_id = match["league_id"]
     season = match.get("matchday_season") or now.year
     matchday_number = match.get("matchday_number")
     if not matchday_number:
@@ -82,7 +82,7 @@ async def make_pick(
     pick_doc = {
         "user_id": user_id,
         "squad_id": squad_id,
-        "sport_key": sport_key,
+        "league_id": league_id,
         "season": season,
         "matchday_number": matchday_number,
         "team": team,
@@ -107,7 +107,7 @@ async def make_pick(
             {
                 "user_id": user_id,
                 "squad_id": squad_id,
-                "sport_key": sport_key,
+                "league_id": league_id,
                 "season": season,
                 "matchday_number": matchday_number,
                 "status": "pending",
@@ -123,7 +123,7 @@ async def make_pick(
         pick_doc = await _db.db.fantasy_picks.find_one({
             "user_id": user_id,
             "squad_id": squad_id,
-            "sport_key": sport_key,
+            "league_id": league_id,
             "season": season,
             "matchday_number": matchday_number,
         })
@@ -136,24 +136,24 @@ async def make_pick(
 
 
 async def get_user_pick(
-    user_id: str, squad_id: str, sport_key: str, season: int, matchday_number: int,
+    user_id: str, squad_id: str, league_id: int, season: int, matchday_number: int,
 ) -> dict | None:
     """Get user's fantasy pick for a specific matchday."""
     return await _db.db.fantasy_picks.find_one({
         "user_id": user_id,
         "squad_id": squad_id,
-        "sport_key": sport_key,
+        "league_id": league_id,
         "season": season,
         "matchday_number": matchday_number,
     })
 
 
-async def get_standings(squad_id: str, sport_key: str, season: int) -> list[dict]:
+async def get_standings(squad_id: str, league_id: int, season: int) -> list[dict]:
     """Get fantasy standings for a squad — aggregated season points."""
     pipeline = [
         {"$match": {
             "squad_id": squad_id,
-            "sport_key": sport_key,
+            "league_id": league_id,
             "season": season,
             "status": "resolved",
         }},

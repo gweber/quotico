@@ -33,10 +33,10 @@ export const useSurvivorStore = defineStore("survivor", () => {
   const standings = ref<SurvivorStanding[]>([]);
   const loading = ref(false);
 
-  async function fetchStatus(squadId: string, sport: string, season?: number) {
+  async function fetchStatus(squadId: string, leagueId: number, season?: number) {
     loading.value = true;
     try {
-      const params: Record<string, string> = { sport };
+      const params: Record<string, string> = { league_id: String(leagueId) };
       if (season) params.season = String(season);
       entry.value = await api.get<SurvivorEntry>(`/survivor/${squadId}/status`, params);
     } catch {
@@ -55,9 +55,9 @@ export const useSurvivorStore = defineStore("survivor", () => {
     return result;
   }
 
-  async function fetchStandings(squadId: string, sport: string, season?: number) {
+  async function fetchStandings(squadId: string, leagueId: number, season?: number) {
     try {
-      const params: Record<string, string> = { sport };
+      const params: Record<string, string> = { league_id: String(leagueId) };
       if (season) params.season = String(season);
       standings.value = await api.get<SurvivorStanding[]>(
         `/survivor/${squadId}/standings`,

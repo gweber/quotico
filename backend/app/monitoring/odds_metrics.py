@@ -92,7 +92,7 @@ METRIC_PROVIDER_COUNT = (
     Gauge(
         "odds_market_provider_count",
         "Providers contributing to current odds per market.",
-        ["sport_key", "market"],
+        ["league_id", "market"],
     )
     if Gauge
     else _NoOpMetric()
@@ -101,7 +101,7 @@ METRIC_PROVIDER_LAST_SEEN = (
     Gauge(
         "odds_provider_last_seen_seconds",
         "Epoch timestamp of provider last seen update.",
-        ["provider", "sport_key"],
+        ["provider", "league_id"],
     )
     if Gauge
     else _NoOpMetric()

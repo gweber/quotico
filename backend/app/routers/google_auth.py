@@ -154,6 +154,10 @@ async def _handle_google_callback(request: Request, code: str) -> RedirectRespon
             "is_deleted": False,
             "is_adult": False,
             "birth_date_verified_at": None,
+            "tip_persona": "casual",
+            "tip_persona_updated_at": now,
+            "tip_override_persona": None,
+            "tip_override_updated_at": None,
             "created_at": now,
             "updated_at": now,
         }

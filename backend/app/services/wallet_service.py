@@ -16,13 +16,13 @@ logger = logging.getLogger("quotico.wallet_service")
 
 
 async def get_or_create_wallet(
-    user_id: str, squad_id: str, sport_key: str, season: int
+    user_id: str, squad_id: str, league_id: int, season: int
 ) -> dict:
     """Get existing wallet or create a new one with initial balance."""
     wallet = await _db.db.wallets.find_one({
         "user_id": user_id,
         "squad_id": squad_id,
-        "sport_key": sport_key,
+        "league_id": league_id,
         "season": season,
     })
     if wallet:
@@ -35,7 +35,7 @@ async def get_or_create_wallet(
 
     # Try league_configs first, fall back to legacy game_mode_config
     from app.services.squad_league_service import get_active_league_config
-    league_config = get_active_league_config(squad, sport_key)
+    league_config = get_active_league_config(squad, league_id)
     if league_config:
         config = league_config.get("config", {})
     else:
@@ -49,7 +49,7 @@ async def get_or_create_wallet(
     wallet_doc = {
         "user_id": user_id,
         "squad_id": squad_id,
-        "sport_key": sport_key,
+        "league_id": league_id,
         "season": season,
         "balance": float(initial_balance),
         "initial_balance": float(initial_balance),
@@ -74,12 +74,12 @@ async def get_or_create_wallet(
         tx_type=TransactionType.INITIAL_CREDIT,
         amount=float(initial_balance),
         balance_after=float(initial_balance),
-        description=f"Initial balance {sport_key} season {season}",
+        description=f"Initial balance {league_id} season {season}",
     )
 
     logger.info(
-        "Wallet created: user=%s squad=%s sport=%s season=%d balance=%.0f",
-        user_id, squad_id, sport_key, season, initial_balance,
+        "Wallet created: user=%s squad=%s league_id=%s season=%d balance=%.0f",
+        user_id, squad_id, league_id, season, initial_balance,
     )
     return wallet_doc
 

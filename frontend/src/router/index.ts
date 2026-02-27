@@ -68,7 +68,7 @@ const router = createRouter({
       meta: { requiresAuth: true },
     },
     {
-      path: "/matchday/:sport?/:matchday?",
+      path: "/matchday/:leagueId?/:matchday?",
       name: "matchday",
       component: () => import("@/views/MatchdayView.vue"),
     },
@@ -94,6 +94,16 @@ const router = createRouter({
       name: "analysis",
       component: () => import("@/views/AnalysisView.vue"),
     },
+    {
+      path: "/teams",
+      name: "teams",
+      component: () => import("@/views/TeamsView.vue"),
+    },
+    {
+      path: "/team/:teamSlug",
+      name: "team-detail",
+      component: () => import("@/views/TeamDetailView.vue"),
+    },
     // Legal
     {
       path: "/legal/:section",
@@ -112,9 +122,15 @@ const router = createRouter({
       meta: { requiresAuth: true, requiresAdmin: true },
     },
     {
-      path: "/admin/ingest",
-      name: "admin-ingest",
-      component: () => import("@/views/admin/AdminIngestDiscoveryView.vue"),
+      path: "/admin/api-analytics",
+      name: "admin-api-analytics",
+      component: () => import("@/views/admin/AdminApiAnalyticsView.vue"),
+      meta: { requiresAuth: true, requiresAdmin: true },
+    },
+    {
+      path: "/admin/league-control",
+      name: "admin-league-control",
+      component: () => import("@/views/admin/AdminLeagueControlCenter.vue"),
       meta: { requiresAuth: true, requiresAdmin: true },
     },
     {
@@ -163,6 +179,24 @@ const router = createRouter({
       path: "/admin/team-tower",
       name: "admin-team-tower",
       component: () => import("@/views/admin/AdminTeamTowerView.vue"),
+      meta: { requiresAuth: true, requiresAdmin: true },
+    },
+    {
+      path: "/admin/referees",
+      name: "admin-referees",
+      component: () => import("@/views/admin/AdminRefereeTower.vue"),
+      meta: { requiresAuth: true, requiresAdmin: true },
+    },
+    {
+      path: "/admin/referees/:refereeId",
+      name: "admin-referee-detail",
+      component: () => import("@/views/admin/AdminRefereeDetailView.vue"),
+      meta: { requiresAuth: true, requiresAdmin: true },
+    },
+    {
+      path: "/admin/odds-monitor",
+      name: "admin-odds-monitor",
+      component: () => import("@/views/admin/AdminOddsMonitor.vue"),
       meta: { requiresAuth: true, requiresAdmin: true },
     },
     {

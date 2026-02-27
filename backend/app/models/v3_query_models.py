@@ -77,6 +77,8 @@ class MatchV3Out(BaseModel):
     odds_timeline: list[dict[str, Any]] = Field(default_factory=list)
     manual_check_required: bool = False
     justice: JusticeMetrics | None = None
+    qtip: dict[str, Any] | None = None
+    qtip_output_level: Literal["none", "summary", "full", "experimental"] = "none"
 
 
 class V3ListMeta(BaseModel):

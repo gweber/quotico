@@ -15,7 +15,7 @@ interface TeamAlias {
   name: string;
   normalized: string;
   source: string;
-  sport_key: string | null;
+  league_id: number | null;
   alias_key: string;
   is_default: boolean;
 }
@@ -39,7 +39,7 @@ interface TeamListResponse {
 interface SuggestionItem {
   id: string;
   source: string;
-  sport_key: string | null;
+  league_id: number | null;
   raw_team_name: string;
   confidence_score: number;
   suggested_team_id: number | null;
@@ -66,7 +66,7 @@ const teams = ref<TeamItem[]>([]);
 const suggestions = ref<SuggestionItem[]>([]);
 const loading = ref(false);
 const search = ref("");
-const aliasDraftByTeam = ref<Record<number, { name: string; source: string; sport_key: string }>>({});
+const aliasDraftByTeam = ref<Record<number, { name: string; source: string; league_id: number | null }>>({});
 const deleteModalOpen = ref(false);
 const deleteTarget = ref<{ teamId: number; alias: TeamAlias } | null>(null);
 const deleteImpact = ref<DeleteImpact | null>(null);
@@ -74,7 +74,7 @@ const deleteBlocked = ref<string | null>(null);
 
 function ensureDraft(teamId: number): void {
   if (!aliasDraftByTeam.value[teamId]) {
-    aliasDraftByTeam.value[teamId] = { name: "", source: "manual", sport_key: "" };
+    aliasDraftByTeam.value[teamId] = { name: "", source: "manual", league_id: null };
   }
 }
 
@@ -121,10 +121,10 @@ async function addAlias(team: TeamItem): Promise<void> {
     await api.post(`/admin/teams-v3/${team.id}/aliases`, {
       name: draft.name.trim(),
       source: draft.source,
-      sport_key: draft.sport_key.trim() || null,
+      league_id: draft.league_id,
     });
     draft.name = "";
-    draft.sport_key = "";
+    draft.league_id = null;
     toast.success(t("admin.teamTower.aliasAdded"));
     await fetchTeams();
   } catch (error) {
@@ -141,7 +141,7 @@ async function openDeleteAlias(teamId: number, alias: TeamAlias): Promise<void> 
     const impact = await api.post<DeleteImpact>(`/admin/teams-v3/${teamId}/aliases/impact`, {
       name: alias.name,
       source: alias.source,
-      sport_key: alias.sport_key,
+      league_id: alias.league_id,
     });
     deleteImpact.value = impact;
   } catch (error) {
@@ -159,7 +159,7 @@ async function confirmDeleteAlias(): Promise<void> {
     }>(`/admin/teams-v3/${teamId}/aliases`, {
       name: alias.name,
       source: alias.source,
-      sport_key: alias.sport_key,
+      league_id: alias.league_id,
     });
     if (result.blocked?.code === "canonical_alias_protected") {
       deleteBlocked.value = t("admin.teamTower.alias.canonicalProtected");
@@ -326,12 +326,12 @@ onMounted(async () => {
             <option value="provider_unknown">provider_unknown</option>
           </select>
           <input
-            :value="(aliasDraftByTeam[team.id] || { sport_key: '' }).sport_key"
+            :value="(aliasDraftByTeam[team.id] || { league_id: null }).league_id ?? ''"
             type="text"
             class="rounded-card border border-surface-3 bg-surface-0 px-3 py-2 text-sm text-text-primary focus:border-primary focus:outline-none"
             :placeholder="t('admin.teamTower.aliases.sportPlaceholder')"
             @focus="ensureDraft(team.id)"
-            @input="ensureDraft(team.id); aliasDraftByTeam[team.id].sport_key = ($event.target as HTMLInputElement).value"
+            @input="ensureDraft(team.id); aliasDraftByTeam[team.id].league_id = Number(($event.target as HTMLInputElement).value) || null"
           />
           <button
             type="button"

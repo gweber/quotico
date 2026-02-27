@@ -28,8 +28,8 @@ from app.utils import utcnow
 
 logger = logging.getLogger("quotico.websocket_manager")
 
-_FILTER_KEYS = ("match_ids", "league_ids", "league_codes", "sport_keys", "event_types")
-_EVENT_FILTER_KEYS = ("match_ids", "league_ids", "league_codes", "sport_keys")
+_FILTER_KEYS = ("match_ids", "league_ids", "league_codes", "event_types")
+_EVENT_FILTER_KEYS = ("match_ids", "league_ids", "league_codes")
 
 
 def _normalize_str_set(values: Any) -> set[str]:
@@ -43,12 +43,31 @@ def _normalize_str_set(values: Any) -> set[str]:
     return out
 
 
+def _normalize_league_id_set(values: Any) -> set[int]:
+    """Normalize league-id filters as int-only tokens."""
+    if not isinstance(values, list):
+        return set()
+    out: set[int] = set()
+    for item in values:
+        if isinstance(item, bool):
+            logger.warning("Legacy websocket payload rejected bool league_id=%s", item)
+            continue
+        if isinstance(item, int):
+            out.add(item)
+            continue
+        if isinstance(item, str):
+            logger.warning("Legacy websocket payload uses string league_id='%s'; expected int", item)
+            continue
+        logger.warning("Legacy websocket payload rejected unsupported league_id type=%s", type(item).__name__)
+    return out
+
+
 @dataclass
 class ManagedConnection:
     connection_id: str
     user_id: str
     websocket: WebSocket
-    filters: dict[str, set[str]]
+    filters: dict[str, set[Any]]
     connected_at: datetime
     last_seen_at: datetime
 
@@ -121,7 +140,7 @@ class WebSocketManager:
             if conn:
                 conn.last_seen_at = utcnow()
 
-    async def update_filters(self, connection_id: str, command_type: str, payload: dict[str, Any]) -> dict[str, list[str]]:
+    async def update_filters(self, connection_id: str, command_type: str, payload: dict[str, Any]) -> dict[str, list[Any]]:
         async with self._lock:
             conn = self._connections.get(connection_id)
             if not conn:
@@ -151,7 +170,14 @@ class WebSocketManager:
         meta: dict[str, Any] | None = None,
     ) -> int:
         selectors = selectors or {}
-        normalized_selectors = {key: _normalize_str_set(selectors.get(key, [])) for key in _EVENT_FILTER_KEYS}
+        if selectors.get("sport_keys"):
+            logger.warning("Legacy websocket selectors use deprecated 'sport_keys'")
+        normalized_selectors: dict[str, set[Any]] = {}
+        for key in _EVENT_FILTER_KEYS:
+            if key == "league_ids":
+                normalized_selectors[key] = _normalize_league_id_set(selectors.get(key, []))
+            else:
+                normalized_selectors[key] = _normalize_str_set(selectors.get(key, []))
         message = {
             "type": str(event_type),
             "data": data,
@@ -216,20 +242,25 @@ class WebSocketManager:
                 self._dropped_connections += 1
 
     @staticmethod
-    def _filters_from_payload(payload: dict[str, Any]) -> dict[str, set[str]]:
+    def _filters_from_payload(payload: dict[str, Any]) -> dict[str, set[Any]]:
         out = {key: set() for key in _FILTER_KEYS}
         if not isinstance(payload, dict):
             return out
         for key in _FILTER_KEYS:
-            out[key] = _normalize_str_set(payload.get(key, []))
+            if key == "league_ids":
+                out[key] = _normalize_league_id_set(payload.get(key, []))
+            else:
+                out[key] = _normalize_str_set(payload.get(key, []))
+        if payload.get("sport_keys"):
+            logger.warning("Legacy websocket payload uses deprecated 'sport_keys' filter")
         return out
 
     @staticmethod
-    def _filters_to_jsonable(filters: dict[str, set[str]]) -> dict[str, list[str]]:
+    def _filters_to_jsonable(filters: dict[str, set[Any]]) -> dict[str, list[Any]]:
         return {key: sorted(filters.get(key, set())) for key in _FILTER_KEYS}
 
     @staticmethod
-    def _matches(filters: dict[str, set[str]], *, event_type: str, selectors: dict[str, set[str]]) -> bool:
+    def _matches(filters: dict[str, set[Any]], *, event_type: str, selectors: dict[str, set[Any]]) -> bool:
         event_types = filters.get("event_types", set())
         if event_types and event_type not in event_types:
             return False

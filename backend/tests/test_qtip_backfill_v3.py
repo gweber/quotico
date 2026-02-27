@@ -91,7 +91,7 @@ class _FakeQuoticoTipsCollection:
 async def test_load_history_snapshots_includes_v3_fields(monkeypatch):
     docs = [
         {
-            "sport_key": "soccer_germany_bundesliga",
+            "league_id": 82,
             "snapshot_date": qtip_backfill.datetime(2025, 2, 1),
             "params": {"rho": -0.08, "alpha": 0.005, "floor": 0.05},
             "reliability": {"cap": 0.9},
@@ -103,9 +103,9 @@ async def test_load_history_snapshots_includes_v3_fields(monkeypatch):
     fake_db = SimpleNamespace(engine_config_history=_FakeEngineConfigHistory(docs))
     monkeypatch.setattr(db_module, "db", fake_db, raising=False)
 
-    grouped = await qtip_backfill.load_history_snapshots("soccer_germany_bundesliga")
-    assert "soccer_germany_bundesliga" in grouped
-    _ts, cache_entry = grouped["soccer_germany_bundesliga"][0]
+    grouped = await qtip_backfill.load_history_snapshots("82")
+    assert "82" in grouped
+    _ts, cache_entry = grouped["82"][0]
     assert cache_entry["schema_version"] == "v3"
     assert cache_entry["market_performance"]["avg_clv"] == 0.1
     assert cache_entry["statistical_integrity"]["avg_xg_delta"] == 0.2
@@ -116,7 +116,7 @@ async def test_run_backfill_calls_enrich_tip_with_match(monkeypatch):
     seen = {"match_id": None}
     match = {
         "_id": "m1",
-        "sport_key": "soccer_germany_bundesliga",
+        "league_id": 82,
         "home_team": "A",
         "away_team": "B",
         "home_team_id": "h1",
@@ -159,7 +159,7 @@ async def test_run_backfill_calls_enrich_tip_with_match(monkeypatch):
     monkeypatch.setattr(tip_module, "resolve_tip", _fake_resolve)
 
     await qtip_backfill.run_backfill(
-        sport_key="soccer_germany_bundesliga",
+        league_id=82,
         batch_size=10,
         skip=0,
         dry_run=True,
@@ -192,7 +192,7 @@ async def test_run_backfill_rerun_failed_deletes_error_only(monkeypatch):
     monkeypatch.setattr(qtip_backfill, "load_history_snapshots", _fake_load_history)
 
     await qtip_backfill.run_backfill(
-        sport_key="soccer_germany_bundesliga",
+        league_id=82,
         batch_size=50,
         skip=0,
         dry_run=False,
@@ -204,7 +204,7 @@ async def test_run_backfill_rerun_failed_deletes_error_only(monkeypatch):
     )
     assert fake_tips.deleted_queries
     assert fake_tips.deleted_queries[0]["status"] == "error"
-    assert fake_tips.deleted_queries[0]["sport_key"] == "soccer_germany_bundesliga"
+    assert fake_tips.deleted_queries[0]["league_id"] == "82"
 
 
 @pytest.mark.asyncio
@@ -227,7 +227,7 @@ async def test_run_backfill_rejects_rerun_and_rerun_failed(monkeypatch):
 
     with pytest.raises(ValueError):
         await qtip_backfill.run_backfill(
-            sport_key=None,
+            league_id=None,
             batch_size=10,
             skip=0,
             dry_run=True,

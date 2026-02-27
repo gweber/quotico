@@ -30,14 +30,13 @@ from app.services.quotico_tip_service import (
     EVD_BOOST_THRESHOLD,
     EVD_DAMPEN_THRESHOLD,
 )
-from app.services.historical_service import sport_keys_for
 from app.services.team_registry_service import TeamRegistry
 
 logger = logging.getLogger("quotico.quotico_tips_router")
 router = APIRouter(prefix="/api/quotico-tips", tags=["quotico-tips"])
 
-# In-memory cache for public performance endpoint (60s TTL), keyed by sport_key
-_perf_cache: dict[str, dict] = {}
+# In-memory cache for public performance endpoint (60s TTL), keyed by league_id
+_perf_cache: dict[str | int, dict] = {}
 _PERF_CACHE_TTL = 60
 
 
@@ -47,7 +46,7 @@ _PERF_CACHE_TTL = 60
 
 @router.get("/", response_model=list[QuoticoTipResponse])
 async def list_tips(
-    sport_key: str | None = Query(None, description="Filter by sport key"),
+    league_id: int | None = Query(None, description="Filter by league id"),
     match_ids: str | None = Query(None, description="Comma-separated match IDs to fetch tips for"),
     min_confidence: float = Query(0.0, ge=0.0, le=1.0, description="Minimum confidence"),
     include_no_signal: bool = Query(False, description="Include tips with no recommendation"),
@@ -56,8 +55,8 @@ async def list_tips(
     """List QuoticoTips for upcoming matches, sorted by confidence."""
     statuses = ["active", "no_signal"] if include_no_signal else ["active"]
     query: dict = {"status": {"$in": statuses}}
-    if sport_key:
-        query["sport_key"] = sport_key
+    if league_id is not None:
+        query["league_id"] = league_id
     if match_ids:
         ids = [mid.strip() for mid in match_ids.split(",") if mid.strip()]
         if ids:
@@ -75,10 +74,10 @@ async def list_tips(
     for tip in quotico_tips:
         results.append(QuoticoTipResponse(
             match_id=tip["match_id"],
-            sport_key=tip["sport_key"],
+            league_id=tip["league_id"],
             home_team=tip["home_team"],
             away_team=tip["away_team"],
-            match_date=ensure_utc(tip["match_date"]),
+            match_date=ensure_utc(tip["start_at"]),
             recommended_selection=tip["recommended_selection"],
             confidence=tip["confidence"],
             raw_confidence=tip.get("raw_confidence"),
@@ -99,18 +98,18 @@ async def list_tips(
 
 @router.get("/public-performance")
 async def public_performance(
-    sport_key: str | None = Query(None, description="Filter by sport key"),
+    league_id: int | None = Query(None, description="Filter by league id"),
 ):
     """Public Q-Tip track record — aggregated stats, no auth required."""
     now = time.time()
-    cache_key = sport_key or "_all"
+    cache_key = league_id or "_all"
     cached = _perf_cache.get(cache_key)
     if cached and cached["expires"] > now:
         return cached["data"]
 
     base_match: dict = {"status": "resolved", "was_correct": {"$ne": None}}
-    if sport_key:
-        base_match["sport_key"] = sport_key
+    if league_id is not None:
+        base_match["league_id"] = league_id
 
     async def _overall():
         results = await _db.db.quotico_tips.aggregate([
@@ -138,7 +137,7 @@ async def public_performance(
         results = await _db.db.quotico_tips.aggregate([
             {"$match": base_match},
             {"$group": {
-                "_id": "$sport_key",
+                "_id": "$league_id",
                 "total": {"$sum": 1},
                 "correct": {"$sum": {"$cond": ["$was_correct", 1, 0]}},
                 "avg_confidence": {"$avg": "$confidence"},
@@ -147,7 +146,7 @@ async def public_performance(
             {"$sort": {"total": -1}},
         ]).to_list(length=50)
         return [{
-            "sport_key": r["_id"],
+            "league_id": r["_id"],
             "total": r["total"],
             "correct": r["correct"],
             "win_rate": round(r["correct"] / r["total"], 3) if r["total"] else 0.0,
@@ -227,14 +226,14 @@ async def public_performance(
         tips = await _db.db.quotico_tips.find(
             base_match,
             {
-                "_id": 0, "match_id": 1, "sport_key": 1,
-                "home_team": 1, "away_team": 1, "match_date": 1,
+                "_id": 0, "match_id": 1, "league_id": 1,
+                "home_team": 1, "away_team": 1, "start_at": 1,
                 "recommended_selection": 1, "actual_result": 1,
                 "was_correct": 1, "confidence": 1, "edge_pct": 1,
             },
-        ).sort("match_date", -1).limit(30).to_list(length=30)
+        ).sort("start_at", -1).limit(30).to_list(length=30)
         for t in tips:
-            t["match_date"] = ensure_utc(t["match_date"]).isoformat()
+            t["start_at"] = ensure_utc(t["start_at"]).isoformat()
             t["confidence"] = round(t["confidence"], 3)
             t["edge_pct"] = round(t["edge_pct"], 2)
         return tips
@@ -266,10 +265,10 @@ async def get_tip(match_id: str):
 
     return QuoticoTipResponse(
         match_id=tip["match_id"],
-        sport_key=tip["sport_key"],
+        league_id=tip["league_id"],
         home_team=tip["home_team"],
         away_team=tip["away_team"],
-        match_date=ensure_utc(tip["match_date"]),
+        match_date=ensure_utc(tip["start_at"]),
         recommended_selection=tip["recommended_selection"],
         confidence=tip["confidence"],
         raw_confidence=tip.get("raw_confidence"),
@@ -294,7 +293,7 @@ async def get_tip(match_id: str):
 @router.post("/{match_id}/refresh")
 async def refresh_single_tip(match_id: str, admin=Depends(get_admin_user)):
     """Recalculate Q-Tip for a single match and return full metrics (admin only)."""
-    match = await _db.db.matches.find_one({"_id": ObjectId(match_id)})
+    match = await _db.db.matches_v3.find_one({"_id": int(match_id)})
     if not match:
         raise HTTPException(status_code=404, detail="Match not found.")
 
@@ -316,7 +315,7 @@ async def refresh_single_tip(match_id: str, admin=Depends(get_admin_user)):
 
     # Serialise for JSON (ObjectId / datetime)
     tip.pop("_id", None)
-    for key in ("match_date", "generated_at", "resolved_at"):
+    for key in ("start_at", "generated_at", "resolved_at"):
         if key in tip and tip[key] is not None:
             tip[key] = ensure_utc(tip[key]).isoformat()
 
@@ -334,7 +333,7 @@ async def scan_tips(admin=Depends(get_admin_user)):
 
 @router.post("/backfill")
 async def backfill_quotico_tips(
-    sport_key: str | None = Query(None, description="Filter by sport key"),
+    league_id: int | None = Query(None, description="Filter by league id"),
     batch_size: int = Query(500, ge=1, le=2000, description="Matches per batch"),
     skip: int = Query(0, ge=0, description="Offset for pagination"),
     dry_run: bool = Query(True, description="If true, don't write to DB"),
@@ -348,12 +347,12 @@ async def backfill_quotico_tips(
     Processes one batch at a time. Use ``skip`` + ``batch_size`` to paginate.
     """
     query: dict = {
-        "status": "final",
+        "status": "FINISHED",
         "odds_meta.markets.h2h.current": {"$exists": True, "$ne": {}},
         "result.outcome": {"$ne": None},
     }
-    if sport_key:
-        query["sport_key"] = sport_key
+    if league_id is not None:
+        query["league_id"] = league_id
 
     max_matches = int(settings.QTIP_BACKFILL_ADMIN_MAX_MATCHES)
     if batch_size > max_matches:
@@ -362,7 +361,7 @@ async def backfill_quotico_tips(
             detail=f"Requested batch_size={batch_size} exceeds admin limit={max_matches}. Use CLI for mass reruns.",
         )
 
-    total_scope = await _db.db.matches.count_documents(query)
+    total_scope = await _db.db.matches_v3.count_documents(query)
     if (total_scope - skip) > max_matches:
         raise HTTPException(
             status_code=400,
@@ -372,7 +371,7 @@ async def backfill_quotico_tips(
             ),
         )
 
-    matches = await _db.db.matches.find(query).sort("match_date", 1).skip(skip).to_list(length=batch_size)
+    matches = await _db.db.matches_v3.find(query).sort("start_at", 1).skip(skip).to_list(length=batch_size)
 
     # Check which matches already have tips
     existing_ids: set[str] = set()
@@ -402,7 +401,7 @@ async def backfill_quotico_tips(
             skipped_missing_odds_meta += 1
             continue
         try:
-            tip = await generate_quotico_tip(match, before_date=match["match_date"])
+            tip = await generate_quotico_tip(match, before_date=match["start_at"])
             tip = await enrich_tip(tip, match=match)
             tip = resolve_tip(tip, match)
             if not dry_run:
@@ -458,7 +457,7 @@ async def tip_performance(admin=Depends(get_admin_user)):
             "avg_edge": {"$avg": "$edge_pct"},
             "avg_confidence": {"$avg": "$confidence"},
             "by_sport": {"$push": {
-                "sport_key": "$sport_key",
+                "league_id": "$league_id",
                 "was_correct": "$was_correct",
                 "edge_pct": "$edge_pct",
             }},
@@ -518,22 +517,27 @@ async def backtest_evd(
     backfill_count = 0
 
     for tip in resolved:
-        sport_key = tip.get("sport_key", "")
+        league_id = tip.get("league_id")
         selection = tip.get("recommended_selection", "-")
         was_correct = tip.get("was_correct", False)
-        match_date = tip.get("match_date")
+        match_date = tip.get("start_at")
 
         if selection == "-" or not match_date:
             continue
 
         team_registry = TeamRegistry.get()
-        related_keys = sport_keys_for(sport_key)
+        if not isinstance(league_id, int):
+            buckets["no_data"]["total"] += 1
+            if was_correct:
+                buckets["no_data"]["correct"] += 1
+            continue
+        related_keys = [league_id]
         home_team_id = tip.get("home_team_id")
         away_team_id = tip.get("away_team_id")
         if not home_team_id:
-            home_team_id = await team_registry.resolve(tip.get("home_team", ""), sport_key)
+            home_team_id = await team_registry.resolve(tip.get("home_team", ""), league_id)
         if not away_team_id:
-            away_team_id = await team_registry.resolve(tip.get("away_team", ""), sport_key)
+            away_team_id = await team_registry.resolve(tip.get("away_team", ""), league_id)
 
         if not home_team_id or not away_team_id:
             buckets["no_data"]["total"] += 1

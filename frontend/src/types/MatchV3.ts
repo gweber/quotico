@@ -25,6 +25,7 @@ export interface MarketEntropy {
   drift_velocity_3h: number;
 }
 
+// FIXME: ODDS_V3_BREAK — type still valid but data no longer produced by connector
 export interface OddsMetaV3 {
   summary_1x2?: {
     home?: OddSummary;
@@ -88,8 +89,10 @@ export interface MatchV3 {
   scores?: PeriodScoresV3;
   odds_meta?: OddsMetaV3;
   manual_check_required?: boolean;
-  referee_id?: number | string | null;
+  referee_id?: number | null;
   referee_name?: string | null;
+  qtip?: MatchQtipPayload | null;
+  qtip_output_level?: OutputLevel;
   result?: {
     home_score?: number | null;
     away_score?: number | null;
@@ -131,3 +134,4 @@ export interface MatchCardVM {
   refereeId?: number;
   refereeName?: string;
 }
+import type { MatchQtipPayload, OutputLevel } from "./persona";

@@ -1,10 +1,17 @@
+<!--
+frontend/src/views/TeamsView.vue
+
+Purpose:
+    Public team search page with debounced lookup and quick navigation to team
+    detail profiles.
+-->
 <script setup lang="ts">
 import { ref, watch } from "vue";
 import { useI18n } from "vue-i18n";
 import { useTeamsStore } from "@/stores/teams";
 import { sportLabel } from "@/types/sports";
 
-useI18n();
+const { t } = useI18n();
 
 const teams = useTeamsStore();
 const searchQuery = ref("");
@@ -25,15 +32,15 @@ watch(searchQuery, (q) => {
 
 <template>
   <div class="max-w-2xl mx-auto p-4">
-    <h1 class="text-xl font-bold text-text-primary mb-6">Teams</h1>
+    <h1 class="text-xl font-bold text-text-primary mb-6">{{ t("teams.title") }}</h1>
 
     <!-- Search -->
-    <label for="team-search" class="sr-only">Team suchen</label>
+    <label for="team-search" class="sr-only">{{ t("teams.searchLabel") }}</label>
     <input
       id="team-search"
       v-model="searchQuery"
       type="text"
-      placeholder="Team suchen..."
+      :placeholder="t('teams.searchPlaceholder')"
       autocomplete="off"
       class="w-full bg-surface-1 border border-surface-3/50 rounded-lg px-4 py-2.5 text-sm text-text-primary placeholder:text-text-muted/50 focus:outline-none focus:ring-1 focus:ring-primary mb-6"
     />
@@ -47,7 +54,7 @@ watch(searchQuery, (q) => {
     <div v-else-if="searchQuery.trim().length >= 2 && teams.searchResults.length > 0" class="space-y-3">
       <RouterLink
         v-for="team in teams.searchResults"
-        :key="team.team_key"
+        :key="team.team_id"
         :to="`/team/${team.slug}`"
         class="block bg-surface-1 rounded-card p-4 border border-surface-3/50 hover:border-surface-3 transition-colors"
       >
@@ -84,7 +91,7 @@ watch(searchQuery, (q) => {
     <div v-else-if="searchQuery.trim().length < 2" class="text-center py-16">
       <p class="text-4xl mb-4" aria-hidden="true">&#x1F3DF;&#xFE0F;</p>
       <p class="text-sm text-text-secondary">
-        Gib mindestens 2 Zeichen ein, um nach einem Team zu suchen.
+        {{ t("teams.minCharsPrompt") }}
       </p>
     </div>
   </div>

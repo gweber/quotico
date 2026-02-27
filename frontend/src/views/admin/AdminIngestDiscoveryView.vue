@@ -19,12 +19,10 @@ interface SeasonOption {
 
 interface DiscoveryLeague {
   league_id: number;
-  sport_key: string;
   name: string;
   country: string;
   is_cup: boolean;
   is_active: boolean;
-  needs_review: boolean;
   ui_order: number;
   features: {
     tipping: boolean;
@@ -484,7 +482,7 @@ onUnmounted(() => {
         <div class="flex items-start justify-between">
           <div>
             <h2 class="text-base font-semibold text-text-primary">{{ league.name }}</h2>
-            <p class="text-xs text-text-muted">{{ league.country || "—" }} · {{ league.sport_key || "—" }}</p>
+            <p class="text-xs text-text-muted">{{ league.country || "—" }} · {{ league.league_id || "—" }}</p>
           </div>
           <button
             type="button"
@@ -505,7 +503,6 @@ onUnmounted(() => {
                 {{ league.last_synced_at ? new Date(league.last_synced_at).toLocaleDateString("de-DE", { day: "2-digit", month: "2-digit", year: "2-digit", hour: "2-digit", minute: "2-digit" }) : t("admin.ingest.neverSynced") }}
               </span>
             </div>
-            <span v-if="league.needs_review" class="text-[11px] text-warning">{{ t("admin.ingest.needsReview") }}</span>
           </div>
           <div class="space-y-2 text-xs">
             <!-- Active -->

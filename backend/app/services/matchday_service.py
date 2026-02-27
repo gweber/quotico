@@ -19,7 +19,6 @@ from bson import ObjectId
 from fastapi import HTTPException, status
 
 import app.database as _db
-from app.config_matchday import MATCHDAY_V3_SPORTS
 from app.utils import ensure_utc, utcnow
 
 logger = logging.getLogger("quotico.matchday_service")
@@ -160,36 +159,33 @@ def is_match_locked(match: dict, lock_minutes: int = LOCK_MINUTES) -> bool:
     return now >= deadline
 
 
-def _parse_v3_matchday_id(matchday_id: str) -> tuple[str, int, int]:
+def _parse_v3_matchday_id(matchday_id: str) -> tuple[int, int, int]:
     parts = str(matchday_id or "").split(":")
     if len(parts) != 4 or parts[0] != "v3":
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid matchday_id format.")
-    sport_key = str(parts[1] or "").strip()
+    try:
+        league_id = int(parts[1])
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid matchday_id format.") from exc
     try:
         season_id = int(parts[2])
         round_id = int(parts[3])
     except (TypeError, ValueError) as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid matchday_id format.") from exc
-    if not sport_key:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid matchday_id format.")
-    return sport_key, season_id, round_id
+    return int(league_id), season_id, round_id
 
 
 async def _resolve_v3_matchday_context(matchday_id: str) -> tuple[dict, dict[str, dict]]:
-    sport_key, season_id, round_id = _parse_v3_matchday_id(matchday_id)
-    cfg = MATCHDAY_V3_SPORTS.get(sport_key) or {}
-    league_ids = [int(x) for x in (cfg.get("league_ids") or []) if isinstance(x, int) or str(x).isdigit()]
-    if not league_ids:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Sport not available.")
+    league_id, season_id, round_id = _parse_v3_matchday_id(matchday_id)
     rows = await _db.db.matches_v3.find(
-        {"season_id": int(season_id), "round_id": int(round_id), "league_id": {"$in": league_ids}},
+        {"season_id": int(season_id), "round_id": int(round_id), "league_id": int(league_id)},
         {"_id": 1, "start_at": 1, "status": 1, "league_id": 1, "odds_meta": 1, "teams": 1},
     ).to_list(length=200)
     if not rows:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Matchday not found.")
     match_ids = [str(int((row or {}).get("_id"))) for row in rows if (row or {}).get("_id") is not None]
     context = {
-        "sport_key": sport_key,
+        "league_id": league_id,
         "season": int(season_id),
         "matchday_number": int(round_id),
         "match_ids": match_ids,

@@ -41,9 +41,8 @@ function toggleExpand(id: string) {
   }
 }
 
-function leagueLabel(key: string): string {
-  if (key === "all") return "All (Fallback)";
-  return canonicalSportLabel(key);
+function leagueLabel(key: number): string {
+  return canonicalSportLabel(String(key));
 }
 
 function penultimateSeasonStartIso(): string {
@@ -169,8 +168,6 @@ const activeStrategies = computed(() => {
   if (!data.value) return [];
   const list = data.value.categories?.active ?? data.value.strategies ?? [];
   return [...list].sort((a, b) => {
-    if (a.sport_key === "all") return 1;
-    if (b.sport_key === "all") return -1;
     return b.validation_fitness.roi - a.validation_fitness.roi;
   });
 });
@@ -359,7 +356,7 @@ onMounted(fetchStrategies);
                   <td class="px-4 py-2.5">
                     <div class="flex items-center gap-1.5 flex-wrap">
                       <span class="text-text-primary font-medium">
-                        {{ leagueLabel(s.sport_key) }}
+                        {{ leagueLabel(s.league_id) }}
                       </span>
                       <span
                         v-if="s.overfit_warning"
@@ -478,7 +475,7 @@ onMounted(fetchStrategies);
                         <h3
                           class="text-xs font-semibold text-text-muted uppercase tracking-wide mb-3"
                         >
-                          {{ t("qbotLab.dnaDetail") }} — {{ leagueLabel(s.sport_key) }}
+                          {{ t("qbotLab.dnaDetail") }} — {{ leagueLabel(s.league_id) }}
                           (Gen {{ s.generation }}, {{ s.version }})
                         </h3>
                         <p class="text-xs text-text-muted mb-3">

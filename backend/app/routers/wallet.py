@@ -36,7 +36,7 @@ async def accept_disclaimer(user=Depends(get_current_user)):
 @router.get("/{squad_id}", response_model=WalletResponse)
 async def get_wallet(
     squad_id: str,
-    sport: str = Query(..., description="Sport key"),
+    league_id: int = Query(..., description="League id"),
     season: int = Query(None, description="Season year"),
     user=Depends(get_current_user),
 ):
@@ -48,11 +48,11 @@ async def get_wallet(
     if not season:
         season = utcnow().year
 
-    wallet = await wallet_service.get_or_create_wallet(user_id, squad_id, sport, season)
+    wallet = await wallet_service.get_or_create_wallet(user_id, squad_id, int(league_id), season)
     return WalletResponse(
         id=str(wallet["_id"]),
         squad_id=wallet["squad_id"],
-        sport_key=wallet["sport_key"],
+        league_id=wallet["league_id"],
         season=wallet["season"],
         balance=wallet["balance"],
         initial_balance=wallet["initial_balance"],
@@ -67,7 +67,7 @@ async def get_wallet(
 @router.get("/{squad_id}/transactions")
 async def get_transactions(
     squad_id: str,
-    sport: str = Query(...),
+    league_id: int = Query(...),
     season: int = Query(None),
     limit: int = Query(50, le=200),
     skip: int = Query(0, ge=0),
@@ -78,7 +78,7 @@ async def get_transactions(
     if not season:
         season = utcnow().year
 
-    wallet = await wallet_service.get_or_create_wallet(user_id, squad_id, sport, season)
+    wallet = await wallet_service.get_or_create_wallet(user_id, squad_id, int(league_id), season)
     txns = await wallet_service.get_wallet_transactions(str(wallet["_id"]), limit, skip)
     return [
         TransactionResponse(

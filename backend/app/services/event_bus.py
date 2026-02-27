@@ -143,7 +143,7 @@ class InMemoryEventBus:
         if self._running:
             sub.workers.extend(self._spawn_workers(sub, worker_count))
 
-    def publish(self, event: BaseEvent) -> None:
+    async def publish(self, event: BaseEvent) -> None:
         normalized = normalize_event_time(event)
         try:
             self._ingress.put_nowait(normalized)

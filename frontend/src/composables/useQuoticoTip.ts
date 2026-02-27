@@ -102,7 +102,7 @@ export interface QbotLogic {
 
 export interface QuoticoTip {
   match_id: string;
-  sport_key: string;
+  league_id: number;
   home_team: string;
   away_team: string;
   match_date: string;
@@ -136,7 +136,7 @@ const tipCache = reactive(new Map<string, QuoticoTip | null>());
  */
 export async function prefetchQuoticoTips(
   matchIds?: string[],
-  sportKey?: string,
+  leagueId?: number,
 ): Promise<void> {
   const api = useApi();
   try {
@@ -147,7 +147,7 @@ export async function prefetchQuoticoTips(
     } else {
       params.limit = "100";
     }
-    if (sportKey) params.sport_key = sportKey;
+    if (leagueId != null) params.league_id = String(leagueId);
 
     const tips = await api.get<QuoticoTip[]>("/quotico-tips/", params);
     const returned = new Set(tips.map((t) => t.match_id));
@@ -168,15 +168,15 @@ export async function prefetchQuoticoTips(
 /**
  * Clear cache and re-fetch tips from the API.
  */
-export async function refreshQuoticoTips(sportKey?: string): Promise<void> {
-  if (sportKey) {
+export async function refreshQuoticoTips(leagueId?: number): Promise<void> {
+  if (leagueId != null) {
     for (const [key, tip] of tipCache) {
-      if (tip?.sport_key === sportKey) tipCache.delete(key);
+      if (tip?.league_id === leagueId) tipCache.delete(key);
     }
   } else {
     tipCache.clear();
   }
-  await prefetchQuoticoTips(undefined, sportKey);
+  await prefetchQuoticoTips(undefined, leagueId);
 }
 
 /**

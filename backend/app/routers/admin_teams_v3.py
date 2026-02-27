@@ -59,8 +59,8 @@ def _source_allowed(value: str) -> str:
     return source
 
 
-def _alias_key(normalized: str, sport_key: str | None, source: str) -> str:
-    return f"{normalized}|{sport_key or '*'}|{source}"
+def _alias_key(normalized: str, league_id: int | None, source: str) -> str:
+    return f"{normalized}|{league_id or '*'}|{source}"
 
 
 def _default_alias_for_team(team: dict[str, Any]) -> dict[str, Any] | None:
@@ -76,7 +76,7 @@ def _default_alias_for_team(team: dict[str, Any]) -> dict[str, Any] | None:
         "name": name,
         "normalized": normalized,
         "source": source,
-        "sport_key": None,
+        "league_id": None,
         "alias_key": _alias_key(normalized, None, source),
         "is_default": True,
         "created_at": now,
@@ -102,7 +102,7 @@ def _serialize_alias(alias: dict[str, Any]) -> dict[str, Any]:
         "name": str((alias or {}).get("name") or ""),
         "normalized": str((alias or {}).get("normalized") or ""),
         "source": str((alias or {}).get("source") or ""),
-        "sport_key": (alias or {}).get("sport_key"),
+        "league_id": (alias or {}).get("league_id"),
         "alias_key": str((alias or {}).get("alias_key") or ""),
         "is_default": bool((alias or {}).get("is_default", False)),
         "created_at": ensure_utc((alias or {}).get("created_at")).isoformat() if (alias or {}).get("created_at") else None,
@@ -125,7 +125,7 @@ def _serialize_team(team: dict[str, Any]) -> dict[str, Any]:
 class AliasInput(BaseModel):
     name: str = Field(min_length=1, max_length=200)
     source: AliasSource
-    sport_key: str | None = None
+    league_id: int | None = None
 
     @field_validator("name")
     @classmethod
@@ -135,19 +135,10 @@ class AliasInput(BaseModel):
             raise ValueError("name is required")
         return name
 
-    @field_validator("sport_key")
-    @classmethod
-    def _sport_trim(cls, value: str | None) -> str | None:
-        if value is None:
-            return None
-        cleaned = str(value).strip()
-        return cleaned or None
-
-
 class AliasDeleteInput(BaseModel):
     name: str = Field(min_length=1, max_length=200)
     source: str | None = None
-    sport_key: str | None = None
+    league_id: int | None = None
     dry_run: bool = False
 
     @field_validator("source")
@@ -267,12 +258,12 @@ async def add_alias_v3(
     if not normalized:
         raise HTTPException(status_code=400, detail="Alias normalization is empty.")
     now = utcnow()
-    key = _alias_key(normalized, body.sport_key, source)
+    key = _alias_key(normalized, body.league_id, source)
     alias = {
         "name": body.name.strip(),
         "normalized": normalized,
         "source": source,
-        "sport_key": body.sport_key,
+        "league_id": body.league_id,
         "alias_key": key,
         "is_default": False,
         "created_at": now,
@@ -285,16 +276,16 @@ async def add_alias_v3(
     return {"team_id": int(team_id), "inserted": bool(result.modified_count > 0), "alias_key": key}
 
 
-async def _find_alias_candidates(team: dict[str, Any], normalized: str, source: str | None, sport_key: str | None) -> list[dict[str, Any]]:
+async def _find_alias_candidates(team: dict[str, Any], normalized: str, source: str | None, league_id: int | None) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     for alias in (team.get("aliases") or []):
         if str((alias or {}).get("normalized") or "") != normalized:
             continue
         alias_source = str((alias or {}).get("source") or "")
-        alias_sport = (alias or {}).get("sport_key")
+        alias_sport = (alias or {}).get("league_id")
         if source is not None and alias_source != source:
             continue
-        if sport_key is not None and str(alias_sport or "") != str(sport_key or ""):
+        if league_id is not None and alias_sport != league_id:
             continue
         out.append(alias)
     return out
@@ -311,7 +302,7 @@ async def alias_impact_v3(
     if not team:
         raise HTTPException(status_code=404, detail="Team not found.")
     normalized = normalize_team_alias(body.name)
-    candidates = await _find_alias_candidates(team, normalized, body.source, body.sport_key)
+    candidates = await _find_alias_candidates(team, normalized, body.source, body.league_id)
     keys = [str((a or {}).get("alias_key") or "") for a in candidates if str((a or {}).get("alias_key") or "")]
     impact = await _compute_alias_impact(int(team_id), keys)
     warning = _orphan_warning(team, candidates)
@@ -331,7 +322,7 @@ async def delete_alias_v3(
     normalized = normalize_team_alias(body.name)
     if not normalized:
         raise HTTPException(status_code=400, detail="Alias normalization is empty.")
-    candidates = await _find_alias_candidates(team, normalized, body.source, body.sport_key)
+    candidates = await _find_alias_candidates(team, normalized, body.source, body.league_id)
     if not candidates:
         return {"removed": False, "impact": {"usage_30d": 0, "last_seen_at": None}}
 
@@ -363,7 +354,7 @@ async def delete_alias_v3(
 async def list_alias_suggestions_v3(
     status: str = Query("pending"),
     source: str | None = Query(None),
-    sport_key: str | None = Query(None),
+    league_id: int | None = Query(None),
     min_confidence: float = Query(0.0, ge=0.0, le=1.0),
     q: str | None = Query(None),
     limit: int = Query(200, ge=1, le=1000),
@@ -373,8 +364,8 @@ async def list_alias_suggestions_v3(
     query: dict[str, Any] = {"status": str(status or "pending").strip().lower() or "pending"}
     if source:
         query["source"] = _source_allowed(source)
-    if sport_key:
-        query["sport_key"] = str(sport_key).strip()
+    if league_id is not None:
+        query["league_id"] = int(league_id)
     if min_confidence > 0.0:
         query["confidence_score"] = {"$gte": float(min_confidence)}
     if q and q.strip():
@@ -401,7 +392,7 @@ async def list_alias_suggestions_v3(
                 "id": str(row.get("_id")),
                 "status": str(row.get("status") or "pending"),
                 "source": str(row.get("source") or ""),
-                "sport_key": row.get("sport_key"),
+                "league_id": row.get("league_id"),
                 "raw_team_name": str(row.get("raw_team_name") or ""),
                 "normalized_name": str(row.get("normalized_name") or ""),
                 "reason": str(row.get("reason") or "unresolved_team"),
@@ -455,13 +446,13 @@ async def apply_alias_suggestions_v3(
         if not normalized:
             failed.append({"id": item.id, "code": "invalid_alias", "message": "Suggestion has empty alias"})
             continue
-        key = _alias_key(normalized, doc.get("sport_key"), source)
+        key = _alias_key(normalized, doc.get("league_id"), source)
         now = utcnow()
         alias = {
             "name": name,
             "normalized": normalized,
             "source": source,
-            "sport_key": doc.get("sport_key"),
+            "league_id": doc.get("league_id"),
             "alias_key": key,
             "is_default": False,
             "created_at": now,
@@ -503,4 +494,3 @@ async def reject_alias_suggestion_v3(
         {"$set": {"status": "rejected", "rejected_reason": str(body.reason or "").strip() or None, "rejected_at": now, "updated_at": now}},
     )
     return {"ok": True, "id": str(doc["_id"])}
-

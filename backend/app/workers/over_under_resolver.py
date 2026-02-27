@@ -32,7 +32,7 @@ async def resolve_over_under_bets() -> None:
     ).to_list(length=5000)
 
     for bet in pending:
-        match = await _db.db.matches.find_one({"_id": ObjectId(bet["match_id"])})
+        match = await _db.db.matches_v3.find_one({"_id": int(bet["match_id"])})
         if not match or match["status"] != "final":
             continue
         result = match.get("result", {})

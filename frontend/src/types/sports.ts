@@ -26,7 +26,7 @@ export const SPORT_FLAGS: Record<string, string> = {
   soccer_portugal_primeira_liga: "🇵🇹",
 };
 
-/** Resolve a sport_key to its display label, falling back to the raw key. */
+/** Resolve a league_id to its display label, falling back to the raw key. */
 export function sportLabel(key: string): string {
   return SPORT_LABELS[key] || key;
 }
@@ -41,7 +41,7 @@ export function scoreUnitLabel(sportKey: string): string {
   return isBasketball(sportKey) ? "Punkte" : "Tore";
 }
 
-/** Resolve a sport_key to its flag, falling back to white flag. */
+/** Resolve a league_id to its flag, falling back to white flag. */
 export function sportFlag(key: string): string {
   return SPORT_FLAGS[key] || "🏳️";
 }

@@ -13,7 +13,7 @@ Dependencies:
 
 Usage:
     python -m tools.qbot_evolution_arena                          # all leagues
-    python -m tools.qbot_evolution_arena --sport soccer_epl       # per-league
+    python -m tools.qbot_evolution_arena --league-id 8            # per-league
     python -m tools.qbot_evolution_arena --multi                   # all leagues, sequential
     python -m tools.qbot_evolution_arena --multi --parallel        # all leagues, concurrent
     python -m tools.qbot_evolution_arena --dry-run                 # no DB write
@@ -197,7 +197,7 @@ def get_time_weight(
 
 
 async def load_tips(
-    sport_key: str | None,
+    league_id: int | None,
     *,
     lookback_years: int = DEFAULT_LOOKBACK_YEARS,
 ) -> list[dict]:
@@ -205,8 +205,8 @@ async def load_tips(
     import app.database as _db
 
     query = {"status": "resolved", "was_correct": {"$ne": None}}
-    if sport_key:
-        query["sport_key"] = sport_key
+    if league_id is not None:
+        query["league_id"] = league_id
     if lookback_years > 0:
         now = _utcnow()
         cutoff = now - timedelta(days=365 * lookback_years)
@@ -214,7 +214,7 @@ async def load_tips(
 
     projection = {
         "match_id": 1,
-        "sport_key": 1,
+        "league_id": 1,
         "match_date": 1,
         "edge_pct": 1,
         "confidence": 1,
@@ -1121,7 +1121,7 @@ def _evaluate_single_candidate(
 # ---------------------------------------------------------------------------
 
 async def run_evolution(
-    sport_key: str | None,
+    league_id: int | None,
     *,
     population_size: int = 300,
     generations: int = 50,
@@ -1142,7 +1142,7 @@ async def run_evolution(
     rng = np.random.default_rng(seed)
 
     # Load and vectorize data
-    tips = await load_tips(sport_key, lookback_years=lookback_years)
+    tips = await load_tips(league_id, lookback_years=lookback_years)
     if len(tips) < 100:
         log.error("Not enough resolved tips (%d < 100). Aborting.", len(tips))
         _signal.signal(_signal.SIGINT, prev_handler)
@@ -1191,7 +1191,7 @@ async def run_evolution(
     stage_outputs: list[dict] = []
 
     if resume:
-        ckpt = _load_checkpoint(sport_key)
+        ckpt = _load_checkpoint(league_id)
         if ckpt:
             population = ckpt["population"]
             start_gen = ckpt["generation"] + 1
@@ -1223,7 +1223,7 @@ async def run_evolution(
                     population = population[:population_size]
                 log.info("Adjusted population size to %d", population_size)
         else:
-            log.warning("No checkpoint found for %s — starting fresh", sport_key or "all")
+            log.warning("No checkpoint found for %s — starting fresh", league_id or "all")
             population = random_population(population_size, rng, dna_ranges=base_ranges)
     else:
         population = random_population(population_size, rng, dna_ranges=base_ranges)
@@ -1263,7 +1263,7 @@ async def run_evolution(
         for gen in range(start_gen, generations):
             if _shutdown_requested:
                 log.info("Graceful shutdown: saving checkpoint at gen %d", gen)
-                _save_checkpoint(sport_key, gen - 1, pop, stage_best_hist, rng)
+                _save_checkpoint(league_id, gen - 1, pop, stage_best_hist, rng)
                 break
 
             fitness = evaluate_population(pop, train_data, min_bets_for_fitness=min_bets)
@@ -1281,7 +1281,7 @@ async def run_evolution(
                 )
 
             if gen > start_gen and gen % CHECKPOINT_INTERVAL == 0 and stage["stage_id"] == 1:
-                _save_checkpoint(sport_key, gen, pop, stage_best_hist, rng)
+                _save_checkpoint(league_id, gen, pop, stage_best_hist, rng)
 
             if best_fit <= prev_best + 1e-6:
                 stagnant_gens += 1
@@ -1379,7 +1379,7 @@ async def run_evolution(
                 candidates.append(fallback)
 
         _log_stress_timing_summary(
-            f"sport={sport_key or 'all'} stage={stage['stage_id']}-{stage['name']}",
+            f"sport={league_id or 'all'} stage={stage['stage_id']}-{stage['name']}",
             candidates,
         )
 
@@ -1518,7 +1518,7 @@ async def run_evolution(
         "version": "v3",
         "fitness_version": "soft_penalty_v1",
         "stress_version": "stress_rescue_v1",
-        "sport_key": sport_key or "all",
+        "league_id": league_id,
         "generation": generations,
         "created_at": _utcnow(),
         "dna": dna_dict,
@@ -1615,7 +1615,7 @@ async def run_evolution(
         # Only replace active strategy when we actually found a deployable active candidate.
         if strategy_doc["is_active"]:
             await _db.db.qbot_strategies.update_many(
-                {"sport_key": strategy_doc["sport_key"], "is_active": True},
+                {"league_id": strategy_doc["league_id"], "is_active": True},
                 {"$set": {"is_active": False}},
             )
         result = await _db.db.qbot_strategies.insert_one(strategy_doc)
@@ -1809,7 +1809,7 @@ def _ensure_utc(dt: datetime) -> datetime:
 # ---------------------------------------------------------------------------
 
 def _save_checkpoint(
-    sport_key: str | None,
+    league_id: int | None,
     generation: int,
     population: np.ndarray,
     fitness_history: list[float],
@@ -1817,7 +1817,7 @@ def _save_checkpoint(
 ) -> Path:
     """Save GA state to disk for resume."""
     CHECKPOINT_DIR.mkdir(exist_ok=True)
-    label = sport_key or "all"
+    label = league_id or "all"
 
     np.savez(
         CHECKPOINT_DIR / f"qbot_pop_{label}.npz",
@@ -1839,9 +1839,9 @@ def _save_checkpoint(
     return CHECKPOINT_DIR
 
 
-def _load_checkpoint(sport_key: str | None) -> dict | None:
+def _load_checkpoint(league_id: int | None) -> dict | None:
     """Load checkpoint from disk (returns None if not found)."""
-    label = sport_key or "all"
+    label = league_id or "all"
     npz_path = CHECKPOINT_DIR / f"qbot_pop_{label}.npz"
     meta_path = CHECKPOINT_DIR / f"qbot_meta_{label}.json"
     if not npz_path.exists() or not meta_path.exists():
@@ -2114,7 +2114,7 @@ def build_ensemble(
 # Multi-league wrapper
 # ---------------------------------------------------------------------------
 
-async def discover_leagues() -> list[tuple[str, int]]:
+async def discover_leagues() -> list[tuple[int, int]]:
     """Discover leagues with resolved tips, ordered by count descending."""
     import app.database as _db
 
@@ -2125,20 +2125,24 @@ async def discover_leagues() -> list[tuple[str, int]]:
 
     pipeline = [
         {"$match": {"status": "resolved", "was_correct": {"$ne": None}}},
-        {"$group": {"_id": "$sport_key", "count": {"$sum": 1}}},
+        {"$group": {"_id": "$league_id", "count": {"$sum": 1}}},
         {"$sort": {"count": -1}},
     ]
     results = await _db.db.quotico_tips.aggregate(pipeline).to_list(100)
-    return [(r["_id"], r["count"]) for r in results if r["_id"]]
+    return [
+        (int(r["_id"]), int(r["count"]))
+        for r in results
+        if isinstance(r.get("_id"), int)
+    ]
 
 
-def _run_evolution_sync(sport_key: str | None, **kwargs) -> dict:
+def _run_evolution_sync(league_id: int | None, **kwargs) -> dict:
     """Sync wrapper for run_evolution() — used by ProcessPoolExecutor."""
     loop = asyncio.new_event_loop()
     try:
         import app.database as _db
         loop.run_until_complete(_db.connect_db())
-        result = loop.run_until_complete(run_evolution(sport_key, **kwargs))
+        result = loop.run_until_complete(run_evolution(league_id, **kwargs))
         loop.run_until_complete(_db.close_db())
         return result
     finally:
@@ -2265,7 +2269,7 @@ def temporal_expanding_cv(
 
 
 async def run_evolution_deep(
-    sport_key: str | None,
+    league_id: int | None,
     *,
     population_size: int = 500,
     generations: int = 100,
@@ -2284,7 +2288,7 @@ async def run_evolution_deep(
 
     rng = np.random.default_rng(seed)
 
-    tips = await load_tips(sport_key, lookback_years=lookback_years)
+    tips = await load_tips(league_id, lookback_years=lookback_years)
     if len(tips) < 500:
         log.error("Deep mode needs >=500 tips (%d found). Use quick mode.", len(tips))
         _signal.signal(_signal.SIGINT, prev_handler)
@@ -2311,7 +2315,7 @@ async def run_evolution_deep(
     population = random_population(population_size, rng)
 
     if resume:
-        ckpt = _load_checkpoint(sport_key)
+        ckpt = _load_checkpoint(league_id)
         if ckpt:
             population = ckpt["population"]
             if population.shape[1] < len(DNA_GENES):
@@ -2349,7 +2353,7 @@ async def run_evolution_deep(
     for gen in range(generations):
         if _shutdown_requested:
             log.info("Graceful shutdown at gen %d", gen)
-            _save_checkpoint(sport_key, gen - 1, population, best_fitness_history, rng)
+            _save_checkpoint(league_id, gen - 1, population, best_fitness_history, rng)
             break
 
         # Evaluate on ALL training folds — pessimistic (worst fold)
@@ -2380,7 +2384,7 @@ async def run_evolution_deep(
             )
 
         if gen % CHECKPOINT_INTERVAL == 0 and gen > 0:
-            _save_checkpoint(sport_key, gen, population, best_fitness_history, rng)
+            _save_checkpoint(league_id, gen, population, best_fitness_history, rng)
 
         # Radiation event
         if best_fit <= prev_best + 1e-6:
@@ -2496,7 +2500,7 @@ async def run_evolution_deep(
             deep_candidates.append(fallback)
 
     _log_stress_timing_summary(
-        f"deep sport={sport_key or 'all'}",
+        f"deep sport={league_id or 'all'}",
         deep_candidates,
     )
 
@@ -2531,7 +2535,7 @@ async def run_evolution_deep(
     strategy_doc = {
         "version": "v3",
         "mode": "deep",
-        "sport_key": sport_key or "all",
+        "league_id": league_id,
         "generation": generations,
         "created_at": _utcnow(),
         "dna": dna_dict,
@@ -2578,7 +2582,7 @@ async def run_evolution_deep(
 
     if not dry_run:
         await _db.db.qbot_strategies.update_many(
-            {"sport_key": strategy_doc["sport_key"], "is_active": True},
+            {"league_id": strategy_doc["league_id"], "is_active": True},
             {"$set": {"is_active": False}},
         )
         result = await _db.db.qbot_strategies.insert_one(strategy_doc)
@@ -2606,7 +2610,7 @@ def _parse_interval(s: str) -> int:
 
 
 async def run_watch_mode(
-    sport_key: str | None,
+    league_id: int | None,
     interval: int = WATCH_DEFAULT_INTERVAL,
     **kwargs,
 ) -> None:
@@ -2616,7 +2620,7 @@ async def run_watch_mode(
         cycle += 1
         log.info("=" * 40)
         log.info("Watch cycle %d — loading latest tips...", cycle)
-        result = await run_evolution(sport_key=sport_key, resume=True, **kwargs)
+        result = await run_evolution(league_id=league_id, resume=True, **kwargs)
         val_roi = result.get("validation_fitness", {}).get("roi", 0.0)
         log.info("Watch cycle %d complete. Val ROI: %.2f%%. Sleeping %ds...",
                  cycle, val_roi * 100, interval)
@@ -2638,8 +2642,17 @@ def main():
     parser = argparse.ArgumentParser(
         description="Qbot Evolution Arena v2 — GA Strategy Optimizer",
     )
-    parser.add_argument("--sport", type=str, default=None,
-                        help="Filter by sport_key (e.g. soccer_epl)")
+    if "--sport" in sys.argv:
+        parser.error(
+            "Error: --sport is deprecated. Use --league-id <int>. "
+            "Example: --league-id 82 (Bundesliga)."
+        )
+    parser.add_argument(
+        "--league-id",
+        type=int,
+        default=None,
+        help="Filter by league_id (int, Sportmonks league id)",
+    )
     parser.add_argument("--generations", type=int, default=None,
                         help="Number of GA generations (default: mode-dependent)")
     parser.add_argument("--population", type=int, default=None,
@@ -2676,7 +2689,7 @@ def main():
             if args.watch:
                 interval = _parse_interval(args.watch)
                 await run_watch_mode(
-                    args.sport,
+                    args.league_id,
                     interval=interval,
                     population_size=population_size,
                     generations=generations,
@@ -2700,7 +2713,7 @@ def main():
                 )
             elif args.mode == "deep":
                 result = await run_evolution_deep(
-                    args.sport,
+                    args.league_id,
                     population_size=population_size,
                     generations=generations,
                     dry_run=args.dry_run,
@@ -2711,7 +2724,7 @@ def main():
                 )
             else:
                 result = await run_evolution(
-                    args.sport,
+                    args.league_id,
                     population_size=population_size,
                     generations=generations,
                     dry_run=args.dry_run,

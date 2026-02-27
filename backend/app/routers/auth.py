@@ -30,6 +30,7 @@ from app.services.auth_service import (
 from app.services.audit_service import log_audit
 from app.services.encryption import decrypt, needs_reencryption, reencrypt
 from app.config_legal import TERMS_VERSION
+from app.services.persona_policy_service import get_persona_policy_service
 from jwt.exceptions import InvalidTokenError as JWTError
 
 
@@ -95,6 +96,10 @@ async def register(body: UserCreate, request: Request, response: Response, db=De
         "birth_date_verified_at": now,
         "terms_accepted_version": TERMS_VERSION if body.disclaimer_accepted else None,
         "terms_accepted_at": now if body.disclaimer_accepted else None,
+        "tip_persona": "casual",
+        "tip_persona_updated_at": now,
+        "tip_override_persona": None,
+        "tip_override_updated_at": None,
         "created_at": now,
         "updated_at": now,
     }
@@ -340,6 +345,8 @@ async def complete_profile(
 @router.get("/me", response_model=UserResponse)
 async def get_me(user=Depends(get_current_user)):
     """Get current user profile."""
+    policy = get_persona_policy_service()
+    effective, source = await policy.resolve_effective_persona(user)
     return UserResponse(
         email=user["email"],
         alias=user.get("alias", ""),
@@ -352,6 +359,11 @@ async def get_me(user=Depends(get_current_user)):
         google_linked=bool(user.get("google_sub")),
         has_password=bool(user.get("hashed_password")),
         terms_accepted_version=user.get("terms_accepted_version"),
+        tip_persona=str(user.get("tip_persona") or "casual"),
+        tip_persona_effective=effective,
+        tip_persona_source=source,
+        tip_persona_updated_at=user.get("tip_persona_updated_at"),
+        tip_override_persona=user.get("tip_override_persona"),
         created_at=user["created_at"],
     )
 

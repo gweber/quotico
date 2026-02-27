@@ -22,16 +22,16 @@ const { data, loading, error, fetch: fetchPerf } = useQTipPerformance();
 const api = useApi();
 const auth = useAuthStore();
 
-const selectedSport = ref<string | null>(null);
+const selectedSport = ref<number | null>(null);
 const allSports = ref<QTipSportBreakdown[]>([]);
 const selectedTipDetail = ref<any | null>(null);
 const detailLoading = ref(false);
 
-async function loadPerf(sportKey?: string) {
-  selectedSport.value = sportKey ?? null;
-  await fetchPerf(sportKey);
+async function loadPerf(leagueId?: number) {
+  selectedSport.value = leagueId ?? null;
+  await fetchPerf(leagueId != null ? String(leagueId) : undefined);
   // Persist global sport list on first (unfiltered) load
-  if (!sportKey && data.value) {
+  if (leagueId == null && data.value) {
     allSports.value = data.value.by_sport;
   }
 }
@@ -41,9 +41,9 @@ const lastUpdated = ref<Date | null>(null);
 // Silent refresh — only updates recent_tips without loading spinner
 async function refreshTrackRecord() {
   try {
-    const sportKey = selectedSport.value ?? undefined;
-    const url = sportKey
-      ? `/quotico-tips/public-performance?sport_key=${encodeURIComponent(sportKey)}`
+    const leagueId = selectedSport.value ?? undefined;
+    const url = leagueId != null
+      ? `/quotico-tips/public-performance?league_id=${encodeURIComponent(String(leagueId))}`
       : "/quotico-tips/public-performance";
     const fresh = await api.get<typeof data.value>(url);
     if (fresh && data.value) {
@@ -164,7 +164,7 @@ function copyConfidenceTable() {
   const rows = data.value.by_confidence.map(
     (b) => `${b.bucket}\t${b.total}\t${b.correct}\t${(b.win_rate * 100).toFixed(1)}%\t${(b.avg_confidence * 100).toFixed(0)}%`,
   );
-  const label = selectedSport.value ? sportLabel(selectedSport.value) : t("qtipPerformance.allLeagues");
+  const label = selectedSport.value != null ? sportLabel(String(selectedSport.value)) : t("qtipPerformance.allLeagues");
   const text = `${t("qtipPerformance.byConfidence")} — ${label}\n${header}\n${rows.join("\n")}`;
   navigator.clipboard.writeText(text);
   copied.value = true;
@@ -271,14 +271,14 @@ function copyConfidenceTable() {
           </button>
           <button
             v-for="sp in allSports"
-            :key="sp.sport_key"
+            :key="sp.league_id"
             class="px-3 py-1 rounded-full text-xs font-medium transition-colors"
-            :class="selectedSport === sp.sport_key
+            :class="selectedSport === sp.league_id
               ? 'bg-indigo-500 text-white'
               : 'bg-surface-2 text-text-muted hover:text-text-secondary'"
-            @click="loadPerf(sp.sport_key)"
+            @click="loadPerf(sp.league_id)"
           >
-            {{ sportLabel(sp.sport_key) }}
+            {{ sportLabel(String(sp.league_id)) }}
           </button>
         </div>
         <!-- Sport table (only when showing all) -->
@@ -296,11 +296,11 @@ function copyConfidenceTable() {
             <tbody>
               <tr
                 v-for="sp in data.by_sport"
-                :key="sp.sport_key"
+                :key="sp.league_id"
                 class="border-b border-surface-3/30 last:border-0 hover:bg-surface-2/50 transition-colors cursor-pointer"
-                @click="loadPerf(sp.sport_key)"
+                @click="loadPerf(sp.league_id)"
               >
-                <td class="py-2 pr-3 text-text-secondary">{{ sportLabel(sp.sport_key) }}</td>
+                <td class="py-2 pr-3 text-text-secondary">{{ sportLabel(String(sp.league_id)) }}</td>
                 <td class="py-2 px-2 text-right tabular-nums text-text-muted">{{ sp.total }}</td>
                 <td class="py-2 px-2 text-right tabular-nums text-text-muted">{{ sp.correct }}</td>
                 <td class="py-2 px-2 text-right tabular-nums font-medium" :class="sp.win_rate >= 0.5 ? 'text-emerald-400' : 'text-red-400'">
@@ -320,7 +320,7 @@ function copyConfidenceTable() {
         <h2 class="text-sm font-semibold text-text-primary mb-1">
           {{ $t("qtipPerformance.byConfidence") }}
           <span v-if="selectedSport" class="text-xs font-normal text-text-muted ml-2">
-            — {{ sportLabel(selectedSport) }}
+            — {{ sportLabel(String(selectedSport)) }}
           </span>
         </h2>
         <div class="flex items-center gap-4 mb-3 text-[10px] text-text-muted">
@@ -462,7 +462,7 @@ function copyConfidenceTable() {
                   </span>
                 </td>
                 <td class="py-2 px-2 text-text-muted whitespace-nowrap">
-                  {{ sportLabel(tip.sport_key) }}
+                  {{ sportLabel(String(tip.league_id)) }}
                 </td>
                 <td class="py-2 px-2 text-right tabular-nums font-medium text-text-secondary">
                   {{ pickLabel(tip.recommended_selection, tip.home_team, tip.away_team) }}

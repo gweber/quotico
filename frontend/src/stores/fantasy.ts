@@ -31,14 +31,14 @@ export const useFantasyStore = defineStore("fantasy", () => {
 
   async function fetchPick(
     squadId: string,
-    sport: string,
+    leagueId: number,
     season: number,
     matchdayNumber: number,
   ) {
     loading.value = true;
     try {
       pick.value = await api.get<FantasyPick | null>(`/fantasy/${squadId}/pick`, {
-        sport,
+        league_id: String(leagueId),
         season: String(season),
         matchday_number: String(matchdayNumber),
       });
@@ -62,9 +62,9 @@ export const useFantasyStore = defineStore("fantasy", () => {
     return result;
   }
 
-  async function fetchStandings(squadId: string, sport: string, season?: number) {
+  async function fetchStandings(squadId: string, leagueId: number, season?: number) {
     try {
-      const params: Record<string, string> = { sport };
+      const params: Record<string, string> = { league_id: String(leagueId) };
       if (season) params.season = String(season);
       standings.value = await api.get<FantasyStanding[]>(
         `/fantasy/${squadId}/standings`,

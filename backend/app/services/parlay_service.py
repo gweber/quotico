@@ -77,11 +77,11 @@ async def create_parlay(
     combined_odds = 1.0
 
     for leg in legs:
-        match = await _db.db.matches.find_one({"_id": ObjectId(leg["match_id"])})
+        match = await _db.db.matches_v3.find_one({"_id": int(leg["match_id"])})
         if not match:
             raise HTTPException(status.HTTP_404_NOT_FOUND, f"Match {leg['match_id']} not found.")
 
-        commence = ensure_utc(match["match_date"])
+        commence = ensure_utc(match["start_at"])
         if commence <= now or match["status"] != "scheduled":
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "One of the matches has already started.")
 
@@ -124,9 +124,9 @@ async def create_parlay(
     # Handle wallet deduction for bankroll mode
     wallet_id = None
     if game_mode == "bankroll" and stake:
-        sport_key = matchday["sport_key"]
+        league_id = matchday["league_id"]
         season = matchday["season"]
-        wallet = await wallet_service.get_or_create_wallet(user_id, squad_id, sport_key, season)
+        wallet = await wallet_service.get_or_create_wallet(user_id, squad_id, league_id, season)
         wallet_id = str(wallet["_id"])
         await wallet_service.deduct_stake(
             wallet_id=wallet_id,
@@ -142,7 +142,7 @@ async def create_parlay(
         "user_id": user_id,
         "squad_id": squad_id,
         "matchday_id": matchday_id,
-        "sport_key": matchday["sport_key"],
+        "league_id": matchday["league_id"],
         "season": matchday["season"],
         "matchday_number": matchday["matchday_number"],
         "legs": [l for l in validated_legs],

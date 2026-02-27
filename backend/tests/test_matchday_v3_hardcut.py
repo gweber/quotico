@@ -30,6 +30,7 @@ def test_parse_v3_matchday_id_rejects_incomplete_format():
 
 
 def test_favorite_prediction_uses_decimal_precision_for_close_odds():
+    # FIXME: ODDS_V3_BREAK — test fixture uses odds_meta.summary_1x2 no longer produced by connector
     match = {
         "odds_meta": {
             "summary_1x2": {
@@ -67,15 +68,15 @@ async def test_matchday_detail_uses_season_display_number_not_round_id(monkeypat
                 }
             ])
 
-    async def _fake_league_ids(_sport_key: str):
+    async def _fake_league_ids(_league_id: str):
         return [8]
 
-    async def _fake_list_matchdays(*, sport_key: str, season: int | None):
-        _ = sport_key, season
+    async def _fake_list_matchdays(*, league_id: str, season: int | None):
+        _ = league_id, season
         return [
             MatchdayResponse(
-                id="v3:soccer_germany_bundesliga:2025:393442",
-                sport_key="soccer_germany_bundesliga",
+                id="v3:82:2025:393442",
+                league_id=82,
                 season=2025,
                 matchday_number=24,
                 label="Matchday 24",
@@ -92,7 +93,7 @@ async def test_matchday_detail_uses_season_display_number_not_round_id(monkeypat
     monkeypatch.setattr(matchday_router._db, "db", type("DB", (), {"matches_v3": _Matches()})(), raising=False)
 
     result = await matchday_router._get_v3_matchday_detail(
-        "v3:soccer_germany_bundesliga:2025:393442",
+        "v3:82:2025:393442",
         lock_mins=15,
     )
     assert result is not None

@@ -692,6 +692,7 @@ class MetricsHeartbeat:
     # v3.2: Omega-Finalizer & fixed-snapshot safety-net passes
     # ------------------------------------------------------------------
 
+    # FIXME: ODDS_V3_BREAK — reads odds_timeline and writes fixed_snapshots.closing from stale data
     async def _omega_finalizer_pass(self) -> int:
         """Write closing snapshot from last pre-kickoff odds_timeline entry.
 
@@ -760,6 +761,7 @@ class MetricsHeartbeat:
         ("omega_1h", 0.75, 1.25),
     ]
 
+    # FIXME: ODDS_V3_BREAK — reads odds_meta.summary_1x2 and writes fixed_snapshots from stale data
     async def _fixed_snapshot_pass(self, upcoming: list[dict[str, Any]]) -> int:
         """Safety-net pass: lock time-window anchors for matches in the upcoming list.
 
@@ -833,11 +835,15 @@ class MetricsHeartbeat:
             return
         try:
             from app.services.event_bus import event_bus
-            from app.services.event_models import BaseEvent
-            await event_bus.publish(BaseEvent(
-                event_type="metrics.updated",
-                data={"source": "heartbeat", "type": tick_type, "matches_synced": count},
-            ))
+            from app.services.event_models import MetricsUpdatedEvent
+
+            await event_bus.publish(
+                MetricsUpdatedEvent(
+                    source="metrics_heartbeat",
+                    tick_type=str(tick_type or ""),
+                    matches_synced=max(0, int(count or 0)),
+                )
+            )
         except Exception:
             logger.debug("Could not publish metrics.updated event", exc_info=True)
 

@@ -10,7 +10,7 @@ logger = logging.getLogger("quotico.matchday_leaderboard")
 _STATE_KEY = "matchday_leaderboard"
 
 
-async def materialize_matchday_leaderboard(*, sport_key: str | None = None, season: int | None = None) -> None:
+async def materialize_matchday_leaderboard(*, league_id: int | None = None, season: int | None = None) -> None:
     """Aggregate resolved matchday_round slips into per-sport/season leaderboard.
 
     Smart sleep: skips if no slips were resolved since last materialization.
@@ -25,8 +25,8 @@ async def materialize_matchday_leaderboard(*, sport_key: str | None = None, seas
             return
 
     match_filter = {"type": "matchday_round", "status": "resolved", "total_points": {"$ne": None}}
-    if sport_key:
-        match_filter["sport_key"] = str(sport_key)
+    if league_id:
+        match_filter["league_id"] = int(league_id)
     if season is not None:
         match_filter["season"] = int(season)
 
@@ -35,7 +35,7 @@ async def materialize_matchday_leaderboard(*, sport_key: str | None = None, seas
         {
             "$group": {
                 "_id": {
-                    "sport_key": "$sport_key",
+                    "league_id": "$league_id",
                     "season": "$season",
                     "user_id": "$user_id",
                     "squad_id": "$squad_id",
@@ -64,7 +64,7 @@ async def materialize_matchday_leaderboard(*, sport_key: str | None = None, seas
 
     updated = 0
     for r in results:
-        sport_key = r["_id"]["sport_key"]
+        league_id = r["_id"]["league_id"]
         season = r["_id"]["season"]
         user_id = r["_id"]["user_id"]
         squad_id = r["_id"].get("squad_id")
@@ -84,7 +84,7 @@ async def materialize_matchday_leaderboard(*, sport_key: str | None = None, seas
                     tendency_count += 1
 
         await _db.db.matchday_leaderboard.update_one(
-            {"sport_key": sport_key, "season": season, "user_id": user_id, "squad_id": squad_id},
+            {"league_id": league_id, "season": season, "user_id": user_id, "squad_id": squad_id},
             {
                 "$set": {
                     "total_points": r["total_points"],
@@ -96,7 +96,7 @@ async def materialize_matchday_leaderboard(*, sport_key: str | None = None, seas
                     "updated_at": now,
                 },
                 "$setOnInsert": {
-                    "sport_key": sport_key,
+                    "league_id": league_id,
                     "season": season,
                     "user_id": user_id,
                     "squad_id": squad_id,

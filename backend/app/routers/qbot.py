@@ -37,7 +37,7 @@ def _slip_projection(doc: dict) -> dict:
         "match_id": sel.get("match_id", ""),
         "home_team": mi.get("home_team", ""),
         "away_team": mi.get("away_team", ""),
-        "sport_key": mi.get("sport_key", ""),
+        "league_id": mi.get("league_id", ""),
         "match_date": mi.get("match_date", ""),
         "selection": sel.get("pick", ""),
         "locked_odds": sel.get("locked_odds"),
@@ -63,7 +63,7 @@ async def _fetch_bets_with_joins(qbot_id: str, status_filter: dict, limit: int, 
             "let": {"mid": {"$toObjectId": "$sel.match_id"}},
             "pipeline": [
                 {"$match": {"$expr": {"$eq": ["$_id", "$$mid"]}}},
-                {"$project": {"home_team": 1, "away_team": 1, "sport_key": 1, "match_date": 1}},
+                {"$project": {"home_team": 1, "away_team": 1, "league_id": 1, "match_date": 1}},
             ],
             "as": "match_info",
         }},
@@ -134,13 +134,13 @@ async def _build_dashboard(qbot_id: str, qbot_points: float) -> dict:
                 "let": {"mid": {"$toObjectId": "$selections.match_id"}},
                 "pipeline": [
                     {"$match": {"$expr": {"$eq": ["$_id", "$$mid"]}}},
-                    {"$project": {"sport_key": 1}},
+                    {"$project": {"league_id": 1}},
                 ],
                 "as": "mi",
             }},
             {"$unwind": "$mi"},
             {"$group": {
-                "_id": "$mi.sport_key",
+                "_id": "$mi.league_id",
                 "total": {"$sum": 1},
                 "won": {"$sum": {"$cond": [{"$eq": ["$status", "won"]}, 1, 0]}},
                 "total_points": {"$sum": {"$cond": [{"$eq": ["$status", "won"]}, "$total_odds", 0]}},
@@ -150,7 +150,7 @@ async def _build_dashboard(qbot_id: str, qbot_points: float) -> dict:
         docs = await _db.db.betting_slips.aggregate(pipeline).to_list(length=20)
         return [
             {
-                "sport_key": d["_id"],
+                "league_id": d["_id"],
                 "total": d["total"],
                 "won": d["won"],
                 "win_rate": round(d["won"] / d["total"], 3) if d["total"] else 0,
@@ -197,7 +197,7 @@ async def _build_dashboard(qbot_id: str, qbot_points: float) -> dict:
                     "match_id": doc["match_id"],
                     "home_team": doc.get("home_team", ""),
                     "away_team": doc.get("away_team", ""),
-                    "sport_key": doc.get("sport_key", ""),
+                    "league_id": doc.get("league_id", ""),
                     "match_date": ensure_utc(doc["match_date"]).isoformat(),
                     "recommended_selection": doc.get("recommended_selection", "-"),
                     "confidence": doc.get("confidence", 0),

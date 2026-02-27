@@ -23,7 +23,7 @@ interface JusticeTeamRow {
 
 interface JusticeSnapshot {
   id: string;
-  sport_key: string;
+  league_id: number;
   snapshot_date: string | null;
   window_start: string | null;
   window_end: string | null;
@@ -36,9 +36,9 @@ interface JusticeSnapshot {
 interface JusticeResponse {
   items: JusticeSnapshot[];
   count: number;
-  available_sports: string[];
+  available_sports: number[];
   filters: {
-    sport_key: string | null;
+    league_id: number | null;
     limit: number;
     days: number;
   };
@@ -50,10 +50,10 @@ const { t } = useI18n();
 const loading = ref(true);
 const error = ref<string | null>(null);
 const items = ref<JusticeSnapshot[]>([]);
-const availableSports = ref<string[]>([]);
+const availableSports = ref<number[]>([]);
 const selectedId = ref<string>("");
 
-const filterSport = ref<string>("");
+const filterSport = ref<number | null>(null);
 const filterLimit = ref<number>(50);
 const filterDays = ref<number>(180);
 const snapshotSearch = ref<string>("");
@@ -62,7 +62,7 @@ const filteredItems = computed(() => {
   const needle = snapshotSearch.value.trim().toLowerCase();
   if (!needle) return items.value;
   return items.value.filter((item) => {
-    const sport = item.sport_key.toLowerCase();
+    const sport = String(item.league_id);
     const date = (item.snapshot_date || "").toLowerCase();
     return sport.includes(needle) || date.includes(needle);
   });
@@ -89,8 +89,8 @@ async function fetchJustice() {
     const qs = new URLSearchParams();
     qs.set("limit", String(filterLimit.value));
     qs.set("days", String(filterDays.value));
-    if (filterSport.value.trim()) {
-      qs.set("sport_key", filterSport.value.trim());
+    if (filterSport.value !== null) {
+      qs.set("league_id", String(filterSport.value));
     }
     const result = await api.get<JusticeResponse>(`/admin/time-machine/justice?${qs.toString()}`);
     items.value = result.items || [];
@@ -139,7 +139,7 @@ onMounted(() => {
             v-model="filterSport"
             class="mt-1 w-full rounded-card border border-surface-3 bg-surface-0 px-2 py-1.5 text-sm text-text-primary"
           >
-            <option value="">{{ t("admin.timeMachineJustice.filters.allSports") }}</option>
+            <option :value="null">{{ t("admin.timeMachineJustice.filters.allSports") }}</option>
             <option v-for="sport in availableSports" :key="sport" :value="sport">{{ sport }}</option>
           </select>
         </div>
@@ -204,7 +204,7 @@ onMounted(() => {
         </div>
         <div class="rounded-card border border-surface-3/60 bg-surface-1 p-3">
           <p class="text-[11px] text-text-muted">{{ t("admin.timeMachineJustice.kpi.latestSport") }}</p>
-          <p class="text-sm font-semibold text-text-primary">{{ topSnapshot?.sport_key || "--" }}</p>
+          <p class="text-sm font-semibold text-text-primary">{{ topSnapshot?.league_id || "--" }}</p>
         </div>
         <div class="rounded-card border border-surface-3/60 bg-surface-1 p-3">
           <p class="text-[11px] text-text-muted">{{ t("admin.timeMachineJustice.kpi.latestDate") }}</p>
@@ -235,7 +235,7 @@ onMounted(() => {
               @click="selectedId = item.id"
             >
               <div class="flex items-center justify-between gap-2">
-                <span class="text-xs text-text-secondary">{{ item.sport_key }}</span>
+                <span class="text-xs text-text-secondary">{{ item.league_id }}</span>
                 <span class="text-[11px] text-text-muted">{{ formatDate(item.snapshot_date) }}</span>
               </div>
               <div class="text-[11px] text-text-muted mt-0.5">
@@ -254,7 +254,7 @@ onMounted(() => {
           </div>
           <div v-else class="p-3 space-y-3">
             <div class="text-xs text-text-muted">
-              {{ selectedSnapshot.sport_key }} · {{ formatDate(selectedSnapshot.snapshot_date) }}
+              {{ selectedSnapshot.league_id }} · {{ formatDate(selectedSnapshot.snapshot_date) }}
             </div>
             <div class="text-[11px] text-text-muted">
               {{ t("admin.timeMachineJustice.window", { start: formatDate(selectedSnapshot.window_start), end: formatDate(selectedSnapshot.window_end) }) }}

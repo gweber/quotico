@@ -67,6 +67,7 @@ const displayOdds = computed(() => {
 
 const isClosingLine = computed(() => oddsBadge.value === "closing");
 
+// FIXME: ODDS_V3_BREAK — reads fixed_snapshots.opening and summary_1x2 for trend arrows which are no longer produced by connector
 // Trend arrows + opening delta from fixed_snapshots
 const TREND_THRESHOLD = 0.03; // minimum delta to show an arrow
 const oddsTrends = computed(() => {

@@ -34,7 +34,7 @@ export interface QbotStrategyIdentity {
 
 export interface QbotStrategy {
   id: string;
-  sport_key: string;
+  league_id: number;
   version: string;
   generation: number;
   dna: Record<string, number>;

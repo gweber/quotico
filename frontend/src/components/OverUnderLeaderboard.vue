@@ -4,7 +4,7 @@ import { useApi } from "@/composables/useApi";
 
 const props = defineProps<{
   squadId: string;
-  sportKey: string;
+  leagueId: number;
   season?: number;
 }>();
 
@@ -22,7 +22,7 @@ const entries = ref<OUEntry[]>([]);
 onMounted(async () => {
   try {
     const params: Record<string, string> = {
-      sport: props.sportKey,
+      league_id: String(props.leagueId),
       mode: "over_under",
     };
     if (props.season) params.season = String(props.season);

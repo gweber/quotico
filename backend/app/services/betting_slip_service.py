@@ -40,11 +40,18 @@ def _is_v3_id(match_id: str) -> bool:
         return False
 
 
+def _require_league_id_int(value: Any, *, context: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        logger.warning("Legacy league_id rejected in %s: value=%r type=%s", context, value, type(value).__name__)
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, f"{context}: league_id must be int.")
+    return value
+
+
 async def _resolve_match(match_id: str, projection: dict | None = None) -> dict | None:
     """Look up a match from either matches_v3 (integer IDs) or matches (ObjectId)."""
     if _is_v3_id(match_id):
         return await _db.db.matches_v3.find_one({"_id": int(match_id)}, projection)
-    return await _db.db.matches.find_one({"_id": ObjectId(match_id)}, projection)
+    return await _db.db.matches_v3.find_one({"_id": int(match_id)}, projection)
 
 
 async def _resolve_matches_batch(match_ids: list[str], projection: dict | None = None) -> dict[str, dict]:
@@ -61,8 +68,8 @@ async def _resolve_matches_batch(match_ids: list[str], projection: dict | None =
             result[str(m["_id"])] = m
 
     if legacy_ids:
-        oid_list = [ObjectId(mid) for mid in legacy_ids]
-        cursor = _db.db.matches.find({"_id": {"$in": oid_list}}, projection)
+        oid_list = [int(mid) for mid in legacy_ids]
+        cursor = _db.db.matches_v3.find({"_id": {"$in": oid_list}}, projection)
         async for m in cursor:
             result[str(m["_id"])] = m
 
@@ -108,7 +115,7 @@ async def create_slip(
     all_match_ids = [s["match_id"] for s in selections]
     matches_by_id = await _resolve_matches_batch(
         all_match_ids,
-        {"status": 1, "match_date": 1, "start_at": 1, "odds": 1, "odds_meta": 1},
+        {"status": 1, "start_at": 1, "start_at": 1, "odds": 1, "odds_meta": 1},
     )
 
     # Check for existing bets on these matches by this user
@@ -137,10 +144,7 @@ async def create_slip(
     # Validate each selection
     locked_selections: list[dict] = []
 
-    from app.providers.odds_api import odds_provider
     staleness_limit = settings.ODDS_STALENESS_MAX_SECONDS
-    if odds_provider.circuit_open:
-        staleness_limit = staleness_limit * 4
 
     for sel in selections:
         match = matches_by_id.get(sel["match_id"])
@@ -151,7 +155,7 @@ async def create_slip(
             )
 
         # Check match hasn't started (v3 uses start_at, legacy uses match_date)
-        commence = ensure_utc(match.get("start_at") or match.get("match_date"))
+        commence = ensure_utc(match.get("start_at") or match.get("start_at"))
         match_status = (match.get("status") or "").lower()
         if commence <= now or match_status != "scheduled":
             raise HTTPException(
@@ -318,7 +322,7 @@ async def create_or_get_draft(
     slip_type: str = "single",
     squad_id: str | None = None,
     matchday_id: str | None = None,
-    sport_key: str | None = None,
+    league_id: int | None = None,
     funding: str = "virtual",
 ) -> dict:
     """Create a new draft slip or return the user's existing active draft.
@@ -367,21 +371,23 @@ async def create_or_get_draft(
         # v3 matchday IDs are strings like "v3:sport:season:round" — resolve context
         from app.services.matchday_service import _resolve_v3_matchday_context
         context, _ = await _resolve_v3_matchday_context(matchday_id)
+        context_league_id = _require_league_id_int(context.get("league_id"), context="matchday_context")
         slip_doc["matchday_id"] = matchday_id
         slip_doc["matchday_number"] = context.get("matchday_number")
-        slip_doc["sport_key"] = context.get("sport_key")
+        slip_doc["league_id"] = context_league_id
         slip_doc["season"] = context.get("season")
         # Freeze point_weights from squad config at creation
         if squad_id:
             squad = await _db.db.squads.find_one({"_id": ObjectId(squad_id)})
             if squad:
                 from app.services.squad_league_service import get_active_league_config
-                lc = get_active_league_config(squad, context.get("sport_key", ""))
+                lc = get_active_league_config(squad, context_league_id)
                 if lc:
                     slip_doc["point_weights"] = lc.get("config", {}).get("point_weights")
 
-    if sport_key:
-        slip_doc["sport_key"] = sport_key
+    if league_id is not None:
+        _require_league_id_int(league_id, context="create_or_get_draft")
+        slip_doc["league_id"] = league_id
 
     result = await _db.db.betting_slips.insert_one(slip_doc)
     slip_doc["_id"] = result.inserted_id
@@ -438,6 +444,7 @@ async def patch_selection(
     market: str = "h2h",
     pick: Any | None = None,
     displayed_odds: float | None = None,
+    reason: str | None = None,
 ) -> dict:
     """Add, update, or remove a leg on a draft/pending slip.
 
@@ -472,10 +479,12 @@ async def patch_selection(
                 "exact_score pick requires both home and away scores.",
             )
 
-    # Validate match exists (supports both v3 integer IDs and legacy ObjectIds)
-    match = await _resolve_match(match_id)
-    if not match:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, f"Match {match_id} not found.")
+    match = None
+    if action != "invalidate":
+        # Validate match exists (supports v3 IDs)
+        match = await _resolve_match(match_id)
+        if not match:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, f"Match {match_id} not found.")
 
     if action == "add":
         if pick is None:
@@ -557,6 +566,27 @@ async def patch_selection(
                 "$set": {"updated_at": now},
             },
         )
+    elif action == "invalidate":
+        if slip["status"] != "draft":
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "Only draft slips support invalidation.")
+        sel_idx = None
+        for i, s in enumerate(slip.get("selections", [])):
+            if s["match_id"] == match_id:
+                sel_idx = i
+                break
+        if sel_idx is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Selection not found for this match.")
+        normalized_reason = str(reason or "match_missing").strip() or "match_missing"
+        update_fields: dict[str, Any] = {
+            f"selections.{sel_idx}.status": "void",
+            f"selections.{sel_idx}.invalid_reason": normalized_reason,
+            f"selections.{sel_idx}.invalid_at": now,
+            "updated_at": now,
+        }
+        await _db.db.betting_slips.update_one(
+            {"_id": slip["_id"]},
+            {"$set": update_fields},
+        )
 
     else:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, f"Invalid action: {action}")
@@ -583,9 +613,15 @@ async def submit_slip(slip_id: str, user_id: str) -> dict:
 
     now = utcnow()
     selections = slip["selections"]
+    active_selections = [sel for sel in selections if str(sel.get("status") or "") != "void"]
+    if not active_selections:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            {"message": "Slip has no valid selections.", "code": "NO_VALID_SELECTIONS"},
+        )
 
     # Lock odds for each selection
-    for sel in selections:
+    for sel in active_selections:
         if sel.get("status") != "draft":
             continue  # Already locked (e.g. per-leg auto-lock)
 
@@ -625,10 +661,14 @@ async def submit_slip(slip_id: str, user_id: str) -> dict:
 
     # Calculate total_odds and potential_payout for market slips
     if slip["type"] in ("single", "parlay"):
-        active_odds = [
-            sel.get("locked_odds", 1.0)
-            for sel in selections if sel.get("locked_odds")
-        ]
+        active_odds: list[float] = []
+        for sel in active_selections:
+            if str(sel.get("status") or "") == "void":
+                active_odds.append(1.0)
+                continue
+            locked = sel.get("locked_odds")
+            if locked:
+                active_odds.append(float(locked))
         if active_odds:
             total_odds = reduce(mul, active_odds, 1.0)
             slip["total_odds"] = round(total_odds, 4)
@@ -644,7 +684,7 @@ async def submit_slip(slip_id: str, user_id: str) -> dict:
             stake=slip.get("stake", 0),
             reference_type="betting_slip",
             reference_id=str(slip["_id"]),
-            description=f"Slip submitted: {len(selections)} selections",
+            description=f"Slip submitted: {len(active_selections)} selections",
         )
 
     update: dict = {
@@ -695,14 +735,15 @@ async def create_bankroll_bet(
     if not match:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Match not found.")
 
-    commence = ensure_utc(match.get("start_at") or match.get("match_date"))
+    commence = ensure_utc(match.get("start_at") or match.get("start_at"))
     match_status = (match.get("status") or "").lower()
     if commence <= now or match_status != "scheduled":
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Match is not available for betting.")
 
     # Get squad bankroll config
     from app.services.squad_league_service import get_active_league_config
-    lc = get_active_league_config(squad, match.get("sport_key", ""))
+    league_id = _require_league_id_int(match.get("league_id"), context="create_bankroll_bet.match")
+    lc = get_active_league_config(squad, league_id)
     config = lc.get("config", {}) if lc else {}
     min_bet = config.get("min_bet", 10)
     max_bet_pct = config.get("max_bet_pct", 50)
@@ -720,9 +761,8 @@ async def create_bankroll_bet(
 
     # Get or create wallet, check max bet
     from app.services import wallet_service
-    sport_key = match.get("sport_key", "")
     season = match.get("matchday_season") or match.get("season", 0)
-    wallet = await wallet_service.get_or_create_wallet(user_id, squad_id, sport_key, season)
+    wallet = await wallet_service.get_or_create_wallet(user_id, squad_id, league_id, season)
     wallet_id = str(wallet["_id"])
 
     max_stake = wallet["balance"] * (max_bet_pct / 100)
@@ -752,7 +792,7 @@ async def create_bankroll_bet(
         "potential_payout": potential_payout,
         "funding": "wallet",
         "wallet_id": wallet_id,
-        "sport_key": sport_key,
+        "league_id": league_id,
         "status": "pending",
         "submitted_at": now,
         "resolved_at": None,
@@ -800,7 +840,7 @@ async def create_over_under_bet(
     if not match:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Match not found.")
 
-    commence = ensure_utc(match.get("start_at") or match.get("match_date"))
+    commence = ensure_utc(match.get("start_at") or match.get("start_at"))
     match_status = (match.get("status") or "").lower()
     if commence <= now or match_status != "scheduled":
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Match is not available for betting.")
@@ -825,9 +865,9 @@ async def create_over_under_bet(
     # Handle wallet funding if stake provided
     if stake and stake > 0:
         from app.services import wallet_service
-        sport_key = match.get("sport_key", "")
+        league_id = _require_league_id_int(match.get("league_id"), context="create_over_under_bet.match")
         season = match.get("matchday_season") or match.get("season", 0)
-        wallet = await wallet_service.get_or_create_wallet(user_id, squad_id, sport_key, season)
+        wallet = await wallet_service.get_or_create_wallet(user_id, squad_id, league_id, season)
         wallet_id = str(wallet["_id"])
         funding = "wallet"
 
@@ -850,7 +890,7 @@ async def create_over_under_bet(
         "potential_payout": potential_payout,
         "funding": funding,
         "wallet_id": wallet_id,
-        "sport_key": match.get("sport_key"),
+        "league_id": _require_league_id_int(match.get("league_id"), context="create_over_under_bet.match"),
         "status": "pending",
         "submitted_at": now,
         "resolved_at": None,
@@ -915,7 +955,7 @@ async def create_parlay(
         if not match:
             raise HTTPException(status.HTTP_404_NOT_FOUND, f"Match {leg['match_id']} not found.")
 
-        commence = ensure_utc(match.get("start_at") or match.get("match_date"))
+        commence = ensure_utc(match.get("start_at") or match.get("start_at"))
         match_status = (match.get("status") or "").lower()
         if commence <= now or match_status != "scheduled":
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "One of the matches has already started.")
@@ -964,10 +1004,10 @@ async def create_parlay(
     if actual_stake:
         potential_payout = round(actual_stake * combined_odds, 2)
         funding = "wallet"
-        sport_key = matchday["sport_key"]
+        league_id = _require_league_id_int(matchday.get("league_id"), context="create_parlay.matchday")
         season = matchday["season"]
         from app.services import wallet_service
-        wallet = await wallet_service.get_or_create_wallet(user_id, squad_id, sport_key, season)
+        wallet = await wallet_service.get_or_create_wallet(user_id, squad_id, league_id, season)
         wallet_id = str(wallet["_id"])
     else:
         actual_stake = 10.0
@@ -978,7 +1018,7 @@ async def create_parlay(
         "squad_id": squad_id,
         "type": "parlay",
         "matchday_id": matchday_id,
-        "sport_key": matchday["sport_key"],
+        "league_id": _require_league_id_int(matchday.get("league_id"), context="create_parlay.matchday"),
         "season": matchday["season"],
         "matchday_number": matchday["matchday_number"],
         "selections": validated_legs,
@@ -1040,7 +1080,7 @@ async def make_survivor_pick(
     if is_match_locked(match):
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Match is locked.")
 
-    sport_key = match.get("sport_key", "")
+    league_id = _require_league_id_int(match.get("league_id"), context="make_survivor_pick.match")
     season = match.get("matchday_season") or match.get("season", 0)
     matchday_number = match.get("matchday_number")
     if matchday_number is None:
@@ -1052,7 +1092,7 @@ async def make_survivor_pick(
         raise HTTPException(status.HTTP_409_CONFLICT, "Match team identity not initialized yet.")
 
     registry = TeamRegistry.get()
-    team_id = await registry.resolve(team, sport_key)
+    team_id = await registry.resolve(team, league_id)
     if team_id not in (home_team_id, away_team_id):
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Team not in this match.")
 
@@ -1060,7 +1100,7 @@ async def make_survivor_pick(
     slip = await _db.db.betting_slips.find_one({
         "user_id": user_id,
         "squad_id": squad_id,
-        "sport_key": sport_key,
+        "league_id": league_id,
         "season": season,
         "type": "survivor",
     })
@@ -1107,7 +1147,7 @@ async def make_survivor_pick(
             "user_id": user_id,
             "squad_id": squad_id,
             "type": "survivor",
-            "sport_key": sport_key,
+            "league_id": league_id,
             "season": season,
             "selections": [{
                 "match_id": match_id,
@@ -1160,7 +1200,7 @@ async def make_fantasy_pick(
     if is_match_locked(match):
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Match is locked.")
 
-    sport_key = match.get("sport_key", "")
+    league_id = _require_league_id_int(match.get("league_id"), context="make_fantasy_pick.match")
     season = match.get("matchday_season") or match.get("season", 0)
     matchday_number = match.get("matchday_number")
     if matchday_number is None:
@@ -1172,7 +1212,7 @@ async def make_fantasy_pick(
         raise HTTPException(status.HTTP_409_CONFLICT, "Match team identity not initialized yet.")
 
     registry = TeamRegistry.get()
-    team_id = await registry.resolve(team, sport_key)
+    team_id = await registry.resolve(team, league_id)
     if team_id not in (home_team_id, away_team_id):
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Team not in this match.")
 
@@ -1180,7 +1220,7 @@ async def make_fantasy_pick(
     existing = await _db.db.betting_slips.find_one({
         "user_id": user_id,
         "squad_id": squad_id,
-        "sport_key": sport_key,
+        "league_id": league_id,
         "season": season,
         "matchday_number": matchday_number,
         "type": "fantasy",
@@ -1209,7 +1249,7 @@ async def make_fantasy_pick(
         "user_id": user_id,
         "squad_id": squad_id,
         "type": "fantasy",
-        "sport_key": sport_key,
+        "league_id": league_id,
         "season": season,
         "matchday_number": matchday_number,
         "selections": [{
@@ -1307,7 +1347,7 @@ def slip_to_response(doc: dict) -> dict:
         "used_teams": doc.get("used_teams"),
         "used_team_ids": used_team_ids,
         # Common
-        "sport_key": doc.get("sport_key"),
+        "league_id": doc.get("league_id"),
         "season": doc.get("season"),
         "created_at": doc.get("created_at"),
         "updated_at": doc.get("updated_at"),

@@ -46,24 +46,24 @@ class Settings(BaseSettings):
     SEED_ADMIN_PASSWORD: str = ""
 
     # football-data.org (free scores + live data)
-    FOOTBALL_DATA_ORG_API_KEY: str = ""
-    FOOTBALL_DATA_ORG_BASE_URL: str = "https://api.football-data.org/v4"
+    SPORTMONKS_ORG_API_KEY: str = ""
+    SPORTMONKS_ORG_BASE_URL: str = "https://api.football-data.org/v4"
 
     # API key for local tools (scraper import etc.)
     IMPORT_API_KEY: str = ""
     SM_API_KEY: str = ""
 
     # Provider runtime settings fallback (DB-first: DB > ENV > defaults)
-    THEODDSAPI_BASE_URL: str = "https://api.the-odds-api.com/v4"
-    OPENLIGADB_BASE_URL: str = "https://api.openligadb.de"
-    FOOTBALL_DATA_UK_BASE_URL: str = "https://www.football-data.co.uk/mmz4281"
+    SPORTMONKS_BASE_URL: str = "https://api.the-odds-api.com/v4"
+    SPORTMONKS_BASE_URL: str = "https://api.sportmonks.de"
+    SPORTMONKS_UK_BASE_URL: str = "https://www.football-data.co.uk/mmz4281"
     UNDERSTAT_BASE_URL: str = "https://understat.com"
     SPORTMONKS_BASE_URL: str = "https://api.sportmonks.com/v3"
     PROVIDER_SETTINGS_CACHE_TTL: int = 15
-    THEODDSAPI_RATE_LIMIT_RPM: int = 30
-    FOOTBALL_DATA_RATE_LIMIT_RPM: int = 10
-    OPENLIGADB_RATE_LIMIT_RPM: int = 120
-    FOOTBALL_DATA_UK_RATE_LIMIT_RPM: int = 30
+    SPORTMONKS_RATE_LIMIT_RPM: int = 30
+    SPORTMONKS_RATE_LIMIT_RPM: int = 10
+    SPORTMONKS_RATE_LIMIT_RPM: int = 120
+    SPORTMONKS_UK_RATE_LIMIT_RPM: int = 30
     UNDERSTAT_RATE_LIMIT_RPM: int = 30
     SPORTMONKS_RESERVE_CREDITS: int = 50
     SPORTMONKS_DISCOVERY_TTL_MINUTES: int = 30
@@ -81,6 +81,9 @@ class Settings(BaseSettings):
     SPORTMONKS_ODDS_TIMELINE_MIN_DELTA: float = 0.02
     SPORTMONKS_ODDS_TIMELINE_MINUTES: int = 60
     ALIAS_SOURCES_ALLOWED: str = "manual,provider_x,crawler,provider_unknown"
+
+    # Odds v3 raw cache pipeline
+    ODDS_V3_RAW_CACHE_ENABLED: bool = True
 
     # V3 query transport
     V3_QUERY_CACHE_TTL_SECONDS: int = 120
@@ -110,10 +113,10 @@ class Settings(BaseSettings):
     EVENT_BUS_HANDLER_QUEUE_MAXSIZE: int = 2000
     EVENT_BUS_HANDLER_DEFAULT_CONCURRENCY: int = 1
     EVENT_BUS_ERROR_BUFFER_SIZE: int = 200
-    EVENT_PUBLISH_FOOTBALL_DATA: bool = True
-    EVENT_PUBLISH_OPENLIGADB: bool = True
-    EVENT_PUBLISH_FOOTBALL_DATA_UK: bool = True
-    EVENT_PUBLISH_THEODDSAPI: bool = True
+    EVENT_PUBLISH_SPORTMONKS: bool = True
+    EVENT_PUBLISH_SPORTMONKS: bool = True
+    EVENT_PUBLISH_SPORTMONKS_UK: bool = True
+    EVENT_PUBLISH_SPORTMONKS: bool = True
     EVENT_PUBLISH_ODDS_INGESTED: bool = True
     EVENT_HANDLER_MATCH_FINALIZED_ENABLED: bool = True
     EVENT_HANDLER_MATCH_UPDATED_ENABLED: bool = True

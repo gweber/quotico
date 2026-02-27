@@ -35,7 +35,7 @@ class LeagueFeatures(BaseModel):
 
 class League(BaseModel):
     id: PyObjectId | None = Field(alias="_id", default=None)
-    sport_key: str
+    league_id: int
     display_name: str
     structure_type: LeagueType = LeagueType.LEAGUE
     country_code: str | None = None
@@ -43,7 +43,6 @@ class League(BaseModel):
     ui_order: int = 999
     current_season: int
     is_active: bool = True
-    needs_review: bool = False
     features: LeagueFeatures = Field(default_factory=LeagueFeatures)
     external_ids: dict[str, str] = Field(default_factory=dict)
 

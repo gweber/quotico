@@ -11,9 +11,9 @@ Dependencies:
     - backend/app/database.py
 
 Usage:
-    python -m tools.qbot_ensemble_miner --sport soccer_epl
+    python -m tools.qbot_ensemble_miner --league-id 8
     python -m tools.qbot_ensemble_miner --multi --runs 7 --base-seed 42
-    python -m tools.qbot_ensemble_miner --sport soccer_epl --mode deep
+    python -m tools.qbot_ensemble_miner --league-id 82 --mode deep
 """
 
 from __future__ import annotations
@@ -157,7 +157,7 @@ def _select_diverse_runs(valid: list[dict[str, Any]], genes: list[str]) -> list[
 
 
 async def _run_one_seed(
-    sport_key: str | None,
+    league_id: int | None,
     *,
     seed: int,
     mode: str,
@@ -168,7 +168,7 @@ async def _run_one_seed(
 ) -> dict[str, Any]:
     if mode == "deep":
         result = await _arena().run_evolution_deep(
-            sport_key,
+            league_id,
             population_size=population_size,
             generations=generations,
             dry_run=True,
@@ -179,7 +179,7 @@ async def _run_one_seed(
         )
     else:
         result = await _arena().run_evolution(
-            sport_key,
+            league_id,
             population_size=population_size,
             generations=generations,
             dry_run=True,
@@ -302,7 +302,7 @@ def _build_consensus(
 
 async def _persist_ensemble_strategy(
     *,
-    sport_key: str | None,
+    league_id: int | None,
     mode: str,
     consensus_dna: dict[str, float],
     summary: dict[str, Any],
@@ -319,7 +319,7 @@ async def _persist_ensemble_strategy(
     best_run = summary["best_run"]
     valid_runs = [r for r in run_results if "error" not in r and isinstance(r.get("dna"), dict)]
     seeds = [base_seed + i for i in range(runs)]
-    sport_value = sport_key or "all"
+    league_value = league_id if isinstance(league_id, int) else None
     now = _utcnow()
 
     validation = best_run.get("validation_fitness") or {}
@@ -330,7 +330,7 @@ async def _persist_ensemble_strategy(
         "version": "v3",
         "fitness_version": "soft_penalty_v1",
         "stress_version": "stress_rescue_v1",
-        "sport_key": sport_value,
+        "league_id": league_value,
         "generation": 0,
         "created_at": now,
         "dna": consensus_dna,
@@ -382,7 +382,7 @@ async def _persist_ensemble_strategy(
     }
 
     if dry_run:
-        print(f"[DRY RUN] Would persist ensemble strategy for {sport_value}")
+        print(f"[DRY RUN] Would persist ensemble strategy for {league_value or 'global'}")
     else:
         result = await _db.db.qbot_strategies.insert_one(strategy_doc)
         inserted["consensus"] = str(result.inserted_id)
@@ -412,7 +412,7 @@ async def _persist_ensemble_strategy(
             "version": source.get("version", "v3"),
             "fitness_version": source.get("fitness_version", "soft_penalty_v1"),
             "stress_version": source.get("stress_version", "stress_rescue_v1"),
-            "sport_key": source.get("sport_key", sport_value),
+            "league_id": source.get("league_id", league_value),
             "generation": source.get("generation", 0),
             "created_at": now,
             "dna": source.get("dna", {}),
@@ -444,7 +444,7 @@ async def _persist_ensemble_strategy(
             },
         }
         if dry_run:
-            print(f"[DRY RUN] Would persist archetype strategy ({archetype}) for {sport_value}")
+            print(f"[DRY RUN] Would persist archetype strategy ({archetype}) for {league_value or 'global'}")
             continue
         r = await _db.db.qbot_strategies.insert_one(doc)
         inserted[archetype] = str(r.inserted_id)
@@ -453,8 +453,8 @@ async def _persist_ensemble_strategy(
     return inserted
 
 
-async def _mine_sport(
-    sport_key: str | None,
+async def _mine_league(
+    league_id: int | None,
     *,
     runs: int,
     base_seed: int,
@@ -466,15 +466,15 @@ async def _mine_sport(
     with_archetypes: bool,
     lookback_years: int,
 ) -> dict[str, Any]:
-    sport_label = sport_key or "all"
-    print(f"\n=== Ensemble mining: {sport_label} | runs={runs} | mode={mode} ===")
+    league_label = league_id if league_id is not None else "global"
+    print(f"\n=== Ensemble mining: {league_label} | runs={runs} | mode={mode} ===")
 
     run_results: list[dict[str, Any]] = []
     for i in range(runs):
         seed = base_seed + i
         print(f"Run {i + 1}/{runs} with seed={seed}")
         result = await _run_one_seed(
-            sport_key,
+            league_id,
             seed=seed,
             mode=mode,
             population_size=population_size,
@@ -506,7 +506,7 @@ async def _mine_sport(
     print("xg_trust_factor CV:", summary.get("xg_trust_factor_cv"))
 
     inserted = await _persist_ensemble_strategy(
-        sport_key=sport_key,
+        league_id=league_id,
         mode=mode,
         consensus_dna=consensus_dna,
         summary=summary,
@@ -518,15 +518,15 @@ async def _mine_sport(
         dry_run=dry_run,
         with_archetypes=with_archetypes,
     )
-    return {"sport_key": sport_label, "inserted": inserted, "summary": summary}
+    return {"league_id": league_id, "inserted": inserted, "summary": summary}
 
 
-async def _discover_eligible_leagues() -> list[str]:
+async def _discover_eligible_leagues() -> list[int]:
     discovered = await _arena().discover_leagues()
     return [
-        sport_key
-        for sport_key, count in discovered
-        if count >= _arena().MIN_TIPS_PER_LEAGUE
+        league_id
+        for league_id, count in discovered
+        if isinstance(league_id, int) and count >= _arena().MIN_TIPS_PER_LEAGUE
     ]
 
 
@@ -534,7 +534,7 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Qbot Ensemble Miner — robust DNA mining across deterministic seeds",
     )
-    parser.add_argument("--sport", type=str, default=None, help="sport_key (e.g. soccer_epl)")
+    parser.add_argument("--league-id", type=int, default=None, help="league_id (int, Sportmonks league id)")
     parser.add_argument("--multi", action="store_true", help="Run all eligible leagues")
     parser.add_argument("--runs", type=int, default=5, help="Number of runs per league (default: 5)")
     parser.add_argument("--base-seed", type=int, default=42, help="Seed start (default: 42)")
@@ -553,8 +553,8 @@ async def _run(args: argparse.Namespace) -> None:
 
     if args.runs < 2:
         raise ValueError("--runs must be >= 2 for variance analysis")
-    if not args.multi and not args.sport:
-        raise ValueError("Provide --sport or use --multi")
+    if not args.multi and args.league_id is None:
+        raise ValueError("Provide --league-id or use --multi")
 
     defaults = _arena().MODE_DEFAULTS[args.mode]
     population_size = args.population or defaults["population_size"]
@@ -562,17 +562,17 @@ async def _run(args: argparse.Namespace) -> None:
 
     await _db.connect_db()
     try:
-        sports: list[str | None]
+        leagues: list[int | None]
         if args.multi:
-            sports = await _discover_eligible_leagues()
-            if not sports:
+            leagues = await _discover_eligible_leagues()
+            if not leagues:
                 raise RuntimeError("No eligible leagues discovered for --multi")
         else:
-            sports = [args.sport]
+            leagues = [args.league_id]
 
-        for sport_key in sports:
-            await _mine_sport(
-                sport_key,
+        for league_id in leagues:
+            await _mine_league(
+                league_id,
                 runs=args.runs,
                 base_seed=args.base_seed,
                 mode=args.mode,
@@ -588,6 +588,11 @@ async def _run(args: argparse.Namespace) -> None:
 
 
 def main() -> None:
+    if "--sport" in sys.argv:
+        raise ValueError(
+            "Error: --sport is deprecated. Use --league-id <int>. "
+            "Example: --league-id 82 (Bundesliga)."
+        )
     args = _parse_args()
     asyncio.run(_run(args))
 

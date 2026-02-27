@@ -28,8 +28,8 @@ async def make_pick(
     """
     now = utcnow()
 
-    # Validate match first (need sport_key for league config check)
-    match = await _db.db.matches.find_one({"_id": ObjectId(match_id)})
+    # Validate match first (need league_id for league config check)
+    match = await _db.db.matches_v3.find_one({"_id": int(match_id)})
     if not match:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Match not found.")
 
@@ -40,7 +40,7 @@ async def make_pick(
     if user_id not in squad.get("members", []):
         raise HTTPException(status.HTTP_403_FORBIDDEN, "You are not a member of this squad.")
     from app.services.squad_league_service import require_active_league_config
-    require_active_league_config(squad, match["sport_key"], "survivor")
+    require_active_league_config(squad, match["league_id"], "survivor")
     if is_match_locked(match):
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Match is locked.")
 
@@ -50,11 +50,11 @@ async def make_pick(
         raise HTTPException(status.HTTP_409_CONFLICT, "Match team identity not initialized yet.")
 
     registry = TeamRegistry.get()
-    team_id = await registry.resolve(team, match["sport_key"])
+    team_id = await registry.resolve(team, match["league_id"])
     if team_id not in (home_team_id, away_team_id):
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Team not in this match.")
 
-    sport_key = match["sport_key"]
+    league_id = match["league_id"]
     season = match.get("matchday_season") or now.year
     matchday_number = match.get("matchday_number")
     if not matchday_number:
@@ -64,7 +64,7 @@ async def make_pick(
     entry = await _db.db.survivor_entries.find_one({
         "user_id": user_id,
         "squad_id": squad_id,
-        "sport_key": sport_key,
+        "league_id": league_id,
         "season": season,
     })
 
@@ -115,7 +115,7 @@ async def make_pick(
         entry = {
             "user_id": user_id,
             "squad_id": squad_id,
-            "sport_key": sport_key,
+            "league_id": league_id,
             "season": season,
             "status": "alive",
             "picks": [{
@@ -146,22 +146,22 @@ async def make_pick(
     return entry
 
 
-async def get_entry(user_id: str, squad_id: str, sport_key: str, season: int) -> dict | None:
+async def get_entry(user_id: str, squad_id: str, league_id: int, season: int) -> dict | None:
     """Get user's survivor entry."""
     return await _db.db.survivor_entries.find_one({
         "user_id": user_id,
         "squad_id": squad_id,
-        "sport_key": sport_key,
+        "league_id": league_id,
         "season": season,
     })
 
 
-async def get_standings(squad_id: str, sport_key: str, season: int) -> list[dict]:
+async def get_standings(squad_id: str, league_id: int, season: int) -> list[dict]:
     """Get all survivor entries for a squad, with user aliases."""
     pipeline = [
         {"$match": {
             "squad_id": squad_id,
-            "sport_key": sport_key,
+            "league_id": league_id,
             "season": season,
         }},
         {"$lookup": {

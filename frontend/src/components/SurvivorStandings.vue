@@ -4,14 +4,14 @@ import { useSurvivorStore } from "@/stores/survivor";
 
 const props = defineProps<{
   squadId: string;
-  sportKey: string;
+  leagueId: number;
   season?: number;
 }>();
 
 const survivor = useSurvivorStore();
 
 onMounted(() => {
-  survivor.fetchStandings(props.squadId, props.sportKey, props.season);
+  survivor.fetchStandings(props.squadId, props.leagueId, props.season);
 });
 </script>
 

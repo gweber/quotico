@@ -143,7 +143,7 @@ async def test_match_ingest_updates_provider_metadata_and_calls_batch_hook(monke
                 "source": "football_data",
                 "league_external_id": "PL",
                 "season": 2025,
-                "sport_key": "soccer_epl",
+                "league_id": 8,
                 "match_date": "2025-08-10T14:00:00Z",
                 "home_team": {"external_id": "57", "name": "Arsenal"},
                 "away_team": {"external_id": "61", "name": "Chelsea"},

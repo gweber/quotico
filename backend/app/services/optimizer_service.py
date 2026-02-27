@@ -19,7 +19,6 @@ from datetime import datetime, timedelta
 from typing import TypedDict
 
 import app.database as _db
-from app.services.historical_service import sport_keys_for
 from app.services.quotico_tip_service import (
     ALPHA_TIME_DECAY,
     ALPHA_WEIGHT_FLOOR,
@@ -73,16 +72,13 @@ REG_WEIGHT_RHO = 0.5
 REG_WEIGHT_ALPHA = 10.0
 REG_WEIGHT_FLOOR = 2.0
 
-CALIBRATED_LEAGUES = [
-    "soccer_germany_bundesliga",
-    "soccer_germany_bundesliga2",
-    "soccer_epl",
-    "soccer_spain_la_liga",
-    "soccer_italy_serie_a",
-    "soccer_france_ligue_one",
-    "soccer_netherlands_eredivisie",
-    "soccer_portugal_primeira_liga",
-]
+async def _get_calibrated_league_ids() -> list[int]:
+    """Return active league ids for calibration/evaluation."""
+    docs = await _db.db.league_registry_v3.find(
+        {"is_active": True, "features.tipping": True},
+        {"league_id": 1},
+    ).to_list(length=500)
+    return [doc["league_id"] for doc in docs if isinstance(doc.get("league_id"), int)]
 
 
 # ---------------------------------------------------------------------------
@@ -111,12 +107,12 @@ class MatchCalibrationData(TypedDict):
 # ---------------------------------------------------------------------------
 
 async def _fetch_calibration_matches(
-    sport_key: str, window_days: int = CALIBRATION_WINDOW_DAYS,
+    league_id: int, window_days: int = CALIBRATION_WINDOW_DAYS,
     before_date: datetime | None = None,
 ) -> list[dict]:
     """Fetch resolved matches with odds + scores for calibration.
 
-    Uses exact sport_key (not related_keys) so each league is calibrated
+    Uses exact league_id (not related_keys) so each league is calibrated
     on its own population — different leagues have different dynamics.
 
     When *before_date* is set, only matches played before that date are
@@ -125,11 +121,11 @@ async def _fetch_calibration_matches(
     reference = before_date or utcnow()
     cutoff = reference - timedelta(days=window_days)
 
-    matches = await _db.db.matches.find(
+    matches = await _db.db.matches_v3.find(
         {
-            "sport_key": sport_key,
-            "status": "final",
-            "match_date": {"$gte": cutoff, "$lt": reference},
+            "league_id": league_id,
+            "status": "FINISHED",
+            "start_at": {"$gte": cutoff, "$lt": reference},
             "result.home_score": {"$exists": True},
             "result.away_score": {"$exists": True},
             "odds_meta.markets.h2h.current.1": {"$gt": 0},
@@ -137,10 +133,10 @@ async def _fetch_calibration_matches(
             "odds_meta.markets.h2h.current.2": {"$gt": 0},
         },
         {
-            "result": 1, "odds_meta.markets.h2h.current": 1, "match_date": 1,
-            "home_team_id": 1, "away_team_id": 1, "sport_key": 1,
+            "result": 1, "odds_meta.markets.h2h.current": 1, "start_at": 1,
+            "home_team_id": 1, "away_team_id": 1, "league_id": 1,
         },
-    ).sort("match_date", 1).to_list(length=500)
+    ).sort("start_at", 1).to_list(length=500)
 
     return matches
 
@@ -160,7 +156,7 @@ def _determine_actual_result(match: dict) -> str | None:
 
 
 async def _prefetch_match_data(
-    matches: list[dict], sport_key: str,
+    matches: list[dict], league_id: int,
     before_date: datetime | None = None,
 ) -> list[MatchCalibrationData]:
     """Fetch-once, slice-per-match strategy for temporal-leak-free calibration data.
@@ -173,8 +169,6 @@ async def _prefetch_match_data(
     When *before_date* is set, team histories and league averages are capped
     at that date (point-in-time calibration).
     """
-    related_keys = sport_keys_for(sport_key)
-
     # --- 1. Collect unique team ids ---
     team_ids: set = set()
     for m in matches:
@@ -198,50 +192,50 @@ async def _prefetch_match_data(
 
     projection = {"result.home_score": 1, "result.away_score": 1,
                   "result.home_xg": 1, "result.away_xg": 1,
-                  "match_date": 1, "home_team_id": 1, "away_team_id": 1}
+                  "start_at": 1, "home_team_id": 1, "away_team_id": 1}
 
     # When before_date is set, cap team history to avoid loading future data
     date_cap: dict = {}
     if before_date:
-        date_cap = {"match_date": {"$lt": before_date}}
+        date_cap = {"start_at": {"$lt": before_date}}
 
     total_teams = len(team_ids)
     for ti, tk in enumerate(team_ids, 1):
         # Home matches
-        home_docs = await _db.db.matches.find(
-            {"home_team_id": tk, "sport_key": {"$in": related_keys}, "status": "final",
+        home_docs = await _db.db.matches_v3.find(
+            {"home_team_id": tk, "league_id": league_id, "status": "FINISHED",
              **date_cap},
             projection,
-        ).sort("match_date", 1).to_list(length=200)
+        ).sort("start_at", 1).to_list(length=200)
         team_home[tk] = home_docs
 
         # Away matches
-        away_docs = await _db.db.matches.find(
-            {"away_team_id": tk, "sport_key": {"$in": related_keys}, "status": "final",
+        away_docs = await _db.db.matches_v3.find(
+            {"away_team_id": tk, "league_id": league_id, "status": "FINISHED",
              **date_cap},
             projection,
-        ).sort("match_date", 1).to_list(length=200)
+        ).sort("start_at", 1).to_list(length=200)
         team_away[tk] = away_docs
 
         # All matches for rest days (cross-competition but within soccer)
-        all_docs = await _db.db.matches.find(
+        all_docs = await _db.db.matches_v3.find(
             {"$or": [{"home_team_id": tk}, {"away_team_id": tk}],
-             "sport_key": {"$in": related_keys}, "status": "final",
+             "league_id": league_id, "status": "FINISHED",
              **date_cap},
-            {"match_date": 1},
-        ).sort("match_date", 1).to_list(length=500)
+            {"start_at": 1},
+        ).sort("start_at", 1).to_list(length=500)
         team_all[tk] = all_docs
 
         if ti % 10 == 0 or ti == total_teams:
             logger.info("  Prefetch: %d/%d teams fetched", ti, total_teams)
 
-    # --- 3. League averages (exact sport_key — each league has different scoring patterns) ---
+    # --- 3. League averages (exact league_id — each league has different scoring patterns) ---
     reference = before_date or utcnow()
     cutoff = reference - timedelta(days=CALIBRATION_WINDOW_DAYS)
     avg_pipeline = [
-        {"$match": {"sport_key": sport_key, "status": "final",
-                     "match_date": {"$gte": cutoff, "$lt": reference}}},
-        {"$sort": {"match_date": -1}},
+        {"$match": {"league_id": league_id, "status": "FINISHED",
+                     "start_at": {"$gte": cutoff, "$lt": reference}}},
+        {"$sort": {"start_at": -1}},
         {"$limit": 1000},
         {"$group": {
             "_id": None,
@@ -250,7 +244,7 @@ async def _prefetch_match_data(
             "count": {"$sum": 1},
         }},
     ]
-    avg_results = await _db.db.matches.aggregate(avg_pipeline).to_list(length=1)
+    avg_results = await _db.db.matches_v3.aggregate(avg_pipeline).to_list(length=1)
     if not avg_results or avg_results[0]["count"] < 50:
         return []
 
@@ -261,7 +255,7 @@ async def _prefetch_match_data(
 
     # --- Helper: extract dates from a list of match docs for bisect ---
     def _extract_dates(docs: list[dict]) -> list[datetime]:
-        return [ensure_utc(d["match_date"]) for d in docs]
+        return [ensure_utc(d["start_at"]) for d in docs]
 
     # --- 4. For each calibration match: slice at match_date ---
     result: list[MatchCalibrationData] = []
@@ -280,7 +274,7 @@ async def _prefetch_match_data(
         if not all(odds_h2h.get(k, 0) > 0 for k in ("1", "X", "2")):
             continue
 
-        match_dt = ensure_utc(m["match_date"])
+        match_dt = ensure_utc(m["start_at"])
 
         # Slice home matches for home team (before match_date)
         h_home_docs = team_home.get(hk, [])
@@ -300,11 +294,11 @@ async def _prefetch_match_data(
         # Extract goals + dates for time-weighted averaging (xG-blended when available)
         home_scored = [blend_goals(d["result"]["home_score"], d["result"].get("home_xg")) for d in h_home_slice]
         home_conceded = [blend_goals(d["result"]["away_score"], d["result"].get("away_xg")) for d in h_home_slice]
-        home_dates = [d["match_date"] for d in h_home_slice]
+        home_dates = [d["start_at"] for d in h_home_slice]
 
         away_scored = [blend_goals(d["result"]["away_score"], d["result"].get("away_xg")) for d in a_away_slice]
         away_conceded = [blend_goals(d["result"]["home_score"], d["result"].get("home_xg")) for d in a_away_slice]
-        away_dates = [d["match_date"] for d in a_away_slice]
+        away_dates = [d["start_at"] for d in a_away_slice]
 
         # Rest days: find last final match before match_date (cross-competition)
         def _rest_from_all(tk_: str) -> int:
@@ -322,13 +316,13 @@ async def _prefetch_match_data(
         # H2H lambdas (filter home team's matches for away team id, and vice versa)
         h2h_matches_raw: list[dict] = []
         for doc in h_home_docs[:cut_idx]:
-            if doc.get("away_team_id") == ak and ensure_utc(doc["match_date"]) < match_dt:
+            if doc.get("away_team_id") == ak and ensure_utc(doc["start_at"]) < match_dt:
                 h2h_matches_raw.append(doc)
         for doc in team_home.get(ak, []):
-            if doc.get("away_team_id") == hk and ensure_utc(doc["match_date"]) < match_dt:
+            if doc.get("away_team_id") == hk and ensure_utc(doc["start_at"]) < match_dt:
                 h2h_matches_raw.append(doc)
         # Sort by date descending (most recent first) for _compute_h2h_lambdas
-        h2h_matches_raw.sort(key=lambda d: d["match_date"], reverse=True)
+        h2h_matches_raw.sort(key=lambda d: d["start_at"], reverse=True)
         h2h_lambdas = _compute_h2h_lambdas(h2h_matches_raw, hk, ak) if h2h_matches_raw else None
 
         result.append(MatchCalibrationData(
@@ -345,11 +339,11 @@ async def _prefetch_match_data(
             h2h_lambdas=h2h_lambdas,
             home_rest=home_rest,
             away_rest=away_rest,
-            match_date=m["match_date"],
+            match_date=m["start_at"],
         ))
 
     logger.info("Prefetched %d calibration data points for %s (%d teams)",
-                len(result), sport_key, len(team_ids))
+                len(result), league_id, len(team_ids))
     return result
 
 
@@ -367,7 +361,7 @@ def _compute_probs_for_params(
     """
     avg_h = md["league_avg_home"]
     avg_a = md["league_avg_away"]
-    ref_date = md["match_date"]
+    ref_date = md["start_at"]
 
     # Time-weighted attack/defense strengths
     home_attack = _time_weighted_average(
@@ -428,10 +422,10 @@ def _compute_probs_for_params(
 # Evaluation (Brier Score + Calibration Error + Regularization)
 # ---------------------------------------------------------------------------
 
-def _get_defaults(sport_key: str) -> dict:
+def _get_defaults(league_id: int) -> dict:
     """Return hardcoded default parameters for a league (regularization anchor)."""
     return {
-        "rho": LEAGUE_RHO.get(sport_key, DIXON_COLES_RHO_DEFAULT),
+        "rho": LEAGUE_RHO.get(league_id, DIXON_COLES_RHO_DEFAULT),
         "alpha": ALPHA_TIME_DECAY,
         "floor": ALPHA_WEIGHT_FLOOR,
     }
@@ -548,7 +542,7 @@ def _build_grid(
 # ---------------------------------------------------------------------------
 
 async def calibrate_league(
-    sport_key: str, mode: str = "refinement",
+    league_id: int, mode: str = "refinement",
     before_date: datetime | None = None,
 ) -> dict:
     """Run grid search calibration for a single league.
@@ -560,36 +554,36 @@ async def calibrate_league(
     is responsible for storing results (e.g. in ``engine_config_history``).
     """
     # Load current config (or defaults)
-    existing = await _db.db.engine_config.find_one({"_id": sport_key})
+    existing = await _db.db.engine_config.find_one({"_id": league_id})
     if not existing:
         # Auto-promote to exploration on first run
         mode = "exploration"
-        logger.info("No engine_config for %s — auto-promoting to exploration", sport_key)
+        logger.info("No engine_config for %s — auto-promoting to exploration", league_id)
 
     current = {
-        "rho": existing["rho"] if existing else LEAGUE_RHO.get(sport_key, DIXON_COLES_RHO_DEFAULT),
+        "rho": existing["rho"] if existing else LEAGUE_RHO.get(league_id, DIXON_COLES_RHO_DEFAULT),
         "alpha": existing["alpha_time_decay"] if existing else ALPHA_TIME_DECAY,
         "floor": existing["alpha_weight_floor"] if existing else ALPHA_WEIGHT_FLOOR,
     }
-    defaults = _get_defaults(sport_key)
+    defaults = _get_defaults(league_id)
 
     # Fetch and prefetch calibration data
-    matches = await _fetch_calibration_matches(sport_key, before_date=before_date)
+    matches = await _fetch_calibration_matches(league_id, before_date=before_date)
     if len(matches) < MIN_CALIBRATION_MATCHES:
         logger.warning("Skipping %s: only %d matches (need %d)",
-                       sport_key, len(matches), MIN_CALIBRATION_MATCHES)
-        return {"sport_key": sport_key, "status": "skipped", "matches": len(matches)}
+                       league_id, len(matches), MIN_CALIBRATION_MATCHES)
+        return {"league_id": league_id, "status": "skipped", "matches": len(matches)}
 
-    all_data = await _prefetch_match_data(matches, sport_key, before_date=before_date)
+    all_data = await _prefetch_match_data(matches, league_id, before_date=before_date)
     if len(all_data) < MIN_CALIBRATION_MATCHES:
         logger.warning("Skipping %s: only %d usable data points after prefetch",
-                       sport_key, len(all_data))
-        return {"sport_key": sport_key, "status": "skipped", "data_points": len(all_data)}
+                       league_id, len(all_data))
+        return {"league_id": league_id, "status": "skipped", "data_points": len(all_data)}
 
     # Build grid
     grid = _build_grid(mode, current)
     logger.info("Calibrating %s (%s mode): %d grid points, %d matches",
-                sport_key, mode, len(grid), len(all_data))
+                league_id, mode, len(grid), len(all_data))
 
     # Grid search
     best_result: dict | None = None
@@ -615,7 +609,7 @@ async def calibrate_league(
             logger.info("  Grid search: %d/%d combos evaluated (%.1fs)", gi, grid_size, elapsed)
 
     if not best_params or not best_result:
-        return {"sport_key": sport_key, "status": "error", "reason": "no valid grid point"}
+        return {"league_id": league_id, "status": "error", "reason": "no valid grid point"}
 
     # Minimum improvement check
     old_rbs = existing["regularized_brier"] if existing and "regularized_brier" in existing else None
@@ -624,10 +618,10 @@ async def calibrate_league(
         if improvement_pct < MIN_IMPROVEMENT_PCT:
             logger.info(
                 "Keeping current params for %s (improvement %.2f%% < %d%% threshold)",
-                sport_key, improvement_pct, MIN_IMPROVEMENT_PCT,
+                league_id, improvement_pct, MIN_IMPROVEMENT_PCT,
             )
             return {
-                "sport_key": sport_key, "status": "kept",
+                "league_id": league_id, "status": "kept",
                 "improvement_pct": round(improvement_pct, 2),
                 "current_rbs": old_rbs, "candidate_rbs": best_rbs,
             }
@@ -658,7 +652,7 @@ async def calibrate_league(
         }
 
         await _db.db.engine_config.update_one(
-            {"_id": sport_key},
+            {"_id": league_id},
             {
                 "$set": {
                     "rho": rho_best,
@@ -689,9 +683,9 @@ async def calibrate_league(
 
         # Append snapshot to engine_config_history for future backfills
         await _db.db.engine_config_history.update_one(
-            {"sport_key": sport_key, "snapshot_date": now},
+            {"league_id": league_id, "snapshot_date": now},
             {"$set": {
-                "sport_key": sport_key,
+                "league_id": league_id,
                 "snapshot_date": now,
                 "params": {
                     "rho": rho_best,
@@ -719,7 +713,7 @@ async def calibrate_league(
     logger.info(
         "Calibrated %s (%s%s): ρ=%.2f, α=%.3f, floor=%.2f, "
         "BS=%.4f, RBS=%.4f, CE=%s, landscape=[%.4f..%.4f] (N=%d)",
-        sport_key, mode, f", as-of {before_date:%Y-%m-%d}" if before_date else "",
+        league_id, mode, f", as-of {before_date:%Y-%m-%d}" if before_date else "",
         rho_best, alpha_best, floor_best,
         best_result["pure_brier"], best_result["regularized_brier"],
         best_result["calibration_error"],
@@ -727,7 +721,7 @@ async def calibrate_league(
     )
 
     return {
-        "sport_key": sport_key, "status": "calibrated", "mode": mode,
+        "league_id": league_id, "status": "calibrated", "mode": mode,
         "rho": rho_best, "alpha": alpha_best, "floor": floor_best,
         "pure_brier": best_result["pure_brier"],
         "regularized_brier": best_result["regularized_brier"],
@@ -750,39 +744,39 @@ async def evaluate_engine_performance() -> dict:
     """
     results: dict = {}
 
-    for sport_key in CALIBRATED_LEAGUES:
-        config = await _db.db.engine_config.find_one({"_id": sport_key})
+    for league_id in await _get_calibrated_league_ids():
+        config = await _db.db.engine_config.find_one({"_id": league_id})
         if not config:
             continue
 
-        # Fetch recent resolved matches (same criteria as calibration — exact sport_key)
+        # Fetch recent resolved matches (same criteria as calibration — exact league_id)
         cutoff = utcnow() - timedelta(days=EVAL_WINDOW_DAYS)
 
-        eval_matches = await _db.db.matches.find(
+        eval_matches = await _db.db.matches_v3.find(
             {
-                "sport_key": sport_key,
-                "status": "final",
-                "match_date": {"$gte": cutoff},
+                "league_id": league_id,
+                "status": "FINISHED",
+                "start_at": {"$gte": cutoff},
                 "result.home_score": {"$exists": True},
                 "result.away_score": {"$exists": True},
                 "odds_meta.markets.h2h.current.1": {"$gt": 0},
                 "odds_meta.markets.h2h.current.X": {"$gt": 0},
                 "odds_meta.markets.h2h.current.2": {"$gt": 0},
             },
-        ).sort("match_date", 1).to_list(length=200)
+        ).sort("start_at", 1).to_list(length=200)
 
         if len(eval_matches) < 20:
             continue
 
         # Prefetch and evaluate with current calibrated params
-        eval_data = await _prefetch_match_data(eval_matches, sport_key)
+        eval_data = await _prefetch_match_data(eval_matches, league_id)
         if len(eval_data) < 20:
             continue
 
         rho = config["rho"]
         alpha = config["alpha_time_decay"]
         floor = config["alpha_weight_floor"]
-        defaults = _get_defaults(sport_key)
+        defaults = _get_defaults(league_id)
 
         eval_result = _evaluate_params(eval_data, rho, alpha, floor, defaults)
 
@@ -801,10 +795,10 @@ async def evaluate_engine_performance() -> dict:
         if needs_recal:
             logger.warning(
                 "%s: Brier degraded %.1f%% (rolling %.4f vs history avg %.4f) — flagged for recalibration",
-                sport_key, degradation_pct, current_brier, history_avg,
+                league_id, degradation_pct, current_brier, history_avg,
             )
 
-        results[sport_key] = {
+        results[league_id] = {
             "brier": current_brier,
             "calibration_error": eval_result["calibration_error"],
             "matches": eval_result["evaluated"],
@@ -829,25 +823,25 @@ async def run_calibration(force_mode: str | None = None) -> dict:
     """
     if force_mode in ("exploration", "refinement"):
         results = {}
-        for sport_key in CALIBRATED_LEAGUES:
+        for league_id in await _get_calibrated_league_ids():
             try:
-                results[sport_key] = await calibrate_league(sport_key, mode=force_mode)
+                results[league_id] = await calibrate_league(league_id, mode=force_mode)
             except Exception:
-                logger.exception("Calibration failed for %s", sport_key)
-                results[sport_key] = {"status": "error"}
+                logger.exception("Calibration failed for %s", league_id)
+                results[league_id] = {"status": "error"}
         return {"mode": force_mode, "leagues": results}
 
     # Daily: evaluate, then recalibrate flagged leagues
     eval_results = await evaluate_engine_performance()
     recalibrated = {}
 
-    for sport_key, eval_data in eval_results.items():
+    for league_id, eval_data in eval_results.items():
         if eval_data.get("needs_recalibration"):
             try:
-                recalibrated[sport_key] = await calibrate_league(sport_key, mode="refinement")
+                recalibrated[league_id] = await calibrate_league(league_id, mode="refinement")
             except Exception:
-                logger.exception("Recalibration failed for %s", sport_key)
-                recalibrated[sport_key] = {"status": "error"}
+                logger.exception("Recalibration failed for %s", league_id)
+                recalibrated[league_id] = {"status": "error"}
 
     return {
         "mode": "daily_eval",
